@@ -123,7 +123,7 @@ These environment variables affect runtime behavior:
 | `CBM_LOG_LEVEL` | `info` | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin-frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
 | `CBM_WORKERS` | auto-detected | Override the indexing worker count. |
 
-Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
+Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific and a conflicting `CBM_CACHE_DIR` is rejected. One-shot CLI commands connect to the existing daemon — or start a temporary one when none is running, in which case that temporary daemon captures its environment from the command that spawned it. To pin daemon-owned settings deterministically, export them before `codebase-memory-mcp daemon start`.
 
 ## 5. Agent and Editor Integration Files
 

@@ -122,7 +122,7 @@ The native `install`, `update`, and `uninstall` commands are the deliberate exce
 
 Package-manager setup (npm, PyPI, or Go) only verifies and atomically publishes that package's private cached binary; it does not replace the active native installation and therefore does not stop running CBM sessions. When that cached binary is executed, it still enters the same exact-build admission barrier. The shell and PowerShell installers invoke the verified candidate's native `install` command, so they do receive the full account-wide activation guarantee.
 
-The ordinary `cli` mode is intentionally separate: it runs one command locally and never starts or connects to the coordination daemon, registers a daemon session, or starts watchers/UI. Its only shared state is the OS admission barrier plus per-project locks for graph mutations. While the command is running, a temporary monitor lets activation cancel that operation and its supervised worker safely; the monitor exits with the command and never becomes a standing daemon. See [CLI Mode](#cli-mode) for details.
+The ordinary `cli` mode is intentionally lightweight: it runs one command and exits, leaving no standing process behind by itself. Commands execute through the per-account coordination daemon — connecting to the running one, or starting a temporary daemon that shuts itself down once its last client disconnects (`codebase-memory-mcp daemon start` keeps a permanent one warm and removes that per-command cold start). Shared state is the OS admission barrier plus per-project locks for graph mutations. While the command is running, a temporary monitor lets activation cancel that operation and its supervised worker safely; the monitor exits with the command. See [CLI Mode](#cli-mode) for details.
 
 ### Graph Visualization UI
 
@@ -572,7 +572,17 @@ no longer a suitable automatic global target.
 
 ## CLI Mode
 
-Every MCP tool can be invoked as a local, one-shot command. CLI tools neither start nor connect to the coordination daemon and leave no standing process behind. They hold a crash-safe exact-build admission lease only for the command lifetime. `index_repository` is the only exception internally: it starts a temporary, exact-build supervised worker for the index, then stops that worker before the CLI command exits; the worker holds its own lease until exit.
+Every MCP tool can be invoked as a local, one-shot command. CLI commands execute through the per-account coordination daemon: they connect to the running daemon, or start a temporary one that shuts down when its last client disconnects, so the command itself leaves no standing process behind. Run `codebase-memory-mcp daemon start` to keep a permanent daemon warm and skip the per-command startup cost. Each command holds a crash-safe exact-build admission lease only for the command lifetime. `index_repository` additionally starts a temporary, exact-build supervised worker for the index, then stops that worker before the CLI command exits; the worker holds its own lease until exit.
+
+### Daemon Lifecycle
+
+CBM runs one coordination daemon per account: MCP frontends, hooks, CLI commands, index jobs, and the UI server all live inside it. By default the daemon is ephemeral — the first client starts it and it exits when the last client disconnects.
+
+- `codebase-memory-mcp daemon start` — start a **permanent** daemon that survives idle periods and session ends. Hooks are connect-only and never start a daemon themselves, so `hook-augment` only augments while a daemon is running; a permanent daemon also removes the cold start every `cli` command otherwise pays.
+- `codebase-memory-mcp daemon status` — show the active daemon: build fingerprint, committed clients, and the UI address when the binary embeds the frontend.
+- `codebase-memory-mcp daemon stop` — retire the permanent daemon (refused while clients are still connected).
+
+All coordinating processes must be the exact same build. After replacing the binary, stop the old daemon and restart agent sessions so the new cohort can form.
 
 Commands that mutate graph data use shared OS-backed, per-project locks. This serializes conflicting work from CLI and MCP sessions on the same project while allowing unrelated projects to proceed independently.
 
