@@ -12,12 +12,49 @@ export type DirMatch =
   | { kind: "descendant"; count: number }
   | { kind: "none" };
 
-/* Match on forward slashes without a trailing slash, so POSIX and Windows
- * spellings of the same folder compare equal (mirrors joinPath in StatsTab). */
-function normalizePath(p: string): string {
+/* Fold to forward slashes, no trailing slash, lowercase. Lowercasing matches
+ * filesystem semantics on the default-case-insensitive macOS and Windows
+ * volumes this UI overwhelmingly runs on; on a case-sensitive volume the
+ * worst case is an extra re-index confirmation — the safer failure mode
+ * than silently skipping it for a differently-typed casing. */
+export function normalizePath(p: string): string {
   let s = p.replace(/\\/g, "/");
   if (s.length > 1) s = s.replace(/\/+$/, "");
-  return s;
+  return s.toLowerCase();
+}
+
+export function buildRootsMap(roots: IndexedRoot[]): Map<string, IndexedRoot> {
+  const m = new Map<string, IndexedRoot>();
+  for (const r of roots) {
+    if (r.root_path) m.set(normalizePath(r.root_path), r);
+  }
+  return m;
+}
+
+/* Pure so tests can exercise the matching without mounting the hook. */
+export function matchDirAgainst(byPath: Map<string, IndexedRoot>, path: string): DirMatch {
+  const p = normalizePath(path);
+  if (!p) return { kind: "none" };
+  const exact = byPath.get(p);
+  if (exact) return { kind: "exact", root: exact };
+  /* Deepest ancestor wins: with nested indexed projects the badge must name
+   * the closest enclosing project, not whichever root the server's cache-dir
+   * scan happened to emit first. */
+  let best: IndexedRoot | null = null;
+  let bestLen = -1;
+  for (const [rootPath, root] of byPath) {
+    if (p.startsWith(rootPath + "/") && rootPath.length > bestLen) {
+      best = root;
+      bestLen = rootPath.length;
+    }
+  }
+  if (best) return { kind: "ancestor", root: best };
+  let count = 0;
+  for (const rootPath of byPath.keys()) {
+    if (rootPath.startsWith(p + "/")) count++;
+  }
+  if (count > 0) return { kind: "descendant", count };
+  return { kind: "none" };
 }
 
 export function useIndexedRoots() {
@@ -38,32 +75,8 @@ export function useIndexedRoots() {
     void refresh();
   }, [refresh]);
 
-  const byPath = useMemo(() => {
-    const m = new Map<string, IndexedRoot>();
-    for (const r of roots) {
-      if (r.root_path) m.set(normalizePath(r.root_path), r);
-    }
-    return m;
-  }, [roots]);
-
-  const matchDir = useCallback(
-    (path: string): DirMatch => {
-      const p = normalizePath(path);
-      if (!p) return { kind: "none" };
-      const exact = byPath.get(p);
-      if (exact) return { kind: "exact", root: exact };
-      for (const [rootPath, root] of byPath) {
-        if (p.startsWith(rootPath + "/")) return { kind: "ancestor", root };
-      }
-      let count = 0;
-      for (const rootPath of byPath.keys()) {
-        if (rootPath.startsWith(p + "/")) count++;
-      }
-      if (count > 0) return { kind: "descendant", count };
-      return { kind: "none" };
-    },
-    [byPath],
-  );
+  const byPath = useMemo(() => buildRootsMap(roots), [roots]);
+  const matchDir = useCallback((path: string) => matchDirAgainst(byPath, path), [byPath]);
 
   return { roots, matchDir, refresh };
 }
