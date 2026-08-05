@@ -1888,6 +1888,55 @@ TEST(ui_server_indexed_roots_reports_projects_and_orphans) {
     PASS();
 }
 
+/* /api/metrics serves the trailing window of hourly buckets from
+ * metrics_requests and silently excludes rows older than ?hours=. */
+TEST(ui_server_metrics_endpoint_returns_windowed_buckets) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+
+    cbm_config_t *cfg = cbm_config_open(fx.cache_dir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_metrics_entry_t entries[2] = {
+        {.bucket_hour = "2026-01-01T00",
+         .source = "mcp",
+         .name = "old_tool",
+         .project = "p",
+         .count = 5,
+         .errors = 0,
+         .dur_us_sum = 100,
+         .dur_us_max = 100},
+        {.bucket_hour = "2099-01-01T00", /* far future: always inside the window */
+         .source = "cli",
+         .name = "fresh_tool",
+         .project = "demo",
+         .count = 3,
+         .errors = 1,
+         .dur_us_sum = 3000,
+         .dur_us_max = 2000},
+    };
+    ASSERT_EQ(cbm_config_metrics_flush(cfg, entries, 2), 0);
+    cbm_config_close(cfg);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char resp[16384];
+    int n = th_http(cbm_http_server_port(ts.srv), "GET /api/metrics?hours=48 HTTP/1.1\r\n\r\n",
+                    resp, sizeof(resp));
+    th_server_stop(&ts);
+
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"buckets\":["));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"fresh_tool\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"source\":\"cli\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"count\":3"));
+    ASSERT_NOT_NULL(strstr(resp, "\"errors\":1"));
+    ASSERT_NULL(strstr(resp, "old_tool")); /* outside the 48h window */
+
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
 #ifdef _WIN32
 typedef struct {
     char path[512];
@@ -2144,5 +2193,6 @@ SUITE(httpd) {
     /* #798 follow-up: full UI-mode hang repro under live sockets */
     RUN_TEST(ui_server_list_projects_responds_under_watchdog);
     RUN_TEST(ui_server_indexed_roots_reports_projects_and_orphans);
+    RUN_TEST(ui_server_metrics_endpoint_returns_windowed_buckets);
     RUN_TEST(git_context_resolve_no_hang_under_live_ui_sockets);
 }

@@ -818,6 +818,118 @@ static void handle_indexed_roots(cbm_http_conn_t *c) {
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
 
+/* ── Request metrics endpoint ─────────────────────────────────── */
+
+/* printf-append into a heap buffer, growing as needed. Returns false (and
+ * frees nothing) on allocation failure; the caller bails out. */
+static bool metrics_appendf(char **buf, size_t *cap, size_t *len, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    va_list args_copy;
+    va_copy(args_copy, args);
+    int needed = vsnprintf(NULL, 0, fmt, args);
+    va_end(args);
+    if (needed < 0) {
+        va_end(args_copy);
+        return false;
+    }
+    if (*len + (size_t)needed + 1 > *cap) {
+        size_t next = *cap * 2;
+        while (*len + (size_t)needed + 1 > next) {
+            next *= 2;
+        }
+        char *grown = realloc(*buf, next);
+        if (!grown) {
+            va_end(args_copy);
+            return false;
+        }
+        *buf = grown;
+        *cap = next;
+    }
+    vsnprintf(*buf + *len, *cap - *len, fmt, args_copy);
+    va_end(args_copy);
+    *len += (size_t)needed;
+    return true;
+}
+
+/* GET /api/metrics?hours=N → raw hourly buckets from metrics_requests for
+ * the trailing window (default one week), for the Control tab to aggregate.
+ * Missing table or unreadable db degrade to an empty list, never an error. */
+static void handle_metrics(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char hours_text[16] = {0};
+    int hours = 168;
+    if (cbm_http_query_param(req->query, "hours", hours_text, (int)sizeof(hours_text)) &&
+        hours_text[0]) {
+        hours = atoi(hours_text);
+    }
+    if (hours < 1) {
+        hours = 1;
+    }
+    if (hours > 24 * 90) {
+        hours = 24 * 90; /* retention window — older rows are pruned anyway */
+    }
+
+    char cutoff[14];
+    time_t t = time(NULL) - (time_t)hours * 3600;
+    struct tm tm;
+    cbm_gmtime_r(&t, &tm);
+    (void)strftime(cutoff, sizeof(cutoff), "%Y-%m-%dT%H", &tm);
+
+    const char *cdir = cbm_resolve_cache_dir();
+    char dbpath[2048];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", cdir ? cdir : ".");
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(dbpath, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) {
+            sqlite3_close(db);
+        }
+        cbm_http_replyf(c, 200, g_cors_json, "{\"buckets\":[]}");
+        return;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT bucket_hour, source, name, project, count, errors,"
+                           " dur_us_sum, dur_us_max FROM metrics_requests"
+                           " WHERE bucket_hour >= ? ORDER BY bucket_hour",
+                           -1, &stmt, NULL) != SQLITE_OK) {
+        /* Older db without the table (pre-metrics binary wrote it last). */
+        sqlite3_close(db);
+        cbm_http_replyf(c, 200, g_cors_json, "{\"buckets\":[]}");
+        return;
+    }
+    sqlite3_bind_text(stmt, 1, cutoff, -1, SQLITE_TRANSIENT);
+
+    size_t cap = 65536, len = 0;
+    char *buf = malloc(cap);
+    bool ok = buf && metrics_appendf(&buf, &cap, &len, "{\"buckets\":[");
+    int count = 0;
+    while (ok && sqlite3_step(stmt) == SQLITE_ROW) {
+        char esc_name[512], esc_project[512];
+        cbm_json_escape(esc_name, (int)sizeof(esc_name),
+                        (const char *)sqlite3_column_text(stmt, 2));
+        cbm_json_escape(esc_project, (int)sizeof(esc_project),
+                        (const char *)sqlite3_column_text(stmt, 3));
+        ok = metrics_appendf(
+            &buf, &cap, &len,
+            "%s{\"bucket_hour\":\"%s\",\"source\":\"%s\",\"name\":\"%s\",\"project\":\"%s\","
+            "\"count\":%lld,\"errors\":%lld,\"dur_us_sum\":%lld,\"dur_us_max\":%lld}",
+            count > 0 ? "," : "", (const char *)sqlite3_column_text(stmt, 0),
+            (const char *)sqlite3_column_text(stmt, 1), esc_name, esc_project,
+            (long long)sqlite3_column_int64(stmt, 4), (long long)sqlite3_column_int64(stmt, 5),
+            (long long)sqlite3_column_int64(stmt, 6), (long long)sqlite3_column_int64(stmt, 7));
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    if (!ok || !metrics_appendf(&buf, &cap, &len, "]}")) {
+        free(buf);
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"out of memory\"}");
+        return;
+    }
+    cbm_http_reply_buf(c, 200, g_cors_json, buf, len);
+    free(buf);
+}
+
 /* ── ADR endpoints ────────────────────────────────────────────── */
 
 /* GET /api/adr?project=X — get ADR content for a project */
@@ -1841,6 +1953,12 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
      * ingest modal to mark already-indexed folders and orphans */
     if (is_get && cbm_http_path_match(req->path, "/api/indexed-roots")) {
         handle_indexed_roots(c);
+        return;
+    }
+
+    /* GET /api/metrics → hourly request-metrics buckets for the Control tab */
+    if (is_get && cbm_http_path_match(req->path, "/api/metrics*")) {
+        handle_metrics(c, req);
         return;
     }
 
