@@ -2470,10 +2470,14 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
         edges = cbm_store_count_edges(pstore, project_name);
     }
     char root_path_buf[CBM_SZ_1K] = "";
+    char indexed_at_buf[CBM_SZ_64] = "";
     cbm_project_t proj = {0};
     if (cbm_store_get_project(pstore, project_name, &proj) == CBM_STORE_OK) {
         if (proj.root_path) {
             snprintf(root_path_buf, sizeof(root_path_buf), "%s", proj.root_path);
+        }
+        if (proj.indexed_at) {
+            snprintf(indexed_at_buf, sizeof(indexed_at_buf), "%s", proj.indexed_at);
         }
         cbm_project_free_fields(&proj);
     }
@@ -2482,6 +2486,9 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     yyjson_mut_val *p = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_strcpy(doc, p, "name", project_name);
     yyjson_mut_obj_add_strcpy(doc, p, "root_path", root_path_buf);
+    if (indexed_at_buf[0]) {
+        yyjson_mut_obj_add_strcpy(doc, p, "indexed_at", indexed_at_buf);
+    }
     /* Listing stays lean: only the branch (the one git fact that
      * disambiguates same-repo projects). The 12-field git block — mostly
      * null for non-git roots — cost ~10KB across a full cache and is one
