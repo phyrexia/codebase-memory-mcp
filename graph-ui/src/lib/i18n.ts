@@ -40,6 +40,8 @@ export const messages = {
       healthChecking: "Checking...",
       indexingInProgress: "Indexing in progress",
       indexingFailed: "Indexing failed",
+      lastIndexed: (when: string) => `Indexed ${when}`,
+      rootMissing: "Folder missing",
     },
     index: {
       newIndex: "New Index",
@@ -55,6 +57,11 @@ export const messages = {
       starting: "Starting...",
       browseRoot: (path: string) => `Browse ${path}`,
       indexDirectory: (name: string) => `Index ${name}`,
+      alreadyIndexed: "Already indexed",
+      reindex: "Re-index",
+      reindexConfirm: (name: string) => `"${name}" is already indexed. Re-index it?`,
+      insideProject: (name: string) => `Inside ${name}`,
+      containsProjects: (n: number) => `Contains ${n} indexed project${n === 1 ? "" : "s"}`,
     },
     adr: {
       title: "Architecture Decision Record",
@@ -111,6 +118,8 @@ export const messages = {
       healthChecking: "检查中...",
       indexingInProgress: "正在索引",
       indexingFailed: "索引失败",
+      lastIndexed: (when: string) => `索引于 ${when}`,
+      rootMissing: "目录已不存在",
     },
     index: {
       newIndex: "新建索引",
@@ -126,6 +135,11 @@ export const messages = {
       starting: "启动中...",
       browseRoot: (path: string) => `浏览 ${path}`,
       indexDirectory: (name: string) => `索引 ${name}`,
+      alreadyIndexed: "已索引",
+      reindex: "重新索引",
+      reindexConfirm: (name: string) => `“${name}” 已被索引。重新索引？`,
+      insideProject: (name: string) => `位于 ${name} 内`,
+      containsProjects: (n: number) => `包含 ${n} 个已索引项目`,
     },
     adr: {
       title: "架构决策记录",

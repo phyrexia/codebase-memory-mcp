@@ -70,7 +70,21 @@ export interface GraphData {
 export interface Project {
   name: string;
   root_path: string;
-  indexed_at: string;
+  indexed_at?: string;
+  branch?: string;
+  nodes?: number;
+  edges?: number;
+}
+
+/* GET /api/indexed-roots — indexed projects with on-disk state, for the
+ * ingest modal to mark already-indexed folders and orphans. */
+export interface IndexedRoot {
+  name: string;
+  root_path: string;
+  indexed_at?: string;
+  nodes: number;
+  edges: number;
+  root_exists: boolean;
 }
 
 export interface SchemaInfo {

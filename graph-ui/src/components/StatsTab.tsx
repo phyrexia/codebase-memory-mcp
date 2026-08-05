@@ -1,6 +1,7 @@
 import { useMemo, useState, useCallback, useEffect, useRef } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useProjects } from "../hooks/useProjects";
+import { useIndexedRoots, type DirMatch } from "../hooks/useIndexedRoots";
 import { colorForLabel } from "../lib/colors";
 import { useUiMessages } from "../lib/i18n";
 
@@ -166,8 +167,34 @@ function joinPath(base: string, dir: string): string {
   return `${base.replace(/[\\/]+$/, "")}${slash}${dir}`;
 }
 
+/* Chip describing how a browsed folder relates to the indexed roots. */
+function DirStateBadge({ match }: { match: DirMatch }) {
+  const t = useUiMessages();
+  if (match.kind === "none") return null;
+  const [label, color] =
+    match.kind === "exact"
+      ? [
+          match.root.indexed_at
+            ? `${t.index.alreadyIndexed} · ${match.root.indexed_at.slice(0, 10)}`
+            : t.index.alreadyIndexed,
+          "#34d399",
+        ]
+      : match.kind === "ancestor"
+        ? [t.index.insideProject(match.root.name), "#9ca3af"]
+        : [t.index.containsProjects(match.count), "#38bdf8"];
+  return (
+    <span
+      className="shrink-0 px-1.5 py-[2px] rounded-md text-[10px] font-medium"
+      style={{ backgroundColor: color + "18", color }}
+    >
+      {label}
+    </span>
+  );
+}
+
 function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const t = useUiMessages();
+  const { matchDir } = useIndexedRoots();
   const [currentPath, setCurrentPath] = useState("");
   const [dirs, setDirs] = useState<string[]>([]);
   const [roots, setRoots] = useState<string[]>(["/"]);
@@ -230,6 +257,10 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
   const submit = async (path = currentPath) => {
     if (!path) return;
+    /* Re-indexing an already-indexed root is legitimate but must be a choice,
+     * not an accident — until now it silently re-indexed. */
+    const match = matchDir(path);
+    if (match.kind === "exact" && !confirm(t.index.reindexConfirm(match.root.name))) return;
     setSubmitting(true); setError(null);
     try {
       const body: { root_path: string; project_name?: string } = { root_path: path };
@@ -378,31 +409,35 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
             ) : filteredDirs.length === 0 ? (
               <p className="text-foreground/15 text-[12px] text-center py-8">{t.index.noSubdirectories}</p>
             ) : (
-              filteredDirs.map((d, i) => (
-                <div
-                  key={d}
-                  className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-[12px] transition-colors group ${
-                    i === activeIndex ? "bg-white/[0.05]" : "hover:bg-white/[0.04]"
-                  }`}
-                >
-                  <button
-                    aria-label={t.index.browseRoot(d)}
-                    onClick={() => browse(joinPath(currentPath, d))}
-                    className="flex min-w-0 flex-1 items-center gap-2 text-left text-foreground/60"
+              filteredDirs.map((d, i) => {
+                const match = matchDir(joinPath(currentPath, d));
+                return (
+                  <div
+                    key={d}
+                    className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-[12px] transition-colors group ${
+                      i === activeIndex ? "bg-white/[0.05]" : "hover:bg-white/[0.04]"
+                    }`}
                   >
-                    <span className="text-foreground/20 group-hover:text-foreground/40">/</span>
-                    <span className="truncate">{d}</span>
-                  </button>
-                  <button
-                    aria-label={t.index.indexDirectory(d)}
-                    onClick={() => submit(joinPath(currentPath, d))}
-                    disabled={submitting}
-                    className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 px-2 py-1 rounded-md bg-primary/15 hover:bg-primary/25 text-primary text-[10px] font-medium transition-all disabled:opacity-30"
-                  >
-                    {t.index.indexThisFolder}
-                  </button>
-                </div>
-              ))
+                    <button
+                      aria-label={t.index.browseRoot(d)}
+                      onClick={() => browse(joinPath(currentPath, d))}
+                      className="flex min-w-0 flex-1 items-center gap-2 text-left text-foreground/60"
+                    >
+                      <span className="text-foreground/20 group-hover:text-foreground/40">/</span>
+                      <span className="truncate">{d}</span>
+                    </button>
+                    <DirStateBadge match={match} />
+                    <button
+                      aria-label={t.index.indexDirectory(d)}
+                      onClick={() => submit(joinPath(currentPath, d))}
+                      disabled={submitting}
+                      className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 px-2 py-1 rounded-md bg-primary/15 hover:bg-primary/25 text-primary text-[10px] font-medium transition-all disabled:opacity-30"
+                    >
+                      {match.kind === "exact" ? t.index.reindex : t.index.indexThisFolder}
+                    </button>
+                  </div>
+                );
+              })
             )}
           </div>
         </ScrollArea>
@@ -411,11 +446,14 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
         <div className="px-5 py-4 border-t border-border/20 shrink-0">
           {error && <div className="rounded-lg bg-destructive/10 border border-destructive/20 px-3 py-2 mb-3"><p className="text-destructive text-[11px]">{error}</p></div>}
           <div className="flex items-center justify-between">
-            <p className="text-[11px] text-foreground/25 font-mono truncate max-w-[250px]">{currentPath}</p>
+            <div className="flex items-center gap-2 min-w-0">
+              <p className="text-[11px] text-foreground/25 font-mono truncate max-w-[250px]">{currentPath}</p>
+              <DirStateBadge match={matchDir(currentPath)} />
+            </div>
             <div className="flex gap-2 shrink-0">
               <button onClick={onClose} className="px-3 py-2 rounded-lg text-[12px] text-foreground/40 hover:bg-white/[0.04] font-medium transition-all">{t.common.cancel}</button>
               <button onClick={() => submit()} disabled={submitting || !currentPath} className="px-4 py-2 rounded-lg bg-primary/20 hover:bg-primary/30 text-primary text-[12px] font-medium transition-all disabled:opacity-30">
-                {submitting ? t.index.starting : t.index.indexThisFolder}
+                {submitting ? t.index.starting : matchDir(currentPath).kind === "exact" ? t.index.reindex : t.index.indexThisFolder}
               </button>
             </div>
           </div>
@@ -500,8 +538,16 @@ export function IndexProgress({ onDone }: { onDone: () => void }) {
 export function StatsTab({ onSelectProject }: StatsTabProps) {
   const t = useUiMessages();
   const { projects, loading, error, refresh } = useProjects();
+  const { roots: indexedRoots, refresh: refreshRoots } = useIndexedRoots();
   const [showModal, setShowModal] = useState(false);
   const [indexing, setIndexing] = useState(false);
+
+  /* Projects whose root folder no longer exists on disk (orphans). */
+  const orphaned = useMemo(() => {
+    const s = new Set<string>();
+    for (const r of indexedRoots) if (r.root_exists === false) s.add(r.name);
+    return s;
+  }, [indexedRoots]);
 
   const aggregate = useMemo(() => {
     let totalNodes = 0, totalEdges = 0;
@@ -535,7 +581,7 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
           </div>
         )}
 
-        {indexing && <IndexProgress onDone={() => { setIndexing(false); refresh(); }} />}
+        {indexing && <IndexProgress onDone={() => { setIndexing(false); refresh(); refreshRoots(); }} />}
 
         <div className="flex items-center justify-between mb-6">
           <h2 className="text-[15px] font-semibold text-foreground/80">{t.projects.indexedProjects}</h2>
@@ -565,7 +611,22 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
                     <div className="mt-1.5"><HealthDot name={p.project.name} /></div>
                     <div className="min-w-0">
                       <h3 className="text-[14px] font-semibold text-foreground/90 mb-0.5">{p.project.name}</h3>
-                      <p className="text-[11px] text-foreground/20 font-mono truncate">{p.project.root_path}</p>
+                      <div className="flex items-center gap-2 min-w-0">
+                        <p className="text-[11px] text-foreground/20 font-mono truncate">{p.project.root_path}</p>
+                        {orphaned.has(p.project.name) && (
+                          <span
+                            className="shrink-0 px-1.5 py-[2px] rounded-md text-[10px] font-medium"
+                            style={{ backgroundColor: "#fbbf2418", color: "#fbbf24" }}
+                          >
+                            {t.projects.rootMissing}
+                          </span>
+                        )}
+                      </div>
+                      {p.project.indexed_at && (
+                        <p className="text-[10px] text-foreground/15 mt-0.5">
+                          {t.projects.lastIndexed(p.project.indexed_at.slice(0, 10))}
+                        </p>
+                      )}
                     </div>
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0">
