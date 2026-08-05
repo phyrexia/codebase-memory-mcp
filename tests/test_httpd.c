@@ -1851,6 +1851,11 @@ TEST(ui_server_indexed_roots_reports_projects_and_orphans) {
     ui_delete_fixture_t fx;
     ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
 
+    /* A real _config.db in the cache dir must be skipped by the scan. */
+    char cfgdb[1088];
+    snprintf(cfgdb, sizeof(cfgdb), "%s/_config.db", fx.cache_dir);
+    ASSERT_EQ(th_write_file(cfgdb, "not a project"), 0);
+
     char orphan_root[1088];
     snprintf(orphan_root, sizeof(orphan_root), "%s/gone", fx.tmpdir);
 

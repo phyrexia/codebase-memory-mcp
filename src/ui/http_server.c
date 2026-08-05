@@ -748,7 +748,8 @@ static void handle_indexed_roots(cbm_http_conn_t *c) {
 
     struct dirent *ent;
     int count = 0;
-    while ((ent = readdir(dir)) != NULL) {
+    bool out_of_space = false;
+    while (!out_of_space && (ent = readdir(dir)) != NULL) {
         const char *fname = ent->d_name;
         size_t len = strlen(fname);
         if (len <= 3 || strcmp(fname + len - 3, ".db") != 0)
@@ -770,25 +771,39 @@ static void handle_indexed_roots(cbm_http_conn_t *c) {
                 if (!p->name || !p->name[0] || strstr(p->name, "::"))
                     continue;
 
+                int nodes = cbm_store_count_nodes(st, p->name);
+                int edges = cbm_store_count_edges(st, p->name);
+                if (nodes < 0) nodes = 0; /* CBM_STORE_ERR sentinel */
+                if (edges < 0) edges = 0;
+
+                /* Stage the whole entry before committing it: a clamped
+                 * partial entry would leave invalid JSON in the response.
+                 * When the 32KB buffer fills, later projects are dropped
+                 * but the emitted JSON stays parseable. */
+                char entry[8192];
+                int epos = 0;
                 char esc[2048];
-                if (count > 0)
-                    buf[pos++] = ',';
                 cbm_json_escape(esc, (int)sizeof(esc), p->name);
-                http_appendf(buf, sizeof(buf), &pos, "{\"name\":\"%s\"", esc);
+                http_appendf(entry, sizeof(entry), &epos, "%s{\"name\":\"%s\"",
+                             count > 0 ? "," : "", esc);
                 cbm_json_escape(esc, (int)sizeof(esc), p->root_path ? p->root_path : "");
-                http_appendf(buf, sizeof(buf), &pos, ",\"root_path\":\"%s\"", esc);
+                http_appendf(entry, sizeof(entry), &epos, ",\"root_path\":\"%s\"", esc);
                 if (p->indexed_at && p->indexed_at[0]) {
                     cbm_json_escape(esc, (int)sizeof(esc), p->indexed_at);
-                    http_appendf(buf, sizeof(buf), &pos, ",\"indexed_at\":\"%s\"", esc);
+                    http_appendf(entry, sizeof(entry), &epos, ",\"indexed_at\":\"%s\"", esc);
                 }
-                http_appendf(buf, sizeof(buf), &pos,
-                             ",\"nodes\":%d,\"edges\":%d,\"root_exists\":%s}",
-                             cbm_store_count_nodes(st, p->name),
-                             cbm_store_count_edges(st, p->name),
+                http_appendf(entry, sizeof(entry), &epos,
+                             ",\"nodes\":%d,\"edges\":%d,\"root_exists\":%s}", nodes, edges,
                              p->root_path && cbm_is_dir(p->root_path) ? "true" : "false");
-                if (pos >= (int)sizeof(buf)) {
-                    pos = (int)sizeof(buf) - 1;
+
+                /* +2 keeps room for the closing "]" and the NUL. */
+                if (pos + epos + 2 > (int)sizeof(buf)) {
+                    out_of_space = true;
+                    break;
                 }
+                memcpy(buf + pos, entry, (size_t)epos);
+                pos += epos;
+                buf[pos] = '\0';
                 count++;
             }
         }
