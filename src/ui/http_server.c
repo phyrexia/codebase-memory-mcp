@@ -174,6 +174,8 @@ struct cbm_http_server {
     cbm_http_project_mutation_begin_fn mutation_begin;
     cbm_http_project_mutation_end_fn mutation_end;
     void *mutation_context;
+    cbm_http_metrics_sink_fn metrics_sink;
+    void *metrics_sink_context;
     index_job_t index_jobs[MAX_INDEX_JOBS];
     atomic_int stop_flag;
     atomic_int run_state;
@@ -2022,6 +2024,11 @@ void cbm_http_server_run(cbm_http_server_t *srv) {
             cbm_log_http_request("graph_ui", req.method, req.path, cbm_http_conn_status(conn),
                                  (int64_t)(cbm_now_ms() - request_start_ms), req.body_len,
                                  cbm_http_conn_response_bytes(conn));
+            if (srv->metrics_sink) {
+                srv->metrics_sink(srv->metrics_sink_context, req.path,
+                                  (cbm_now_ms() - request_start_ms) * 1000,
+                                  cbm_http_conn_status(conn) >= 400);
+            }
             cbm_http_req_free(&req);
         } else if (rc > 0) {
             /* Parse/transport error with a known HTTP status (400/408/411/413/431).
@@ -2030,6 +2037,10 @@ void cbm_http_server_run(cbm_http_server_t *srv) {
             cbm_log_http_request("graph_ui", "", "", cbm_http_conn_status(conn),
                                  (int64_t)(cbm_now_ms() - request_start_ms), 0,
                                  cbm_http_conn_response_bytes(conn));
+            if (srv->metrics_sink) {
+                srv->metrics_sink(srv->metrics_sink_context, "_malformed",
+                                  (cbm_now_ms() - request_start_ms) * 1000, true);
+            }
         }
         cbm_httpd_conn_close(conn);
     }
@@ -2065,6 +2076,14 @@ void cbm_http_server_set_index_executor(cbm_http_server_t *srv, cbm_http_index_e
     if (srv) {
         srv->index_executor = executor;
         srv->index_executor_context = context;
+    }
+}
+
+void cbm_http_server_set_metrics_sink(cbm_http_server_t *srv, cbm_http_metrics_sink_fn sink,
+                                      void *context) {
+    if (srv) {
+        srv->metrics_sink = sink;
+        srv->metrics_sink_context = context;
     }
 }
 

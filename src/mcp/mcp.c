@@ -1553,6 +1553,11 @@ struct cbm_mcp_server {
     int64_t active_request_id;       /* JSON-RPC id of the in-progress tool call */
     char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
     cbm_mcp_tool_profile_t tool_profile;
+
+    /* Request-metrics sink (borrowed; installed by the daemon application). */
+    cbm_mcp_metrics_sink_fn metrics_sink;
+    void *metrics_sink_context;
+    char metrics_source[8]; /* "mcp" | "cli"; empty defaults to "mcp" */
 };
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
@@ -1605,6 +1610,20 @@ void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w) {
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
     if (srv) {
         srv->config = cfg;
+    }
+}
+
+void cbm_mcp_server_set_metrics_sink(cbm_mcp_server_t *srv, cbm_mcp_metrics_sink_fn sink,
+                                     void *context) {
+    if (srv) {
+        srv->metrics_sink = sink;
+        srv->metrics_sink_context = context;
+    }
+}
+
+void cbm_mcp_server_set_metrics_source(cbm_mcp_server_t *srv, const char *source) {
+    if (srv) {
+        snprintf(srv->metrics_source, sizeof(srv->metrics_source), "%s", source ? source : "");
     }
 }
 
@@ -11352,6 +11371,14 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
                            ((long long)(t1.tv_nsec - t0.tv_nsec) / MCP_MS_TO_US);
         bool is_err = (result_json != NULL) && (strstr(result_json, "\"isError\":true") != NULL);
         cbm_diag_record_query(dur_us, is_err);
+        if (srv->metrics_sink) {
+            const char *metrics_project =
+                srv->session_project[0] ? srv->session_project
+                                        : (srv->current_project ? srv->current_project : "");
+            srv->metrics_sink(srv->metrics_sink_context,
+                              srv->metrics_source[0] ? srv->metrics_source : "mcp", tool_name,
+                              metrics_project, (uint64_t)dur_us, is_err);
+        }
         long long request_dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
                                    ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
         cbm_log_mcp_request(req.method, tool_name, is_err, request_dur_us);

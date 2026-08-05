@@ -14,6 +14,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct cbm_http_server cbm_http_server_t;
 struct cbm_watcher;
@@ -24,6 +25,11 @@ typedef int (*cbm_http_index_executor_fn)(void *context, const char *root_path,
                                           const char *project_name);
 typedef bool (*cbm_http_project_mutation_begin_fn)(void *context, const char *project);
 typedef void (*cbm_http_project_mutation_end_fn)(void *context, const char *project);
+
+/* Request-metrics sink: one call per served HTTP request with the path
+ * (query stripped by the caller of the log line), duration and error flag. */
+typedef void (*cbm_http_metrics_sink_fn)(void *context, const char *path, uint64_t dur_us,
+                                         bool is_error);
 
 /* Create an HTTP server on the given port.
  * Creates its own cbm_mcp_server_t with a separate read-only SQLite connection.
@@ -66,6 +72,10 @@ void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *wat
 /* Route UI indexing through the daemon's shared operation registry. */
 void cbm_http_server_set_index_executor(cbm_http_server_t *srv, cbm_http_index_executor_fn executor,
                                         void *context);
+
+/* Report each served HTTP request to the daemon's metrics accumulator. */
+void cbm_http_server_set_metrics_sink(cbm_http_server_t *srv, cbm_http_metrics_sink_fn sink,
+                                      void *context);
 
 /* Route direct UI mutations and /rpc mutation tools through the daemon's
  * per-project coordination gate. Direct UI calls are non-blocking: begin=false

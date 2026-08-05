@@ -153,6 +153,17 @@ void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
 /* Set external config store reference (for auto_index setting). Not owned. */
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
 
+/* Request-metrics sink: invoked once per completed tool call with the
+ * measured duration and error flag. Borrowed context; never blocks the
+ * request path beyond the callee's own locking. */
+typedef void (*cbm_mcp_metrics_sink_fn)(void *context, const char *source, const char *tool,
+                                        const char *project, uint64_t dur_us, bool is_error);
+void cbm_mcp_server_set_metrics_sink(cbm_mcp_server_t *srv, cbm_mcp_metrics_sink_fn sink,
+                                     void *context);
+/* Label the transport feeding this server ("mcp" for JSON-RPC sessions,
+ * "cli" for daemon TOOL frames); reported to the metrics sink. */
+void cbm_mcp_server_set_metrics_source(cbm_mcp_server_t *srv, const char *source);
+
 /* Set an explicit session context for an embedded/daemon-backed server.
  * session_root is copied and its project name is derived using the same naming
  * rule as indexing. allowed_root is copied when non-NULL; an explicit NULL

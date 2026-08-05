@@ -323,6 +323,9 @@ static void host_http_config_load_default(void *context, cbm_ui_config_t *config
     cbm_ui_config_load(config_out);
 }
 
+static void host_http_metrics_sink(void *context, const char *path, uint64_t dur_us,
+                                   bool is_error);
+
 static cbm_http_server_t *host_http_server_new_default(void *context, int port) {
     (void)context;
     return cbm_http_server_new(port);
@@ -333,6 +336,7 @@ static void host_http_server_configure_default(void *context, cbm_http_server_t 
     (void)context;
     cbm_http_server_set_watcher(server, host->watcher);
     cbm_http_server_set_index_executor(server, host_ui_index, host);
+    cbm_http_server_set_metrics_sink(server, host_http_metrics_sink, host);
     cbm_http_server_set_project_mutation_guard(server, host_ui_mutation_begin, host_ui_mutation_end,
                                                host);
 }
@@ -425,6 +429,16 @@ static void host_http_schedule_retry(host_state_t *host, uint64_t now_ms, const 
     char delay_text[32];
     (void)snprintf(delay_text, sizeof(delay_text), "%u", delay);
     cbm_log_warn("ui.retry_scheduled", "reason", reason, "delay_ms", delay_text);
+}
+
+/* UI HTTP requests feed the same accumulator as tool calls ("http" source). */
+static void host_http_metrics_sink(void *context, const char *path, uint64_t dur_us,
+                                   bool is_error) {
+    host_state_t *host = context;
+    if (host && host->application) {
+        cbm_daemon_application_metrics_record(host->application, "http", path ? path : "", "",
+                                              dur_us, is_error);
+    }
 }
 
 /* Minute cadence for the request-metrics drain, same deadline pattern as the

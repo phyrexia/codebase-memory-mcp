@@ -168,6 +168,13 @@ struct cbm_daemon_application_mutation {
     cbm_daemon_application_mutation_t *next;
 };
 
+/* Bridges cbm_mcp_server tool-call measurements into the accumulator. */
+static void application_metrics_sink(void *context, const char *source, const char *tool,
+                                     const char *project, uint64_t dur_us, bool is_error) {
+    cbm_daemon_application_metrics_record((cbm_daemon_application_t *)context, source, tool,
+                                          project, dur_us, is_error);
+}
+
 typedef struct {
     char bucket_hour[14]; /* UTC "YYYY-MM-DDTHH" */
     char source[16];
@@ -1067,10 +1074,29 @@ static void application_cancelled_result(cbm_index_worker_result_t *result) {
     result->tree_quiesced = true;
 }
 
+static application_attempt_status_t application_job_run_attempt_inner(
+    cbm_daemon_application_job_t *job, const char *marker_path, const char *quarantine_path,
+    application_attempt_t *attempt);
+
+/* Timing/metrics wrapper: one record per physical worker attempt ("index"
+ * source), so coalesced subscriber requests don't inflate the count. */
 static application_attempt_status_t application_job_run_attempt(cbm_daemon_application_job_t *job,
                                                                 const char *marker_path,
                                                                 const char *quarantine_path,
                                                                 application_attempt_t *attempt) {
+    uint64_t t0_ms = cbm_now_ms();
+    application_attempt_status_t status =
+        application_job_run_attempt_inner(job, marker_path, quarantine_path, attempt);
+    cbm_daemon_application_metrics_record(job->application, "index", "index_run",
+                                          job->project_key ? job->project_key : "",
+                                          (cbm_now_ms() - t0_ms) * 1000,
+                                          status == APPLICATION_ATTEMPT_START_FAILED);
+    return status;
+}
+
+static application_attempt_status_t application_job_run_attempt_inner(
+    cbm_daemon_application_job_t *job, const char *marker_path, const char *quarantine_path,
+    application_attempt_t *attempt) {
     application_attempt_init(attempt);
     cbm_daemon_application_t *application = job->application;
     if (application_job_cancel_requested(job)) {
@@ -2269,6 +2295,8 @@ static cbm_daemon_runtime_application_session_t *application_session_open(
     }
     cbm_mcp_server_set_background_tasks(session->mcp, false);
     cbm_mcp_server_set_config(session->mcp, application->config);
+    cbm_mcp_server_set_metrics_sink(session->mcp, application_metrics_sink, application);
+    cbm_mcp_server_set_metrics_source(session->mcp, "mcp");
     cbm_mcp_server_set_index_executor(session->mcp, application_index_execute, session);
     cbm_mcp_server_set_project_mutation_guard(session->mcp, application_session_mutation_begin,
                                               application_session_mutation_end, session);
@@ -2420,7 +2448,16 @@ static cbm_daemon_runtime_application_status_t application_tool_request(
         free(args);
         return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
     }
+    /* TOOL frames bypass the JSON-RPC layer where the mcp/cli sink fires, so
+     * this path measures and records itself — closing the historical blind
+     * spot where CLI traffic was invisible to telemetry. */
+    uint64_t tool_t0_ms = cbm_now_ms();
     char *response = cbm_mcp_handle_tool(session->mcp, tool, args);
+    bool tool_is_err = !response || strstr(response, "\"isError\":true") != NULL;
+    const char *tool_project = cbm_mcp_server_session_project(session->mcp);
+    cbm_daemon_application_metrics_record(session->application, "cli", tool,
+                                          tool_project ? tool_project : "",
+                                          (cbm_now_ms() - tool_t0_ms) * 1000, tool_is_err);
     free(tool);
     free(args);
     if (!response) {
@@ -2498,8 +2535,13 @@ static cbm_daemon_runtime_application_status_t application_request_dispatch(
         if (!input) {
             return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
         }
+        uint64_t hook_t0_ms = cbm_now_ms();
         char *response = cbm_hook_augment_process_for(session->mcp, input, session->hook_event,
                                                       session->hook_dialect);
+        cbm_daemon_application_metrics_record(
+            application, "hook", session->hook_event[0] ? session->hook_event : "hook",
+            cbm_mcp_server_session_project(session->mcp), (cbm_now_ms() - hook_t0_ms) * 1000,
+            response == NULL);
         free(input);
         if (response) {
             size_t response_length = strlen(response);
