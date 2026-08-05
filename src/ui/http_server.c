@@ -729,6 +729,78 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
 
+/* GET /api/indexed-roots → every indexed project with its root_path and
+ * freshness, so the ingest modal can mark folders that are already indexed
+ * and flag orphans whose root no longer exists on disk. One entry per
+ * primary project; "::" shadow rows (miss graphs) share the db and are
+ * skipped exactly like list_projects does (#1044). */
+static void handle_indexed_roots(cbm_http_conn_t *c) {
+    const char *cdir = cbm_resolve_cache_dir();
+    DIR *dir = cdir ? opendir(cdir) : NULL;
+    if (!dir) {
+        cbm_http_replyf(c, 200, g_cors_json, "[]");
+        return;
+    }
+
+    char buf[32768];
+    int pos = 0;
+    http_appendf(buf, sizeof(buf), &pos, "[");
+
+    struct dirent *ent;
+    int count = 0;
+    while ((ent = readdir(dir)) != NULL) {
+        const char *fname = ent->d_name;
+        size_t len = strlen(fname);
+        if (len <= 3 || strcmp(fname + len - 3, ".db") != 0)
+            continue;
+        if (fname[0] == '_') /* _config.db / _cross_repo.db — not projects */
+            continue;
+
+        char full[2048];
+        snprintf(full, sizeof(full), "%s/%s", cdir, fname);
+        cbm_store_t *st = cbm_store_open_path_query(full);
+        if (!st)
+            continue; /* ghost / unreadable — not a resolvable project */
+
+        cbm_project_t *projs = NULL;
+        int n = 0;
+        if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK) {
+            for (int i = 0; i < n; i++) {
+                const cbm_project_t *p = &projs[i];
+                if (!p->name || !p->name[0] || strstr(p->name, "::"))
+                    continue;
+
+                char esc[2048];
+                if (count > 0)
+                    buf[pos++] = ',';
+                cbm_json_escape(esc, (int)sizeof(esc), p->name);
+                http_appendf(buf, sizeof(buf), &pos, "{\"name\":\"%s\"", esc);
+                cbm_json_escape(esc, (int)sizeof(esc), p->root_path ? p->root_path : "");
+                http_appendf(buf, sizeof(buf), &pos, ",\"root_path\":\"%s\"", esc);
+                if (p->indexed_at && p->indexed_at[0]) {
+                    cbm_json_escape(esc, (int)sizeof(esc), p->indexed_at);
+                    http_appendf(buf, sizeof(buf), &pos, ",\"indexed_at\":\"%s\"", esc);
+                }
+                http_appendf(buf, sizeof(buf), &pos,
+                             ",\"nodes\":%d,\"edges\":%d,\"root_exists\":%s}",
+                             cbm_store_count_nodes(st, p->name),
+                             cbm_store_count_edges(st, p->name),
+                             p->root_path && cbm_is_dir(p->root_path) ? "true" : "false");
+                if (pos >= (int)sizeof(buf)) {
+                    pos = (int)sizeof(buf) - 1;
+                }
+                count++;
+            }
+        }
+        cbm_store_free_projects(projs, n);
+        cbm_store_close(st);
+    }
+    closedir(dir);
+
+    http_appendf(buf, sizeof(buf), &pos, "]");
+    cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
+}
+
 /* ── ADR endpoints ────────────────────────────────────────────── */
 
 /* GET /api/adr?project=X — get ADR content for a project */
@@ -1745,6 +1817,13 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     /* GET /api/browse → directory browser for file picker */
     if (is_get && cbm_http_path_match(req->path, "/api/browse*")) {
         handle_browse(c, req);
+        return;
+    }
+
+    /* GET /api/indexed-roots → indexed projects with root paths, for the
+     * ingest modal to mark already-indexed folders and orphans */
+    if (is_get && cbm_http_path_match(req->path, "/api/indexed-roots")) {
+        handle_indexed_roots(c);
         return;
     }
 

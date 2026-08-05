@@ -1843,6 +1843,46 @@ TEST(ui_server_list_projects_responds_under_watchdog) {
     PASS();
 }
 
+/* /api/indexed-roots reports every indexed project with its root_path and
+ * whether that root still exists on disk, so the ingest modal can mark
+ * already-indexed folders and flag orphans. Internal dbs (_config.db) must
+ * never surface as projects. */
+TEST(ui_server_indexed_roots_reports_projects_and_orphans) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+
+    char orphan_root[1088];
+    snprintf(orphan_root, sizeof(orphan_root), "%s/gone", fx.tmpdir);
+
+    cbm_store_t *live = cbm_store_open("roots-live");
+    ASSERT_NOT_NULL(live);
+    ASSERT_EQ(cbm_store_upsert_project(live, "roots-live", fx.tmpdir), CBM_STORE_OK);
+    cbm_store_close(live);
+
+    cbm_store_t *orphan = cbm_store_open("roots-orphan");
+    ASSERT_NOT_NULL(orphan);
+    ASSERT_EQ(cbm_store_upsert_project(orphan, "roots-orphan", orphan_root), CBM_STORE_OK);
+    cbm_store_close(orphan);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char resp[16384];
+    int n = th_http(cbm_http_server_port(ts.srv), "GET /api/indexed-roots HTTP/1.1\r\n\r\n", resp,
+                    sizeof(resp));
+    th_server_stop(&ts);
+
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"roots-live\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"root_exists\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"roots-orphan\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"root_exists\":false"));
+    ASSERT_NULL(strstr(resp, "_config"));
+
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
 #ifdef _WIN32
 typedef struct {
     char path[512];
@@ -2098,5 +2138,6 @@ SUITE(httpd) {
     RUN_TEST(ui_server_stop_interrupts_partial_request_within_one_second);
     /* #798 follow-up: full UI-mode hang repro under live sockets */
     RUN_TEST(ui_server_list_projects_responds_under_watchdog);
+    RUN_TEST(ui_server_indexed_roots_reports_projects_and_orphans);
     RUN_TEST(git_context_resolve_no_hang_under_live_ui_sockets);
 }
