@@ -116,6 +116,19 @@ bool cbm_daemon_application_free(cbm_daemon_application_t *application);
 cbm_daemon_runtime_application_callbacks_t cbm_daemon_application_runtime_callbacks(
     cbm_daemon_application_t *application);
 
+/* Record one served request into the in-memory metrics accumulator (RED:
+ * rate/errors/duration). source: mcp|cli|hook|http|index. Never fails and
+ * never blocks beyond the application mutex. */
+void cbm_daemon_application_metrics_record(cbm_daemon_application_t *application,
+                                           const char *source, const char *name,
+                                           const char *project, uint64_t dur_us, bool is_error);
+
+/* Drain the accumulator into the metrics_requests table of _config.db (one
+ * transaction) and apply retention once per UTC day. On write failure the
+ * accumulated data is restored for the next attempt. Called by the daemon
+ * host loop once a minute. */
+void cbm_daemon_application_metrics_flush(cbm_daemon_application_t *application);
+
 /* Thin-client request helpers. Every helper performs one bounded runtime
  * exchange. MCP notifications succeed with a NULL/zero response. Returned
  * response bytes are malloc-owned and include one trailing NUL for text use;

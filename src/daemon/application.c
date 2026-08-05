@@ -58,6 +58,10 @@ enum {
     APPLICATION_BACKGROUND_REAP_MS = 10000,
     APPLICATION_UPDATE_VERSION_CAP = 128,
     APPLICATION_UPDATE_NOTICE_CAP = 1024,
+    /* Request-metrics accumulator: distinct (bucket, source, name, project)
+     * slots held between minute flushes; saturation folds into "_other". */
+    APPLICATION_METRICS_SLOTS = 256,
+    APPLICATION_METRICS_RETENTION_DAYS = 90,
 };
 
 /* There is deliberately NO production update-check provider. The daemon used to
@@ -164,6 +168,17 @@ struct cbm_daemon_application_mutation {
     cbm_daemon_application_mutation_t *next;
 };
 
+typedef struct {
+    char bucket_hour[14]; /* UTC "YYYY-MM-DDTHH" */
+    char source[16];
+    char name[96];
+    char project[96];
+    int64_t count;
+    int64_t errors;
+    int64_t dur_us_sum;
+    int64_t dur_us_max;
+} cbm_daemon_metrics_slot_t;
+
 struct cbm_daemon_application {
     cbm_mutex_t mutex;
     struct cbm_watcher *watcher;
@@ -191,6 +206,11 @@ struct cbm_daemon_application {
     bool stopping;
     /* See cbm_daemon_application_set_permanent. */
     bool permanent;
+    /* Request-metrics accumulator, recorded under `mutex` and drained by the
+     * host loop once a minute (cbm_daemon_application_metrics_flush). */
+    cbm_daemon_metrics_slot_t metrics_slots[APPLICATION_METRICS_SLOTS];
+    size_t metrics_slot_count;
+    char metrics_last_prune_day[11]; /* UTC "YYYY-MM-DD" of the last prune */
 };
 
 static void application_job_unsubscribe_locked(cbm_daemon_application_job_t *job);
@@ -3344,4 +3364,132 @@ bool cbm_daemon_application_session_retains_store_for_test(
     const cbm_daemon_application_session_t *session =
         (const cbm_daemon_application_session_t *)opaque_session;
     return session && session->mcp && cbm_mcp_server_store(session->mcp) != NULL;
+}
+
+/* ── Request-metrics accumulator (statsd-style, flushed to _config.db) ── */
+
+static void metrics_bucket_now(char *buf, size_t sz) {
+    time_t t = time(NULL);
+    struct tm tm;
+    cbm_gmtime_r(&t, &tm);
+    (void)strftime(buf, sz, "%Y-%m-%dT%H", &tm);
+}
+
+static cbm_daemon_metrics_slot_t *metrics_slot_find_locked(cbm_daemon_application_t *application,
+                                                           const char *bucket, const char *source,
+                                                           const char *name, const char *project) {
+    for (size_t i = 0; i < application->metrics_slot_count; i++) {
+        cbm_daemon_metrics_slot_t *s = &application->metrics_slots[i];
+        if (strcmp(s->bucket_hour, bucket) == 0 && strcmp(s->source, source) == 0 &&
+            strcmp(s->name, name) == 0 && strcmp(s->project, project) == 0) {
+            return s;
+        }
+    }
+    return NULL;
+}
+
+static void metrics_add_locked(cbm_daemon_application_t *application, const char *bucket,
+                               const char *source, const char *name, const char *project,
+                               int64_t count, int64_t errors, int64_t dur_us_sum,
+                               int64_t dur_us_max) {
+    cbm_daemon_metrics_slot_t *slot =
+        metrics_slot_find_locked(application, bucket, source, name, project);
+    if (!slot && application->metrics_slot_count >= APPLICATION_METRICS_SLOTS) {
+        /* Saturated: fold into the per-source overflow slot so pressure stays
+         * visible in the data instead of vanishing. */
+        name = "_other";
+        project = "";
+        slot = metrics_slot_find_locked(application, bucket, source, name, project);
+    }
+    if (!slot) {
+        if (application->metrics_slot_count >= APPLICATION_METRICS_SLOTS) {
+            return;
+        }
+        slot = &application->metrics_slots[application->metrics_slot_count++];
+        memset(slot, 0, sizeof(*slot));
+        snprintf(slot->bucket_hour, sizeof(slot->bucket_hour), "%s", bucket);
+        snprintf(slot->source, sizeof(slot->source), "%s", source);
+        snprintf(slot->name, sizeof(slot->name), "%s", name);
+        snprintf(slot->project, sizeof(slot->project), "%s", project);
+    }
+    slot->count += count;
+    slot->errors += errors;
+    slot->dur_us_sum += dur_us_sum;
+    if (dur_us_max > slot->dur_us_max) {
+        slot->dur_us_max = dur_us_max;
+    }
+}
+
+void cbm_daemon_application_metrics_record(cbm_daemon_application_t *application,
+                                           const char *source, const char *name,
+                                           const char *project, uint64_t dur_us, bool is_error) {
+    if (!application || !source || !name) {
+        return;
+    }
+    char bucket[14];
+    metrics_bucket_now(bucket, sizeof(bucket));
+    cbm_mutex_lock(&application->mutex);
+    metrics_add_locked(application, bucket, source, name, project ? project : "", 1,
+                       is_error ? 1 : 0, (int64_t)dur_us, (int64_t)dur_us);
+    cbm_mutex_unlock(&application->mutex);
+}
+
+void cbm_daemon_application_metrics_flush(cbm_daemon_application_t *application) {
+    if (!application || !application->config) {
+        return;
+    }
+    cbm_daemon_metrics_slot_t snapshot[APPLICATION_METRICS_SLOTS];
+    size_t n = 0;
+    cbm_mutex_lock(&application->mutex);
+    n = application->metrics_slot_count;
+    if (n > 0) {
+        memcpy(snapshot, application->metrics_slots, n * sizeof(snapshot[0]));
+        application->metrics_slot_count = 0;
+    }
+    cbm_mutex_unlock(&application->mutex);
+
+    if (n > 0) {
+        cbm_metrics_entry_t entries[APPLICATION_METRICS_SLOTS];
+        for (size_t i = 0; i < n; i++) {
+            entries[i] = (cbm_metrics_entry_t){
+                .bucket_hour = snapshot[i].bucket_hour,
+                .source = snapshot[i].source,
+                .name = snapshot[i].name,
+                .project = snapshot[i].project,
+                .count = snapshot[i].count,
+                .errors = snapshot[i].errors,
+                .dur_us_sum = snapshot[i].dur_us_sum,
+                .dur_us_max = snapshot[i].dur_us_max,
+            };
+        }
+        if (cbm_config_metrics_flush(application->config, entries, (int)n) != 0) {
+            /* Write failed (e.g. busy lock from a concurrent `config set`):
+             * restore the snapshot so the next minute retries. Metrics never
+             * fail a request or the daemon. */
+            cbm_mutex_lock(&application->mutex);
+            for (size_t i = 0; i < n; i++) {
+                metrics_add_locked(application, snapshot[i].bucket_hour, snapshot[i].source,
+                                   snapshot[i].name, snapshot[i].project, snapshot[i].count,
+                                   snapshot[i].errors, snapshot[i].dur_us_sum,
+                                   snapshot[i].dur_us_max);
+            }
+            cbm_mutex_unlock(&application->mutex);
+            return;
+        }
+    }
+
+    /* Retention: once per UTC day, drop buckets older than the window. */
+    char bucket[14];
+    metrics_bucket_now(bucket, sizeof(bucket));
+    if (strncmp(bucket, application->metrics_last_prune_day,
+                sizeof(application->metrics_last_prune_day) - 1) != 0) {
+        snprintf(application->metrics_last_prune_day,
+                 sizeof(application->metrics_last_prune_day), "%.10s", bucket);
+        time_t cutoff = time(NULL) - (time_t)APPLICATION_METRICS_RETENTION_DAYS * 24 * 3600;
+        struct tm tm;
+        cbm_gmtime_r(&cutoff, &tm);
+        char cutoff_bucket[14];
+        (void)strftime(cutoff_bucket, sizeof(cutoff_bucket), "%Y-%m-%dT%H", &tm);
+        (void)cbm_config_metrics_prune(application->config, cutoff_bucket);
+    }
 }

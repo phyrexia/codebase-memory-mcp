@@ -21,6 +21,7 @@
 #include "ui/config.h"
 #include "watcher/watcher.h"
 
+#include <sqlite3.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -303,6 +304,64 @@ TEST(daemon_application_new_session_does_not_retain_initial_store) {
     ASSERT_NOT_NULL(application);
     ASSERT_NOT_NULL(session);
     ASSERT_FALSE(retains_store);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
+TEST(daemon_application_metrics_record_flush_and_accumulate) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/dapp-metrics-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    cbm_daemon_application_config_t app_cfg = {0};
+    app_cfg.config = cfg;
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&app_cfg);
+    ASSERT_NOT_NULL(application);
+
+    cbm_daemon_application_metrics_record(application, "mcp", "search_graph", "demo", 1500, false);
+    cbm_daemon_application_metrics_record(application, "mcp", "search_graph", "demo", 500, true);
+    cbm_daemon_application_metrics_record(application, "http", "/api/logs", NULL, 100, false);
+    /* NULL source/name must be ignored, never crash. */
+    cbm_daemon_application_metrics_record(application, NULL, "x", NULL, 1, false);
+    cbm_daemon_application_metrics_flush(application);
+    /* Second flush with an empty accumulator must not change the rows. */
+    cbm_daemon_application_metrics_flush(application);
+
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", tmpdir);
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(dbpath, &db), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT count, errors, dur_us_sum, dur_us_max FROM"
+                                 " metrics_requests WHERE source='mcp' AND name='search_graph'"
+                                 " AND project='demo'",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int64(stmt, 0), 2);
+    ASSERT_EQ(sqlite3_column_int64(stmt, 1), 1);
+    ASSERT_EQ(sqlite3_column_int64(stmt, 2), 2000);
+    ASSERT_EQ(sqlite3_column_int64(stmt, 3), 1500);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE); /* exactly one row */
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT COUNT(*) FROM metrics_requests WHERE source='http'"
+                                 " AND name='/api/logs' AND project=''",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    bool stopped = cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    cbm_config_close(cfg);
+    th_rmtree(tmpdir);
     ASSERT_TRUE(stopped);
     PASS();
 }
@@ -4917,5 +4976,6 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_queues_explicit_index_behind_physical_job_limit);
     RUN_TEST(daemon_application_default_limit_admits_four_and_rejects_fifth);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
+    RUN_TEST(daemon_application_metrics_record_flush_and_accumulate);
     RUN_TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained);
 }

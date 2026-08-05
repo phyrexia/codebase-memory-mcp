@@ -45,6 +45,7 @@ enum {
     HOST_DAEMON_CLAIM_TIMEOUT_MS = 12000,
     HOST_WAIT_TICK_MS = 100,
     HOST_HTTP_CONFIG_POLL_MS = 1000,
+    HOST_METRICS_FLUSH_MS = 60000,
     HOST_HTTP_RETRY_INITIAL_MS = 1000,
     HOST_HTTP_RETRY_MAX_MS = 30000,
     HOST_WATCH_INTERVAL_MS = 5000,
@@ -93,6 +94,7 @@ struct host_state {
     bool http_assets_available;
     int http_config_port;
     uint64_t http_next_config_load_ms;
+    uint64_t metrics_next_flush_ms;
     uint64_t http_retry_at_ms;
     uint32_t http_retry_delay_ms;
     uint32_t http_largest_scheduled_retry_ms;
@@ -423,6 +425,16 @@ static void host_http_schedule_retry(host_state_t *host, uint64_t now_ms, const 
     char delay_text[32];
     (void)snprintf(delay_text, sizeof(delay_text), "%u", delay);
     cbm_log_warn("ui.retry_scheduled", "reason", reason, "delay_ms", delay_text);
+}
+
+/* Minute cadence for the request-metrics drain, same deadline pattern as the
+ * HTTP config poll below. Failed drains keep their data (see metrics_flush). */
+static void host_metrics_flush_at(host_state_t *host, uint64_t now_ms) {
+    if (!host || !host->application || now_ms < host->metrics_next_flush_ms) {
+        return;
+    }
+    host->metrics_next_flush_ms = host_deadline_from(now_ms, HOST_METRICS_FLUSH_MS);
+    cbm_daemon_application_metrics_flush(host->application);
 }
 
 static void host_http_reconcile_at(host_state_t *host, uint64_t now_ms, bool force_config_load) {
@@ -857,6 +869,7 @@ static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
             return cbm_daemon_runtime_service_stop(service, HOST_RUNTIME_SHUTDOWN_MS);
         }
         host_http_reconcile_at(host, cbm_now_ms(), false);
+        host_metrics_flush_at(host, cbm_now_ms());
         (void)cbm_daemon_runtime_service_wait_exited(service, HOST_WAIT_TICK_MS);
     }
 }
