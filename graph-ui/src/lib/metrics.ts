@@ -108,6 +108,32 @@ export function topBy(rows: MetricsRow[], dim: "name" | "project" | "source", n:
     .slice(0, n);
 }
 
+/* Rows whose hourly bucket starts at or after the given epoch ms — used to
+ * cut "today" at the viewer's LOCAL midnight, not the UTC calendar day. */
+export function rowsSince(rows: MetricsRow[], sinceMs: number): MetricsRow[] {
+  return rows.filter((r) => {
+    const ms = bucketToMs(r.bucket_hour);
+    return Number.isFinite(ms) && ms >= sinceMs;
+  });
+}
+
+/* Minimal runtime validation at the fetch boundary so a drifted backend
+ * shape degrades to dropped rows instead of NaN in the cards. */
+export function isMetricsRow(v: unknown): v is MetricsRow {
+  if (typeof v !== "object" || v === null) return false;
+  const r = v as Record<string, unknown>;
+  return (
+    typeof r.bucket_hour === "string" &&
+    typeof r.source === "string" &&
+    typeof r.name === "string" &&
+    typeof r.project === "string" &&
+    typeof r.count === "number" &&
+    typeof r.errors === "number" &&
+    typeof r.dur_us_sum === "number" &&
+    typeof r.dur_us_max === "number"
+  );
+}
+
 export function totalsOf(rows: MetricsRow[], series: SeriesPoint[]): MetricsTotals {
   let count = 0;
   let errors = 0;

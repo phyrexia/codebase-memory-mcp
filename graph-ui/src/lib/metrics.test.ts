@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { bucketToMs, seriesByHour, seriesByDay, topBy, totalsOf, type MetricsRow } from "./metrics";
+import {
+  bucketToMs,
+  isMetricsRow,
+  rowsSince,
+  seriesByHour,
+  seriesByDay,
+  topBy,
+  totalsOf,
+  type MetricsRow,
+} from "./metrics";
 
 const row = (partial: Partial<MetricsRow>): MetricsRow => ({
   bucket_hour: "2026-08-05T14",
@@ -78,5 +87,27 @@ describe("totalsOf", () => {
 describe("bucketToMs", () => {
   it("parses UTC hour buckets", () => {
     expect(bucketToMs("2026-08-05T15")).toBe(Date.parse("2026-08-05T15:00:00Z"));
+  });
+});
+
+describe("rowsSince", () => {
+  it("keeps buckets at or after the cutoff and drops malformed ones", () => {
+    const rows = [
+      row({ bucket_hour: "2026-08-05T03" }),
+      row({ bucket_hour: "2026-08-05T04" }),
+      row({ bucket_hour: "not-a-bucket" }),
+    ];
+    const since = Date.parse("2026-08-05T04:00:00Z");
+    expect(rowsSince(rows, since).map((r) => r.bucket_hour)).toEqual(["2026-08-05T04"]);
+  });
+});
+
+describe("isMetricsRow", () => {
+  it("accepts well-formed rows and rejects drifted shapes", () => {
+    expect(isMetricsRow(row({}))).toBe(true);
+    expect(isMetricsRow({ ...row({}), count: "3" })).toBe(false);
+    expect(isMetricsRow({ ...row({}), name: null })).toBe(false);
+    expect(isMetricsRow(null)).toBe(false);
+    expect(isMetricsRow("x")).toBe(false);
   });
 });

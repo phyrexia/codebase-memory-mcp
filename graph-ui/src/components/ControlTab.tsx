@@ -7,6 +7,8 @@ import {
   seriesByDay,
   topBy,
   totalsOf,
+  rowsSince,
+  isMetricsRow,
   type MetricsRow,
   type SeriesPoint,
   type TopEntry,
@@ -144,20 +146,25 @@ function MetricsSection() {
         return;
       }
       const data = await res.json();
-      if (Array.isArray(data.buckets)) setRows(data.buckets as MetricsRow[]);
+      if (Array.isArray(data.buckets)) setRows((data.buckets as unknown[]).filter(isMetricsRow));
     } catch {
       /* keep last data */
     }
   }, []);
 
   useEffect(() => {
+    if (!available) return; /* stop polling once the backend said 404 */
     fetchMetrics();
     const interval = setInterval(fetchMetrics, 10000);
     return () => clearInterval(interval);
-  }, [fetchMetrics]);
+  }, [fetchMetrics, available]);
 
-  const today = new Date().toISOString().slice(0, 10);
-  const todayRows = useMemo(() => rows.filter((r) => r.bucket_hour.startsWith(today)), [rows, today]);
+  /* "Today" cuts at the viewer's local midnight; buckets are UTC hours. */
+  const todayRows = useMemo(() => {
+    const midnight = new Date();
+    midnight.setHours(0, 0, 0, 0);
+    return rowsSince(rows, midnight.getTime());
+  }, [rows]);
   const totals = useMemo(() => totalsOf(todayRows, seriesByHour(todayRows, 24)), [todayRows]);
   const series = useMemo(
     () => (view === "24h" ? seriesByHour(rows, 24) : seriesByDay(rows, 7)),
