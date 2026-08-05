@@ -584,6 +584,10 @@ CBM runs one coordination daemon per account: MCP frontends, hooks, CLI commands
 
 All coordinating processes must be the exact same build. After replacing the binary, stop the old daemon and restart agent sessions so the new cohort can form.
 
+### Request Metrics
+
+The daemon aggregates every served request — MCP tool calls, CLI commands, hook augmentations, UI HTTP requests, and physical index runs — into hourly RED buckets (rate, errors, duration) per source, tool, and project. Counters accumulate in memory and flush to the `metrics_requests` table of `_config.db` once a minute; 90 days are retained. Query them at `GET /api/metrics?hours=N` on the UI port, or open the **Control** tab for the last-24h/7d view with top tools and projects. Metrics are additive and local: no wire-protocol changes, no new files in the cache dir, and older binaries simply ignore the table.
+
 Commands that mutate graph data use shared OS-backed, per-project locks. This serializes conflicting work from CLI and MCP sessions on the same project while allowing unrelated projects to proceed independently.
 
 When stderr is an interactive terminal, the CLI automatically shows lifecycle and indexing progress. Pass `--progress` to force the same feedback when stderr is redirected or the command is run non-interactively. Progress is written only to stderr; stdout remains reserved for the command result, so pipes and scripts stay machine-safe. Pass `--json` when the full MCP result envelope is needed.
