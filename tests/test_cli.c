@@ -23,6 +23,7 @@
 #include <foundation/constants.h>
 #include <foundation/platform.h>
 #include <mcp/mcp.h>
+#include <sqlite3.h>
 #include <foundation/yaml.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
@@ -11360,6 +11361,92 @@ TEST(cli_config_get_set) {
     PASS();
 }
 
+TEST(cli_config_metrics_flush_and_prune) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    cbm_metrics_entry_t entries[2] = {
+        {.bucket_hour = "2026-08-06T10",
+         .source = "mcp",
+         .name = "search_graph",
+         .project = "demo",
+         .count = 3,
+         .errors = 1,
+         .dur_us_sum = 3000,
+         .dur_us_max = 2000},
+        {.bucket_hour = "2026-08-06T10",
+         .source = "http",
+         .name = "/api/logs",
+         .project = NULL, /* stored as "" */
+         .count = 2,
+         .errors = 0,
+         .dur_us_sum = 500,
+         .dur_us_max = 400},
+    };
+    ASSERT_EQ(cbm_config_metrics_flush(cfg, entries, 2), 0);
+    /* Second flush of the same bucket must accumulate, and dur_us_max must
+     * keep the maximum, not the latest. */
+    entries[0].dur_us_max = 900;
+    ASSERT_EQ(cbm_config_metrics_flush(cfg, entries, 2), 0);
+    /* Older bucket, to be pruned below. */
+    entries[0].bucket_hour = "2026-05-01T00";
+    ASSERT_EQ(cbm_config_metrics_flush(cfg, entries, 1), 0);
+    entries[0].bucket_hour = "2026-08-06T10";
+    /* Empty flush is a no-op success. */
+    ASSERT_EQ(cbm_config_metrics_flush(cfg, NULL, 0), 0);
+
+    sqlite3 *db = NULL;
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", tmpdir);
+    ASSERT_EQ(sqlite3_open(dbpath, &db), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT count, errors, dur_us_sum, dur_us_max, project"
+                                 " FROM metrics_requests"
+                                 " WHERE bucket_hour='2026-08-06T10' AND name='search_graph'",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int64(stmt, 0), 6);    /* 3 + 3 */
+    ASSERT_EQ(sqlite3_column_int64(stmt, 1), 2);    /* 1 + 1 */
+    ASSERT_EQ(sqlite3_column_int64(stmt, 2), 6000); /* 3000 + 3000 */
+    ASSERT_EQ(sqlite3_column_int64(stmt, 3), 2000); /* max(2000, 900) */
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT project FROM metrics_requests"
+                                 " WHERE bucket_hour='2026-08-06T10' AND name='/api/logs'",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), ""); /* NULL folded */
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    ASSERT_EQ(cbm_config_metrics_prune(cfg, "2026-08-01T00"), 0);
+    ASSERT_EQ(sqlite3_open(dbpath, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM metrics_requests WHERE bucket_hour<'2026-08-01T00'",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 0); /* old bucket gone */
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM metrics_requests", -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2); /* current bucket intact */
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 typedef struct {
     cbm_config_t *config;
     const char *key;
@@ -12242,6 +12329,7 @@ SUITE(cli) {
     /* Config store (7 tests — group F) */
     RUN_TEST(cli_config_open_close);
     RUN_TEST(cli_config_get_set);
+    RUN_TEST(cli_config_metrics_flush_and_prune);
     RUN_TEST(cli_config_get_result_storage_is_per_thread);
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);

@@ -6346,8 +6346,25 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
         return NULL;
     }
 
-    /* Create table if not exists */
-    const char *sql = "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)";
+    /* Writers from two processes can meet here (daemon metrics flush vs a
+     * `config set` from the CLI): give lock waits a short grace instead of
+     * failing immediately. */
+    sqlite3_busy_timeout(db, 2000);
+
+    /* Create tables if not exists (additive-only: older binaries ignore
+     * tables they don't know) */
+    const char *sql =
+        "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);"
+        "CREATE TABLE IF NOT EXISTS metrics_requests ("
+        " bucket_hour TEXT NOT NULL,"
+        " source TEXT NOT NULL,"
+        " name TEXT NOT NULL,"
+        " project TEXT NOT NULL DEFAULT '',"
+        " count INTEGER NOT NULL DEFAULT 0,"
+        " errors INTEGER NOT NULL DEFAULT 0,"
+        " dur_us_sum INTEGER NOT NULL DEFAULT 0,"
+        " dur_us_max INTEGER NOT NULL DEFAULT 0,"
+        " PRIMARY KEY (bucket_hour, source, name, project));";
     char *err_msg = NULL;
     if (sqlite3_exec(db, sql, NULL, NULL, &err_msg) != SQLITE_OK) {
         sqlite3_free(err_msg);
@@ -6455,6 +6472,84 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
         return CLI_ERR;
     }
     sqlite3_bind_text(stmt, SQL_PARAM_1, key, SQL_NUL_TERM, cbm_sqlite_transient);
+
+    int rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : CLI_ERR;
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+/* ── Request metrics (hourly aggregate buckets in _config.db) ──── */
+
+int cbm_config_metrics_flush(cbm_config_t *cfg, const cbm_metrics_entry_t *entries, int n) {
+    if (!cfg || n < 0 || (n > 0 && !entries)) {
+        return CLI_ERR;
+    }
+    if (n == 0) {
+        return 0;
+    }
+    /* IMMEDIATE takes the write lock up front; on busy the whole flush fails
+     * atomically and the caller keeps its in-memory accumulator for the next
+     * attempt — metrics must never be half-written or crash the daemon. */
+    if (sqlite3_exec(cfg->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        return CLI_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cfg->db,
+                           "INSERT INTO metrics_requests (bucket_hour, source, name, project,"
+                           " count, errors, dur_us_sum, dur_us_max)"
+                           " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                           " ON CONFLICT(bucket_hour, source, name, project) DO UPDATE SET"
+                           " count = count + excluded.count,"
+                           " errors = errors + excluded.errors,"
+                           " dur_us_sum = dur_us_sum + excluded.dur_us_sum,"
+                           " dur_us_max = MAX(dur_us_max, excluded.dur_us_max)",
+                           SQL_NUL_TERM, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_exec(cfg->db, "ROLLBACK", NULL, NULL, NULL);
+        return CLI_ERR;
+    }
+    int rc = 0;
+    for (int i = 0; i < n && rc == 0; i++) {
+        const cbm_metrics_entry_t *e = &entries[i];
+        if (!e->bucket_hour || !e->source || !e->name) {
+            rc = CLI_ERR;
+            break;
+        }
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        int p = SQL_PARAM_1;
+        sqlite3_bind_text(stmt, p++, e->bucket_hour, SQL_NUL_TERM, cbm_sqlite_transient);
+        sqlite3_bind_text(stmt, p++, e->source, SQL_NUL_TERM, cbm_sqlite_transient);
+        sqlite3_bind_text(stmt, p++, e->name, SQL_NUL_TERM, cbm_sqlite_transient);
+        sqlite3_bind_text(stmt, p++, e->project ? e->project : "", SQL_NUL_TERM,
+                          cbm_sqlite_transient);
+        sqlite3_bind_int64(stmt, p++, e->count);
+        sqlite3_bind_int64(stmt, p++, e->errors);
+        sqlite3_bind_int64(stmt, p++, e->dur_us_sum);
+        sqlite3_bind_int64(stmt, p++, e->dur_us_max);
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            rc = CLI_ERR;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (rc == 0 && sqlite3_exec(cfg->db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+        rc = CLI_ERR;
+    }
+    if (rc != 0) {
+        sqlite3_exec(cfg->db, "ROLLBACK", NULL, NULL, NULL);
+    }
+    return rc;
+}
+
+int cbm_config_metrics_prune(cbm_config_t *cfg, const char *older_than_bucket) {
+    if (!cfg || !older_than_bucket) {
+        return CLI_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cfg->db, "DELETE FROM metrics_requests WHERE bucket_hour < ?",
+                           SQL_NUL_TERM, &stmt, NULL) != SQLITE_OK) {
+        return CLI_ERR;
+    }
+    sqlite3_bind_text(stmt, SQL_PARAM_1, older_than_bucket, SQL_NUL_TERM, cbm_sqlite_transient);
 
     int rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : CLI_ERR;
     sqlite3_finalize(stmt);

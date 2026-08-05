@@ -390,6 +390,29 @@ int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value);
 /* Delete a config key. Returns 0 on success. */
 int cbm_config_delete(cbm_config_t *cfg, const char *key);
 
+/* One aggregated request-metrics entry (rows of the metrics_requests table
+ * in _config.db). Entries carry their own hourly bucket so a flush spanning
+ * an hour boundary stays a single transaction. project NULL is stored as "". */
+typedef struct {
+    const char *bucket_hour; /* UTC "YYYY-MM-DDTHH" */
+    const char *source;      /* mcp | cli | hook | http | index */
+    const char *name;        /* tool name / http path / hook event / "index_run" */
+    const char *project;
+    int64_t count;
+    int64_t errors;
+    int64_t dur_us_sum;
+    int64_t dur_us_max;
+} cbm_metrics_entry_t;
+
+/* Upsert-add the entries in one transaction. Returns 0 on success; on any
+ * failure (including a busy lock) nothing is written and the caller should
+ * keep its accumulator and retry later. */
+int cbm_config_metrics_flush(cbm_config_t *cfg, const cbm_metrics_entry_t *entries, int n);
+
+/* Delete buckets strictly older than the given "YYYY-MM-DDTHH" (retention).
+ * Returns 0 on success. */
+int cbm_config_metrics_prune(cbm_config_t *cfg, const char *older_than_bucket);
+
 /* Well-known config keys */
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
