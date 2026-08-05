@@ -1,7 +1,16 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { ProcessInfo } from "../lib/types";
 import { useUiMessages } from "../lib/i18n";
+import {
+  seriesByHour,
+  seriesByDay,
+  topBy,
+  totalsOf,
+  type MetricsRow,
+  type SeriesPoint,
+  type TopEntry,
+} from "../lib/metrics";
 
 /* ── Gauge component ────────────────────────────────────── */
 
@@ -70,6 +79,145 @@ function ProcessCard({ proc, selected, onSelect }: {
 
       <p className="text-[10px] text-foreground/15 font-mono truncate">{proc.command}</p>
     </button>
+  );
+}
+
+/* ── Request metrics ────────────────────────────────────── */
+
+function MetricsBars({ series, titleOf }: {
+  series: SeriesPoint[];
+  titleOf: (p: SeriesPoint) => string;
+}) {
+  const max = Math.max(1, ...series.map((p) => p.count));
+  return (
+    <div className="flex items-end gap-[3px] h-24">
+      {series.map((p, i) => (
+        <div key={i} className="flex-1 flex flex-col items-center gap-1 min-w-0" title={titleOf(p)}>
+          <div className="w-full flex flex-col justify-end h-20 rounded-sm overflow-hidden bg-white/[0.03]">
+            <div
+              className="w-full transition-all duration-500"
+              style={{
+                height: `${(p.count / max) * 100}%`,
+                backgroundColor: p.errors > 0 ? "#e05252aa" : "#1DA27E88",
+              }}
+            />
+          </div>
+          {/* Label every few bars to avoid clutter */}
+          {(series.length <= 7 || i % 4 === 0) && (
+            <span className="text-[8px] text-foreground/20 truncate">{p.label}</span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TopTable({ title, entries }: { title: string; entries: TopEntry[] }) {
+  return (
+    <div className="flex-1 rounded-xl border border-border/30 bg-white/[0.02] p-4 min-w-0">
+      <p className="text-[10px] text-foreground/25 uppercase tracking-widest mb-2">{title}</p>
+      {entries.map((e) => (
+        <div key={e.key} className="flex items-center justify-between gap-2 py-1 text-[11px]">
+          <span className="text-foreground/60 font-mono truncate">{e.key}</span>
+          <span className="shrink-0 tabular-nums text-foreground/40">
+            {e.count.toLocaleString()}
+            {e.errors > 0 && <span className="text-red-400/70"> · {e.errors}✕</span>}
+            <span className="text-foreground/20"> · {e.avgMs.toFixed(0)}ms</span>
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function MetricsSection() {
+  const t = useUiMessages();
+  const [rows, setRows] = useState<MetricsRow[]>([]);
+  const [available, setAvailable] = useState(true);
+  const [view, setView] = useState<"24h" | "7d">("24h");
+
+  const fetchMetrics = useCallback(async () => {
+    try {
+      const res = await fetch("/api/metrics?hours=168");
+      if (!res.ok) {
+        setAvailable(false); /* older backend — hide the section */
+        return;
+      }
+      const data = await res.json();
+      if (Array.isArray(data.buckets)) setRows(data.buckets as MetricsRow[]);
+    } catch {
+      /* keep last data */
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchMetrics();
+    const interval = setInterval(fetchMetrics, 10000);
+    return () => clearInterval(interval);
+  }, [fetchMetrics]);
+
+  const today = new Date().toISOString().slice(0, 10);
+  const todayRows = useMemo(() => rows.filter((r) => r.bucket_hour.startsWith(today)), [rows, today]);
+  const totals = useMemo(() => totalsOf(todayRows, seriesByHour(todayRows, 24)), [todayRows]);
+  const series = useMemo(
+    () => (view === "24h" ? seriesByHour(rows, 24) : seriesByDay(rows, 7)),
+    [rows, view],
+  );
+  const topTools = useMemo(() => topBy(rows, "name", 5), [rows]);
+  const topProjects = useMemo(() => topBy(rows.filter((r) => r.project), "project", 5), [rows]);
+
+  if (!available) return null;
+
+  return (
+    <div className="mb-8">
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-[13px] font-medium text-foreground/50">{t.control.metricsTitle}</h3>
+        <div className="flex gap-1">
+          {(["24h", "7d"] as const).map((w) => (
+            <button
+              key={w}
+              onClick={() => setView(w)}
+              className={`px-2 py-1 rounded-md text-[10px] font-medium transition-all ${
+                view === w ? "bg-primary/20 text-primary" : "bg-white/[0.03] text-foreground/30 hover:text-foreground/50"
+              }`}
+            >
+              {w === "24h" ? t.control.windowDay : t.control.windowWeek}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex gap-4 mb-4">
+        {[
+          { label: t.control.requestsToday, value: totals.count.toLocaleString(), color: "text-primary" },
+          { label: t.control.errorsToday, value: totals.errors.toLocaleString(), color: totals.errors > 0 ? "text-red-400/80" : "text-foreground/80" },
+          { label: t.control.peakLabel, value: totals.peak ? `${totals.peak.label} · ${totals.peak.count.toLocaleString()}` : "—", color: "text-foreground/80" },
+          { label: t.control.avgLatency, value: `${totals.avgMs.toFixed(0)} ms`, color: "text-foreground/80" },
+        ].map((s) => (
+          <div key={s.label} className="flex-1 rounded-xl border border-border/30 bg-white/[0.02] p-4">
+            <p className="text-[10px] text-foreground/25 uppercase tracking-widest mb-1">{s.label}</p>
+            <p className={`text-[18px] font-semibold tabular-nums ${s.color}`}>{s.value}</p>
+          </div>
+        ))}
+      </div>
+
+      {rows.length === 0 ? (
+        <p className="text-foreground/20 text-[12px] text-center py-6">{t.control.noMetrics}</p>
+      ) : (
+        <>
+          <div className="rounded-xl border border-border/30 bg-white/[0.02] p-4 mb-4">
+            <MetricsBars
+              series={series}
+              titleOf={(p) => t.control.metricsBarTitle(p.label, p.count, p.errors)}
+            />
+          </div>
+          <div className="flex gap-4">
+            <TopTable title={t.control.topTools} entries={topTools} />
+            <TopTable title={t.control.topProjects} entries={topProjects} />
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -167,6 +315,9 @@ export function ControlTab() {
           <Gauge label={t.control.processes} value={processes.length} max={10} unit="" color="text-primary" />
           <Gauge label={t.control.selfRam} value={selfMetrics.rss_mb} max={2048} unit="MB" color="text-primary" />
         </div>
+
+        {/* Request metrics */}
+        <MetricsSection />
 
         {/* Process grid */}
         <div className="mb-8">
