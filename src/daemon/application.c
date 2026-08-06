@@ -3434,6 +3434,17 @@ static void metrics_add_locked(cbm_daemon_application_t *application, const char
                                const char *source, const char *name, const char *project,
                                int64_t count, int64_t errors, int64_t dur_us_sum,
                                int64_t dur_us_max) {
+    /* Clamp the lookup key to the slot's storage width up front: comparing an
+     * untruncated input against the truncated stored copy would never match,
+     * burning a fresh slot per call for over-long tool names or HTTP paths
+     * until everything folds into "_other". */
+    char name_key[sizeof(((cbm_daemon_metrics_slot_t *)0)->name)];
+    char project_key[sizeof(((cbm_daemon_metrics_slot_t *)0)->project)];
+    snprintf(name_key, sizeof(name_key), "%s", name);
+    snprintf(project_key, sizeof(project_key), "%s", project);
+    name = name_key;
+    project = project_key;
+
     cbm_daemon_metrics_slot_t *slot =
         metrics_slot_find_locked(application, bucket, source, name, project);
     if (!slot && application->metrics_slot_count >= APPLICATION_METRICS_SLOTS) {
