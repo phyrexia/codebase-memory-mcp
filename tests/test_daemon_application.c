@@ -1035,6 +1035,64 @@ TEST(daemon_application_hook_context_preserves_event_and_dialect) {
     PASS();
 }
 
+/* A hook request on a session that never sent an event must not kill the daemon.
+ * Regression for 2026-08-13: the request-metrics call indexed session->hook_event
+ * without a NULL check, so every eventless augment — Claude Code's PreToolUse path
+ * — segfaulted the daemon inside application_request_dispatch. Non-vacuous: the
+ * context below deliberately omits both event and dialect. */
+TEST(daemon_application_hook_without_event_survives) {
+    char root[APP_TEST_PATH_CAP];
+    (void)snprintf(root, sizeof(root), "%s/cbm-app-hook-noevent-XXXXXX", cbm_tmpdir());
+    bool root_ok = cbm_mkdtemp(root) != NULL;
+    cbm_daemon_application_t *application = cbm_daemon_application_new(NULL);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 306);
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    char input[APP_TEST_PATH_CAP + 32];
+    (void)snprintf(input, sizeof(input), "{\"cwd\":\"%s\"}", root);
+    uint8_t *hook = NULL;
+    uint32_t hook_length = 0;
+    bool encoded = root_ok && session &&
+                   app_test_context_request_options(root, root, CBM_MCP_TOOL_PROFILE_ALL, NULL,
+                                                    NULL, &context, &context_length) &&
+                   app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_HOOK_AUGMENT, input, &hook,
+                                         &hook_length);
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    cbm_daemon_runtime_application_status_t context_status =
+        encoded ? app_test_request(&callbacks, session, context, context_length, &response,
+                                   &response_length)
+                : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(response);
+    response = NULL;
+    /* The daemon must answer this, not die on it. */
+    cbm_daemon_runtime_application_status_t hook_status =
+        context_status == CBM_DAEMON_RUNTIME_APPLICATION_OK
+            ? app_test_request(&callbacks, session, hook, hook_length, &response, &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+
+    free(response);
+    free(context);
+    free(hook);
+    if (session) {
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    if (root_ok) {
+        (void)cbm_rmdir(root);
+    }
+
+    ASSERT_TRUE(root_ok);
+    ASSERT_TRUE(encoded);
+    ASSERT_EQ(context_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(hook_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
 TEST(daemon_application_reference_counts_one_shared_watch) {
     const char *old_cache = getenv("CBM_CACHE_DIR");
     bool had_cache = old_cache != NULL;
@@ -5151,6 +5209,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_ui_readiness_proof_is_generation_bound_before_context);
     RUN_TEST(daemon_application_restricted_profile_owns_no_background_surfaces);
     RUN_TEST(daemon_application_hook_context_preserves_event_and_dialect);
+    RUN_TEST(daemon_application_hook_without_event_survives);
     RUN_TEST(daemon_application_mcp_notification_has_no_response);
     RUN_TEST(daemon_application_reference_counts_one_shared_watch);
     RUN_TEST(daemon_application_free_releases_live_watch_once);

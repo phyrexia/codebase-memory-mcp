@@ -2647,10 +2647,18 @@ static cbm_daemon_runtime_application_status_t application_request_dispatch(
         uint64_t hook_t0_ms = cbm_now_ms();
         char *response = cbm_hook_augment_process_for(session->mcp, input, session->hook_event,
                                                       session->hook_dialect);
-        cbm_daemon_application_metrics_record(
-            application, "hook", session->hook_event[0] ? session->hook_event : "hook",
-            cbm_mcp_server_session_project(session->mcp), (cbm_now_ms() - hook_t0_ms) * 1000,
-            response == NULL);
+        /* hook_event is an optional heap string: SET_CONTEXT leaves it NULL when
+         * the client sends no event (Claude Code's PreToolUse augment does), so
+         * it must be NULL-checked before indexing. Reading [0] off NULL segfaulted
+         * the daemon on every such hook — 11 crashes on 2026-08-13, all landing in
+         * this dispatch. The tool path below already guards its project the same way. */
+        const char *hook_metric_name =
+            (session->hook_event && session->hook_event[0]) ? session->hook_event : "hook";
+        const char *hook_project = cbm_mcp_server_session_project(session->mcp);
+        cbm_daemon_application_metrics_record(application, "hook", hook_metric_name,
+                                              hook_project ? hook_project : "",
+                                              (cbm_now_ms() - hook_t0_ms) * 1000,
+                                              response == NULL);
         free(input);
         if (response) {
             size_t response_length = strlen(response);
