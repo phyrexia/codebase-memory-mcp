@@ -303,7 +303,11 @@ static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
             n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\"}", i > 0 ? "," : "", a->index,
                          esc_e);
         }
-        if (n <= 0 || (size_t)n >= cap - pos - PAIR_LEN) {
+        /* Add rather than subtract: pos is unsigned, so `cap - pos - PAIR_LEN`
+         * wraps once pos reaches cap - PAIR_LEN and stops bounding the memcpy
+         * below. The closing write at the end of this function already guards
+         * additively; match it. */
+        if (n <= 0 || pos + (size_t)n + PAIR_LEN >= cap) {
             break; /* not enough room — close the array with what fits */
         }
         memcpy(props + pos, one, (size_t)n);
@@ -963,5 +967,6 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
     }
 }
 
-/* DLL resolve tracking removed — triggered Windows Defender false positive.
- * See issue #89. */
+/* DLL resolve tracking remains removed after associated builds received a
+ * Windows Defender verdict. The verdict did not provide feature attribution;
+ * see issue #89 for the historical observation. */

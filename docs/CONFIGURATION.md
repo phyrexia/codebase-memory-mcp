@@ -106,7 +106,7 @@ Current format:
 
 Notes:
 
-- If the UI-enabled binary has embedded assets and no UI config file exists yet, the UI auto-enables on first run.
+- If a UI-enabled binary finds its verified external asset pack and no UI config file exists yet, the UI auto-enables on first run. Missing or invalid assets leave the MCP/daemon service available and keep the UI disabled.
 - `CBM_CACHE_DIR` changes both the UI config location and the runtime settings database location.
 - CBM resolves `CBM_CACHE_DIR` to one canonical per-account cache root. A process configured with a different root fails while any CBM session or command is active; close them before switching roots.
 
@@ -116,7 +116,7 @@ These environment variables affect runtime behavior:
 
 | Variable | Default | Description |
 |---|---|---|
-| `CBM_ALLOWED_ROOT` | *(unset)* | Restrict `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused; unset imposes no restriction. Useful when the server may be driven by an untrusted caller (agentic or multi-tenant deployments). |
+| `CBM_ALLOWED_ROOT` | *(unset)* | Confine `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused, and the same check now applies to the graph UI's `POST /api/index` route rather than only to the MCP tool. Unset imposes no *containment* restriction — but see the always-on limits below, which apply whether or not this is set. Useful when the server may be driven by an untrusted caller, e.g. agentic or multi-tenant deployments. |
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the cache directory used for indexes, `_config.db`, and UI `config.json`. |
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. The daemon records the randomized paths in the `diagnostics.start` discovery record (a single JSON line) in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`; that one record is emitted even when `CBM_LOG_LEVEL` suppresses ordinary logging, so the paths always remain discoverable. |
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
@@ -124,6 +124,25 @@ These environment variables affect runtime behavior:
 | `CBM_WORKERS` | auto-detected | Override the indexing worker count. |
 
 Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific and a conflicting `CBM_CACHE_DIR` is rejected. One-shot CLI commands connect to the existing daemon — or start a temporary one when none is running, in which case that temporary daemon captures its environment from the command that spawned it. To pin daemon-owned settings deterministically, export them before `codebase-memory-mcp daemon start`.
+
+
+### Roots that are always refused
+
+Independently of `CBM_ALLOWED_ROOT`, some directories are refused as an indexing
+root because they are too broad or too sensitive to index as a unit:
+
+- a filesystem root, a Windows drive root, or a UNC share root;
+- a top-level system tree — `/etc`, `/var`, `/usr`, `/home`, `/Users`, and on
+  Windows `C:\Windows`, `C:\Users`, `C:\ProgramData`, `C:\Program Files`;
+- your home directory itself (directories *below* it are fine);
+- a credential directory at any depth — `.ssh`, `.aws`, `.gnupg`, `.kube`,
+  `.docker`, `.netrc`, `.git-credentials`, `.password-store`, macOS `Keychains`.
+
+Two limits are worth stating plainly. This constrains *scope*, not
+*sensitivity*: inside a root that is allowed, every file the process can read may
+be indexed and later returned. And the credential list is a denylist, so it
+raises the cost of a mistake rather than closing the class — a directory it does
+not name is permitted.
 
 ## 5. Agent and Editor Integration Files
 

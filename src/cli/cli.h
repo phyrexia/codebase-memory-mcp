@@ -195,6 +195,21 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir);
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run);
 
 #ifdef CBM_CLI_ENABLE_TEST_API
+/* #1558: client-selector vocabulary, exposed so a test can prove every token
+ * resolves and an unknown one is rejected. */
+bool cbm_cli_clients_apply_selection_for_testing(const char *spec, cbm_detected_agents_t *detected);
+size_t cbm_cli_clients_count_for_testing(void);
+const char *cbm_cli_clients_token_for_testing(size_t index);
+#endif
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+/* #1566: name the package manager that owns a binary path, or NULL when it is
+ * not recognisably foreign. Detection must be positive evidence — see the
+ * implementation comment. */
+const char *cbm_cli_external_manager_name_for_testing(const char *self_path);
+#endif
+
+#ifdef CBM_CLI_ENABLE_TEST_API
 int cbm_build_qwen_hook_command_for_testing(const char *binary_path, bool windows, char *command,
                                             size_t command_size, char *shell, size_t shell_size);
 int cbm_build_qoder_hook_command_for_testing(const char *binary_path, bool windows, char *command,
@@ -499,6 +514,20 @@ char *cbm_hook_augment_lifecycle_json_for(const char *input, const char *forced_
  * hard fail-open deadline without constructing a local MCP/store instance. */
 void cbm_hook_augment_arm_deadline(void);
 char *cbm_hook_augment_read_stdin(void);
+
+/* Why a hook client is not augmenting. The hook caller only ever sees stdout,
+ * so each reason that is actionable by the user must have a stdout notice
+ * (#1388: a build-conflicted daemon used to report on stderr alone, which is
+ * invisible in-session and reads as silent skips). */
+typedef enum {
+    CBM_HOOK_ADMISSION_DAEMON_ABSENT = 0, /* no daemon running: `daemon start` heals it */
+    CBM_HOOK_ADMISSION_BUILD_CONFLICT     /* daemon runs another build: needs `daemon stop` */
+} cbm_hook_admission_t;
+
+/* The JSON systemMessage a hook client must print on stdout for `reason`, or
+ * NULL when nothing should be printed. hook_dialect NULL = Claude Code, the
+ * only dialect that surfaces a stdout systemMessage to the user. */
+const char *cbm_hook_admission_notice(cbm_hook_admission_t reason, const char *hook_dialect);
 
 /* Process one already-read hook payload using a caller-owned MCP session.
  * Returns a malloc-owned hook output JSON string, or NULL for fail-open/no

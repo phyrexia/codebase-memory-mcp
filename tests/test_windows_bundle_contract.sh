@@ -139,21 +139,16 @@ require(
     "Makefile.cbm must not expose a Windows launcher target or variable",
 )
 
-# Each archive variant is still produced through the ONE canonical packaging
-# entry, so the four-file layout above governs all of them.
+# Every archive is produced through the ONE canonical packaging entry, so the
+# four-file layout above governs all of them. A reappearing --variant flag would
+# mean the retired two-composition split is back.
 build_workflow = read(".github/workflows/_build.yml")
-for archive, call, ui in (
-    ("codebase-memory-mcp-windows-amd64.zip", "scripts/package-release.sh windows amd64", False),
-    ("codebase-memory-mcp-ui-windows-amd64.zip",
-     "scripts/package-release.sh windows amd64 --variant ui", True),
-    ("codebase-memory-mcp-windows-arm64.zip", "scripts/package-release.sh windows arm64", False),
-    ("codebase-memory-mcp-ui-windows-arm64.zip",
-     "scripts/package-release.sh windows arm64 --variant ui", True),
+for archive, call in (
+    ("codebase-memory-mcp-windows-amd64.zip", "scripts/package-release.sh windows amd64"),
+    ("codebase-memory-mcp-windows-arm64.zip", "scripts/package-release.sh windows arm64"),
 ):
-    # The lookahead keeps a ui call from satisfying a standard check.
-    pattern = re.escape(call) + ("" if ui else r"(?!\s+--variant)")
     require(
-        re.search(pattern, build_workflow) is not None,
+        re.search(re.escape(call) + r"(?!\s+--variant)", build_workflow) is not None,
         f"_build.yml must produce {archive} via the canonical packaging entry ('{call}')",
     )
 
@@ -221,7 +216,7 @@ single_binary_contracts = {
     ),
     "pkg/pypi/src/codebase_memory_mcp/_cli.py": (
         r"_WINDOWS_BINARY_NAME\s*=\s*['\"]codebase-memory-mcp\.exe['\"]",
-        r"def\s+_windows_binary_ready\(",
+        r"def\s+_runtime_set_ready\(",
     ),
 }
 for relative, patterns in single_binary_contracts.items():
@@ -537,8 +532,14 @@ require(
 )
 require(
     sync_case is not None
-    and 'remote_head="$(vm clangarm64 "cd /c/cbm && git rev-parse --verify HEAD")"'
-    in sync_case.group("body")
+    # Assert the PROPERTY, not one spelling of it: capture the remote HEAD into
+    # a local variable and compare it here. The checkout path became a variable
+    # (per-run isolation), so pinning the literal `/c/cbm` was asserting the
+    # implementation rather than the contract it exists to protect.
+    and re.search(
+        r'remote_head="\$\(vm clangarm64 "cd \S+ && git rev-parse --verify HEAD"\)"',
+        sync_case.group("body"),
+    )
     and 'test \\"\\$(git rev-parse --verify HEAD)\\"' not in sync_case.group("body"),
     "win.sh sync must compare the remote HEAD locally instead of nesting shell quotes through "
     "cmd.exe",
@@ -743,8 +744,19 @@ update_windows_block = (
 require(
     update_start >= 0
     and "install.ps1" in update_windows_block
-    and "powershell -ExecutionPolicy Bypass -File" in update_windows_block,
+    and "powershell -File" in update_windows_block,
     "cbm_cmd_update must print the install.ps1 command on Windows",
+)
+# The printed command must NOT carry an execution-policy override. That is a
+# canonical malicious-loader pattern, and emitting it as a string literal put
+# the signature inside every Windows artifact we ship — to save the user one
+# documented step. The hand-off above is the property this contract cares
+# about; the bypass flag was only ever the literal form it happened to take.
+# Unblock-File covers the common case and the README covers the rest.
+require(
+    "ExecutionPolicy" not in update_windows_block,
+    "cbm_cmd_update must not print an execution-policy override "
+    "(document it instead of shipping the pattern in the binary)",
 )
 require(
     "cbm_windows_launcher" not in cli_source

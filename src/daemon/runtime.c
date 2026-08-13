@@ -11,6 +11,7 @@
 #include "foundation/log.h"
 #include "foundation/mem.h"
 #include "foundation/platform.h"
+#include "foundation/win_utf8.h"
 
 #include <limits.h>
 #include <stdatomic.h>
@@ -26,6 +27,14 @@
 static atomic_bool runtime_force_peer_image_unverified_seam;
 void cbm_daemon_runtime_force_peer_image_unverified_for_testing(bool force) {
     atomic_store(&runtime_force_peer_image_unverified_seam, force);
+}
+/* The two failure modes are NOT interchangeable and must be testable apart:
+ * an image that cannot be examined at all is admitted (the peer already proved
+ * build compatibility in the HELLO), while one that CAN be examined and differs
+ * is rejected. One seam per mode keeps each contract honest. */
+static atomic_bool runtime_force_peer_image_mismatch_seam;
+void cbm_daemon_runtime_force_peer_image_mismatch_for_testing(bool force) {
+    atomic_store(&runtime_force_peer_image_mismatch_seam, force);
 }
 #endif
 
@@ -711,10 +720,17 @@ static bool runtime_process_image_reference_acquire(
     LARGE_INTEGER size_before;
     LARGE_INTEGER size_after;
     bool ok = runtime_windows_process_image_snapshot(process, &process_before);
-    HANDLE file = ok ? CreateFileW(process_before.path, GENERIC_READ,
-                                   FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                                   FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, NULL)
-                     : INVALID_HANDLE_VALUE;
+    /* QueryFullProcessImageNameW returns a stable identity spelling for the
+     * before/after comparison, but its Win32/DOS form may exceed MAX_PATH.
+     * Keep that snapshot byte-for-byte and use an owned extended spelling only
+     * at the file-API boundary. */
+    wchar_t *open_path = ok ? cbm_wide_path_to_extended(process_before.path) : NULL;
+    HANDLE file = open_path
+                      ? CreateFileW(open_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                    NULL, OPEN_EXISTING,
+                                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, NULL)
+                      : INVALID_HANDLE_VALUE;
+    free(open_path);
     ok = ok && runtime_windows_file_snapshot(file, &file_before, &size_before) &&
          (!fingerprint || cbm_daemon_build_fingerprint_native_file((uintptr_t)file, fingerprint)) &&
          runtime_windows_file_snapshot(file, &file_after, &size_after) &&
@@ -1744,11 +1760,32 @@ static void *runtime_connection_worker(void *opaque) {
         peer_image_verified = false;
         peer_image_fingerprinted = false;
     }
+    if (atomic_load(&runtime_force_peer_image_mismatch_seam)) {
+        peer_image_verified = false;
+        peer_image_fingerprinted = true;
+    }
 #endif
+    /* Two different failures wear the same "unverified" flag, and treating them
+     * alike broke every ephemeral-path client (#1539/#1383):
+     *
+     *   fingerprint_mismatch — the peer's image WAS read and hashes differently
+     *     than the running daemon. That is the tamper/skew case the gate exists
+     *     for. Still rejected, hard.
+     *   image_unverifiable — the peer's image could not be examined at all
+     *     (ephemeral npx cache paths, ptrace_scope restrictions, sandboxed
+     *     hosts). Nothing was contradicted; we simply could not look. The peer
+     *     ALREADY proved semantic version, build fingerprint, protocol/store/
+     *     feature ABI and cache root in the HELLO exchange above — rejecting on
+     *     top of that traded a real compatibility proof for an unavailable one,
+     *     and made `npx codebase-memory-mcp` unusable with the daemon. Admit,
+     *     and say so out loud so the weaker check is never invisible. */
+    if (!peer_image_verified && !peer_image_fingerprinted) {
+        cbm_log_warn("daemon.client_image_unverifiable_admitted", "reason", "image_unverifiable",
+                     "basis", "rendezvous_hello_verified");
+        peer_image_verified = true;
+    }
     if (!peer_image_verified) {
-        const char *reason =
-            peer_image_fingerprinted ? "fingerprint_mismatch" : "image_unverifiable";
-        cbm_log_error("daemon.client_image_rejected", "reason", reason);
+        cbm_log_error("daemon.client_image_rejected", "reason", "fingerprint_mismatch");
         /* #1383: answer the peer before closing. An unanswered rejection is
          * indistinguishable from a slow cold start on the client side — the
          * caller sat on "pending" indefinitely with the reason visible only in
@@ -1757,10 +1794,9 @@ static void *runtime_connection_worker(void *opaque) {
          * peer; admission stays rejected either way. */
         runtime_result_rejected(&hello_result, "CBM daemon rejected this client's binary image");
         (void)snprintf(hello_result.message, sizeof(hello_result.message),
-                       "CBM daemon rejected this client: %s. The client binary must match the "
-                       "running daemon's build; close CBM sessions (or run 'daemon stop') and "
-                       "retry with one consistent install.",
-                       reason);
+                       "CBM daemon rejected this client: fingerprint_mismatch. The client binary "
+                       "must match the running daemon's build; close CBM sessions (or run "
+                       "'daemon stop') and retry with one consistent install.");
         (void)runtime_send_hello_response(worker->connection, &hello_result);
         runtime_worker_finish(worker);
         return NULL;
