@@ -6645,6 +6645,8 @@ int cbm_config_metrics_prune(cbm_config_t *cfg, const char *older_than_bucket) {
     int rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : CLI_ERR;
     sqlite3_finalize(stmt);
     return rc;
+}
+
 /* Whether the background watcher subsystem should run (default true). The
  * daemon host gates watcher construction and thread startup on this; see
  * cbm_config_watcher_enabled in cli.h. NULL-safe via cbm_config_get_bool (a

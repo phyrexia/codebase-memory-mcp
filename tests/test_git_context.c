@@ -494,6 +494,8 @@ TEST(worktree_status_unavailable_non_repo) {
     cbm_git_worktree_status_free(&st);
     th_rmtree(tmp);
     PASS();
+}
+
 /* ── cbm_git_is_linked_worktree ─────────────────────────────────── */
 /* Detection backing the `ignore_worktrees` config gate. The predicate must be
  * TRUE only for a linked worktree (`git worktree add`) — never for the main
