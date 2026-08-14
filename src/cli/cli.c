@@ -6645,6 +6645,12 @@ int cbm_config_metrics_prune(cbm_config_t *cfg, const char *older_than_bucket) {
     int rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : CLI_ERR;
     sqlite3_finalize(stmt);
     return rc;
+/* Whether the background watcher subsystem should run (default true). The
+ * daemon host gates watcher construction and thread startup on this; see
+ * cbm_config_watcher_enabled in cli.h. NULL-safe via cbm_config_get_bool (a
+ * NULL cfg returns the default). */
+bool cbm_config_watcher_enabled(cbm_config_t *cfg) {
+    return cbm_config_get_bool(cfg, CBM_CONFIG_WATCHER_ENABLED, true);
 }
 
 /* ── Config CLI subcommand ────────────────────────────────────── */
@@ -6669,6 +6675,8 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_IGNORE_WORKTREES, "false",
      "Skip linked git worktrees when indexing automatically"},
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
+    {CBM_CONFIG_WATCHER_ENABLED, "true",
+     "Run the background watcher thread (auto-reindex); false to disable"},
 };
 
 static const config_key_def_t *config_key_lookup(const char *key) {

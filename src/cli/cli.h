@@ -434,6 +434,16 @@ int cbm_config_metrics_prune(cbm_config_t *cfg, const char *older_than_bucket);
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_IGNORE_WORKTREES "ignore_worktrees"
 #define CBM_CONFIG_UI_LANG "ui-lang"
+#define CBM_CONFIG_WATCHER_ENABLED "watcher_enabled"
+
+/* Whether the background watcher subsystem should run at all (default true).
+ * When false, the daemon host skips building and starting the watcher entirely:
+ * the poll thread never starts and no projects are registered (#335). Read once
+ * at daemon startup. Distinct from auto_watch, which only gates per-session
+ * registration while the watcher IS running. NULL-safe — a NULL cfg returns the
+ * default (true), so a failure to open the config store never silently disables
+ * the watcher. */
+bool cbm_config_watcher_enabled(cbm_config_t *cfg);
 
 /* ── Binary activation safety ─────────────────────────────────── */
 
