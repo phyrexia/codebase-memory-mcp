@@ -432,6 +432,7 @@ int cbm_config_metrics_prune(cbm_config_t *cfg, const char *older_than_bucket);
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
+#define CBM_CONFIG_IGNORE_WORKTREES "ignore_worktrees"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 
 /* ── Binary activation safety ─────────────────────────────────── */
