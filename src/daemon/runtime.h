@@ -418,6 +418,8 @@ void cbm_daemon_runtime_service_spurious_wake_for_testing(
     cbm_daemon_runtime_service_t *service);
 uint64_t cbm_daemon_runtime_service_condition_waits_for_testing(
     cbm_daemon_runtime_service_t *service);
+uint64_t cbm_daemon_runtime_service_stopping_wait_entries_for_testing(
+    cbm_daemon_runtime_service_t *service);
 
 /* #1383 test seam: force peer-image verification to fail so tests can exercise
  * the rejection-response path from the in-process harness. */

@@ -170,6 +170,7 @@ struct cbm_daemon_runtime_service {
     bool state_changed_initialized;
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     uint64_t condition_waits_for_testing;
+    uint64_t stopping_wait_entries_for_testing;
 #endif
     cbm_daemon_ipc_listener_t *listener;
     cbm_daemon_coordinator_t *coordinator;
@@ -2148,14 +2149,16 @@ static void *runtime_accept_loop(void *opaque) {
             cbm_mutex_lock(&service->mutex);
             while (service->state == CBM_DAEMON_RUNTIME_SERVICE_STOPPING &&
                    !runtime_service_can_exit_locked(service, cbm_now_ms())) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+                service->stopping_wait_entries_for_testing++;
+#endif
                 uint32_t remaining_ms =
                     runtime_deadline_remaining_ms(service->stop_deadline_ms);
-                if (remaining_ms == 0) {
-                    (void)runtime_service_can_exit_locked(service, cbm_now_ms());
-                    break;
-                }
                 cbm_condition_wait_result_t waited =
-                    cbm_condition_timed_wait(&service->state_changed, &service->mutex, remaining_ms);
+                    remaining_ms == 0
+                        ? cbm_condition_wait(&service->state_changed, &service->mutex)
+                        : cbm_condition_timed_wait(&service->state_changed, &service->mutex,
+                                                   remaining_ms);
                 if (waited == CBM_CONDITION_ERROR) {
                     service->emergency_stop = true;
                     runtime_service_changed_locked(service);
@@ -2586,6 +2589,17 @@ uint64_t cbm_daemon_runtime_service_condition_waits_for_testing(
     uint64_t waits = service->condition_waits_for_testing;
     cbm_mutex_unlock(&service->mutex);
     return waits;
+}
+
+uint64_t cbm_daemon_runtime_service_stopping_wait_entries_for_testing(
+    cbm_daemon_runtime_service_t *service) {
+    if (!service) {
+        return 0;
+    }
+    cbm_mutex_lock(&service->mutex);
+    uint64_t entries = service->stopping_wait_entries_for_testing;
+    cbm_mutex_unlock(&service->mutex);
+    return entries;
 }
 #endif
 

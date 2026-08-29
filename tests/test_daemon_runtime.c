@@ -4019,6 +4019,9 @@ TEST(daemon_runtime_noncooperative_callback_does_not_detach_or_unbound_stop) {
     bool close_begun = false;
     bool stop_returned = true;
     uint64_t stop_elapsed_ms = UINT64_MAX;
+    uint64_t stopping_wait_entries_before = 0;
+    uint64_t stopping_wait_entries_after = UINT64_MAX;
+    bool stopping_wait_entries_bounded = false;
     bool exited_before_release = false;
     bool close_finished = false;
     bool exited_after_release = false;
@@ -4041,6 +4044,14 @@ TEST(daemon_runtime_noncooperative_callback_does_not_detach_or_unbound_stop) {
         uint64_t stop_started_ms = cbm_now_ms();
         stop_returned = cbm_daemon_runtime_service_stop(fixture.service, STOP_BOUND_MS);
         stop_elapsed_ms = cbm_now_ms() - stop_started_ms;
+        stopping_wait_entries_before =
+            cbm_daemon_runtime_service_stopping_wait_entries_for_testing(fixture.service);
+        cbm_usleep(100U * 1000U);
+        stopping_wait_entries_after =
+            cbm_daemon_runtime_service_stopping_wait_entries_for_testing(fixture.service);
+        stopping_wait_entries_bounded =
+            stopping_wait_entries_after >= stopping_wait_entries_before &&
+            stopping_wait_entries_after - stopping_wait_entries_before <= 2;
         exited_before_release =
             cbm_daemon_runtime_service_state(fixture.service) == CBM_DAEMON_RUNTIME_SERVICE_EXITED;
     }
@@ -4081,6 +4092,7 @@ TEST(daemon_runtime_noncooperative_callback_does_not_detach_or_unbound_stop) {
     ASSERT_TRUE(close_begun);
     ASSERT_FALSE(stop_returned);
     ASSERT_TRUE(stop_elapsed_ms <= STOP_OBSERVED_MAX_MS);
+    ASSERT_TRUE(stopping_wait_entries_bounded);
     ASSERT_FALSE(exited_before_release);
     ASSERT_EQ(request_thread_join_rc, 0);
     /* The interrupted transport cannot receive a final disconnect ACK. */
