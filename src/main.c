@@ -44,6 +44,12 @@ enum {
     MAIN_PATH_CAP = 4096,
     MAIN_CONNECT_TIMEOUT_MS = 1000,
     MAIN_STARTUP_TIMEOUT_MS = 10000,
+    /* Backstop for waiting out a held startup transition — see
+     * main_local_transition_acquire. Not a budget for healthy contention: a busy
+     * lock always resolves, either because the live holder finishes or because
+     * the OS finishes reclaiming a dead holder's lock. This only bounds a peer
+     * that never finishes, so a command cannot hang indefinitely. */
+    MAIN_STARTUP_CONTENTION_CEILING_MS = 120000,
     MAIN_MCP_STARTUP_TIMEOUT_MS = 30000,
     MAIN_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000,
     MAIN_HOOK_CONNECT_TIMEOUT_MS = 250,
@@ -756,8 +762,10 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
             return SKIP_ONE;
         }
         args_json = heap_args;
-    } else if (!cli_isatty(0)) {
-        /* piped stdin (UTF-8 clean, no shell quoting): cli <tool> < args.json */
+    } else if (cbm_cli_args_from_stdin_allowed(tool_name, cli_isatty(0) != 0)) {
+        /* piped stdin (UTF-8 clean, no shell quoting): cli <tool> < args.json.
+         * Gated (#1359): a tool that declares no arguments must not read a pipe
+         * nobody is going to write to or close — see the WHY on the predicate. */
         heap_args = cli_slurp_stream(stdin);
         if (heap_args && heap_args[0]) {
             args_json = heap_args;
@@ -904,16 +912,16 @@ static void print_help(void) {
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
     printf("  --port=N     Set UI port (default 9749, persisted)\n");
     printf("  --tool-profile=analysis|scout  Expose a restricted inspection surface\n");
-    printf("\nSupported automatic/conditional client surfaces (43):\n");
+    printf("\nSupported automatic/conditional client surfaces (45):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
     printf("  Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf,\n");
     printf("  Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands,\n");
     printf("  Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush,\n");
-    printf("  Goose, Mistral Vibe, Qoder CLI, Kimi Code CLI, GitLab Duo CLI,\n");
+    printf("  Goose, Mistral Vibe, Grok Build, Qoder CLI, Kimi Code CLI, GitLab Duo CLI,\n");
     printf("  Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Continue / cn,\n");
     printf("  Visual Studio, TRAE, Roo Code, Amazon Q Developer IDE,\n");
     printf("  CodeBuddy Code CLI, IBM Bob IDE, IBM Bob Shell, Pochi, Pi,\n");
-    printf("  Sourcegraph Cody\n");
+    printf("  Sourcegraph Cody, Oh My Pi (omp)\n");
     printf("  Conditional/explicit targets are changed only when their documented\n");
     printf("  platform, marker, or explicit existing config path is present.\n");
     printf("  Manual/UI MCP boundaries: Qodo, Warp, JetBrains AI/ACP, Replit,\n");
@@ -1260,38 +1268,19 @@ static uint64_t main_deadline_after(uint32_t timeout_ms) {
     return now_ms > UINT64_MAX - timeout_ms ? UINT64_MAX : now_ms + timeout_ms;
 }
 
-/* The rendezvous directory lives under %LOCALAPPDATA% (Windows) or the POSIX
- * runtime/home directory by default. That ancestry is not always acceptable to
- * cbm_daemon_ipc_private_directory_secure(): a profile that has acquired a
- * mutation-granting ACE for an untrusted identity -- an AppContainer capability
- * SID, for instance -- fails it, and the binary then cannot start at all, with
- * no supported way to point it elsewhere. `config` is unreachable too, because
- * it needs the same endpoint.
- *
- * CBM_RUNTIME_DIR does NOT relax that check. The directory it names goes
- * through exactly the same validation; the operator merely chooses an ancestry
- * that passes. An unset or rejected value keeps the default behavior. */
-static const char *main_runtime_parent(char *buffer, size_t capacity) {
+static cbm_daemon_ipc_endpoint_t *main_daemon_endpoint_new(void) {
     const char *runtime_parent = NULL;
 #ifdef CBM_ENABLE_TEST_SEAMS
     /* Product daemon coordination is deliberately account-wide. Product-level
      * lifecycle guards need an isolated rendezvous namespace so they cannot
      * attach to or retire a developer's real daemon while exercising exact
      * start/open/stop behavior. The seam is opt-in at compile time and the
-     * detached child inherits the same environment value. It wins over the
-     * product override so existing lifecycle tests keep their isolation. */
-    runtime_parent = cbm_safe_getenv("CBM_TEST_DAEMON_RUNTIME_PARENT", buffer, capacity, NULL);
+     * detached child inherits the same environment value. */
+    char seam_runtime_parent[MAIN_PATH_CAP];
+    runtime_parent = cbm_safe_getenv("CBM_TEST_DAEMON_RUNTIME_PARENT", seam_runtime_parent,
+                                     sizeof(seam_runtime_parent), NULL);
 #endif
-    if (!runtime_parent) {
-        runtime_parent = cbm_safe_getenv("CBM_RUNTIME_DIR", buffer, capacity, NULL);
-    }
-    return runtime_parent;
-}
-
-static cbm_daemon_ipc_endpoint_t *main_daemon_endpoint_new(void) {
-    char runtime_parent_buffer[MAIN_PATH_CAP];
-    return cbm_daemon_bootstrap_endpoint_new(
-        main_runtime_parent(runtime_parent_buffer, sizeof(runtime_parent_buffer)));
+    return cbm_daemon_bootstrap_endpoint_new(runtime_parent);
 }
 
 static bool main_local_cli_feedback_enabled(int argc, char **argv) {
@@ -1305,14 +1294,47 @@ static bool main_local_cli_feedback_enabled(int argc, char **argv) {
     return cbm_cli_progress_enabled(requested, cli_isatty(2) != 0);
 }
 
+/* Acquire the exclusive startup transition, waiting out whatever currently holds it.
+ *
+ * try_acquire answers one of three things, and they must not be conflated:
+ *    1  acquired
+ *   -1  coordination is unsafe or unverifiable — fail now, waiting cannot help
+ *    0  BUSY: the lock is held
+ *
+ * A busy lock always resolves, by one of two routes:
+ *   - a live peer holds it, and releases when its command finishes;
+ *   - the holder is already dead and the operating system has not finished
+ *     reclaiming the lock yet.
+ *
+ * The second route is Windows-specific and is why this wait needs room. On POSIX
+ * the kernel drops flock the instant the owner dies. Windows byte-range locks do
+ * not work that way: Microsoft documents that after a process terminates holding
+ * one, "the time it takes for the operating system to unlock these locks depends
+ * upon available system resources", and that until then "access to these files
+ * may be denied". A loaded CI runner is precisely where those resources are
+ * scarce, and `tests/windows/test_daemon_stability.py` manufactures the situation
+ * deliberately — it hard-kills daemons with `taskkill /F`, including a crash
+ * recovery section, so the next client meets a lock whose owner no longer exists.
+ *
+ * Waiting was previously capped at MAIN_STARTUP_TIMEOUT_MS (10s), which let a
+ * clock decide a user-visible outcome: a command was refused with "coordination
+ * remained busy" while the only thing wrong was that the OS had not yet swept up
+ * after a killed process. Since both routes above terminate, the correct response
+ * to busy is to keep waiting; the ceiling below is a backstop against a peer that
+ * never finishes, not a budget for healthy contention. Clean exits already
+ * release through main_local_transition_close, so this path is only reached after
+ * an abrupt termination or under genuine concurrency. */
 static int main_local_transition_acquire(const cbm_daemon_ipc_endpoint_t *endpoint, FILE *feedback,
                                          cbm_daemon_ipc_local_transition_t **transition_out) {
-    uint64_t deadline = main_deadline_after(MAIN_STARTUP_TIMEOUT_MS);
+    uint64_t ceiling = main_deadline_after(MAIN_STARTUP_CONTENTION_CEILING_MS);
     bool waiting_reported = false;
     for (;;) {
         int status = cbm_daemon_ipc_local_transition_try_acquire(endpoint, transition_out);
-        if (status != 0 || cbm_now_ms() >= deadline) {
-            return status;
+        if (status != 0) {
+            return status; /* acquired, or a genuine coordination failure */
+        }
+        if (cbm_now_ms() >= ceiling) {
+            return 0; /* still busy after the backstop */
         }
         if (feedback && !waiting_reported) {
             (void)fputs("Waiting for CBM startup coordination...\n", feedback);
@@ -1471,11 +1493,18 @@ static bool main_semver_newer(const char *candidate, const char *active) {
  * stdout carries a JSON-RPC error object so the agent surfaces the reason;
  * id is null because the failure precedes reading any request. stderr carries
  * the same text for humans reading a terminal. */
-static void main_report_client_bootstrap_failure(cbm_daemon_process_role_t role,
-                                                 const cbm_daemon_bootstrap_result_t *result) {
-    const char *detail = (result && result->message[0])
-                             ? result->message
-                             : "CBM daemon connection failed before the session was established";
+/* #1582: an MCP client that dies before the session exists must SAY so on
+ * stdout. #1539 added that for bootstrap failures, but every earlier exit on
+ * the client path still wrote to stderr only — which no MCP client surfaces.
+ * A reporter's log showed the whole failure as:
+ *
+ *   Server transport closed unexpectedly, this is likely due to the process
+ *   exiting early
+ *
+ * for what was a specific, nameable refusal. The guarantee is "a server that
+ * cannot start always says why", so it belongs on every client-path exit, not
+ * just the one that happened to be fixed first. */
+static void main_report_client_failure(cbm_daemon_process_role_t role, const char *detail) {
     if (cbm_daemon_process_role_requires_client(role)) {
         char escaped[CBM_DAEMON_CONFLICT_MESSAGE_SIZE * 2];
         size_t out = 0;
@@ -1498,6 +1527,14 @@ static void main_report_client_bootstrap_failure(cbm_daemon_process_role_t role,
         (void)fflush(stdout);
     }
     (void)fprintf(stderr, "codebase-memory-mcp: %s\n", detail);
+}
+
+static void main_report_client_bootstrap_failure(cbm_daemon_process_role_t role,
+                                                 const cbm_daemon_bootstrap_result_t *result) {
+    main_report_client_failure(role, (result && result->message[0])
+                                         ? result->message
+                                         : "CBM daemon connection failed before the session was "
+                                           "established");
 }
 
 /* Client bootstrap with the upgrade policy: a CONFLICT against a PERMANENT
@@ -1541,7 +1578,7 @@ static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
  * one is spawned for this command — with a hint that `daemon start` removes
  * that per-command cost. Only supervised index workers stay in-process. */
 static char *main_local_cli_daemon_execute(const char *tool_name, const char *args_json) {
-    cbm_daemon_ipc_endpoint_t *endpoint = main_daemon_endpoint_new();
+    cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
     char executable_path[MAIN_PATH_CAP] = {0};
     cbm_daemon_build_identity_t identity;
     bool prepared =
@@ -2402,6 +2439,14 @@ int main(int argc, char **argv) {
     }
 #endif
     cbm_daemon_process_role_t role = cbm_daemon_process_role(argc, argv);
+    if (role == CBM_DAEMON_PROCESS_WORKER) {
+        /* Before this process writes ANYTHING. A worker's stderr is a file the
+         * supervisor keeps for post-mortem, and setvbuf only binds before a
+         * stream's first operation — claim it here so even the "could not
+         * start" messages below reach disk. The header follows once the argv
+         * grammar has been validated. */
+        cbm_log_set_crash_durable(true);
+    }
     if (role == CBM_DAEMON_PROCESS_INVALID) {
         (void)fprintf(stderr, "codebase-memory-mcp: invalid internal process arguments\n");
         return EXIT_FAILURE;
@@ -2440,6 +2485,24 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
         cbm_hook_augment_arm_deadline();
 #endif
+        /* Read stdin now and bail before executable-identity hashing when the
+         * event can never produce output (an un-forced PreToolUse Bash call
+         * that is not a search). The identity hash costs ~1.1 s of user CPU
+         * per invocation, and with Bash in the installed matcher nearly every
+         * agent command would pay it for nothing. A no-op touches no shared
+         * state, so it needs no identity. Anything else is handed back via
+         * the prefetch so downstream readers see stdin exactly once. */
+        if (!hook_event) {
+            char *hook_input = cbm_hook_augment_read_stdin();
+            if (!hook_input) {
+                return EXIT_SUCCESS; /* fail open, nothing to augment */
+            }
+            if (cbm_hook_augment_input_is_noop_bash(hook_input)) {
+                free(hook_input);
+                return EXIT_SUCCESS;
+            }
+            cbm_hook_augment_prefetch_stdin(hook_input);
+        }
     }
 
     if (role == CBM_DAEMON_PROCESS_STATELESS) {
@@ -2454,7 +2517,7 @@ int main(int argc, char **argv) {
             (void)fputs("Preparing one-shot local CBM command...\n", feedback);
             (void)fflush(feedback);
         }
-        cbm_daemon_ipc_endpoint_t *local_endpoint = main_daemon_endpoint_new();
+        cbm_daemon_ipc_endpoint_t *local_endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
         char local_executable[MAIN_PATH_CAP];
         cbm_daemon_build_identity_t local_identity;
         cbm_project_lock_manager_t *project_locks =
@@ -2486,9 +2549,22 @@ int main(int argc, char **argv) {
             coordination_failure = main_build_identity_status_name(local_identity_status);
         }
         if (coordination_failure) {
+            /* Name the rule that refused, not just the stage that failed.
+             *
+             * "(endpoint)" alone is what four separate reporters in #1533 and
+             * #1574 were left with: every mode fails, `config list` included,
+             * so the product cannot even be reconfigured out of it, and
+             * CBM_LOG_LEVEL=debug adds nothing. One of them had to build an
+             * instrumented binary to discover that a single ACE on an ancestor
+             * of %LOCALAPPDATA% was the cause. The validation detail already
+             * holds that — it names the directory, the offending SID and the
+             * right it granted — and the daemon-endpoint path a few hundred
+             * lines below has printed it since #1582. This path did not. */
+            const char *why = cbm_daemon_ipc_validation_detail();
             (void)fprintf(
-                stderr, "codebase-memory-mcp: secure CLI coordination could not be created (%s)\n",
-                coordination_failure);
+                stderr,
+                "codebase-memory-mcp: secure CLI coordination could not be created (%s)%s%s\n",
+                coordination_failure, (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
             goto local_cli_cleanup;
         }
         cbm_http_server_set_binary_path(local_executable);
@@ -2523,11 +2599,24 @@ int main(int argc, char **argv) {
         int transition_status =
             main_local_transition_acquire(local_endpoint, feedback, &local_transition);
         if (transition_status != 1 || !local_transition) {
-            (void)fprintf(stderr,
-                          "codebase-memory-mcp: CLI startup coordination %s; retry after the "
-                          "active CBM transition exits\n",
-                          transition_status == 0 ? "remained busy"
-                                                 : "could not be verified safely");
+            if (transition_status == 0) {
+                /* The backstop fired. Name both explanations: after this much
+                 * waiting the likely causes are a peer that is genuinely stuck,
+                 * or (on Windows) a lock left behind by a force-killed process
+                 * that the OS has not reclaimed. "Busy" alone sent reporters
+                 * hunting for a CBM session that had already exited. */
+                (void)fprintf(stderr,
+                              "codebase-memory-mcp: CLI startup coordination stayed busy for "
+                              "%d seconds. Either another CBM command is still running, or a "
+                              "previous one was force-killed and the operating system has not "
+                              "released its lock yet. Check for running CBM processes; if there "
+                              "are none, retry shortly.\n",
+                              MAIN_STARTUP_CONTENTION_CEILING_MS / 1000);
+            } else {
+                (void)fprintf(stderr, "codebase-memory-mcp: CLI startup coordination could not "
+                                      "be verified safely; retry after active CBM sessions "
+                                      "exit\n");
+            }
             goto local_cli_cleanup;
         }
         int seal_status = cbm_daemon_ipc_local_transition_seal_legacy(local_transition);
@@ -2579,7 +2668,7 @@ int main(int argc, char **argv) {
         cleanup_ok = main_version_cohort_close(&cohort_lease, &cohort_manager) && cleanup_ok;
         cbm_daemon_ipc_endpoint_free(local_endpoint);
         if (!cleanup_ok) {
-            (void)fprintf(stderr, "codebase-memory-mcp: CLI coordination cleanup failed\n");
+            main_report_client_failure(role, "CLI coordination cleanup failed");
             return EXIT_FAILURE;
         }
         return exit_code;
@@ -2614,7 +2703,14 @@ int main(int argc, char **argv) {
                           cbm_index_worker_argv_status_message(worker_status));
             return EXIT_FAILURE;
         }
-        cbm_daemon_ipc_endpoint_t *worker_endpoint = main_daemon_endpoint_new();
+        /* First thing a worker records, and the only thing six 0-byte-log
+         * reports were missing: who I am, what I was asked to index, with what
+         * arguments. Everything below here can crash and the log still names
+         * the run. */
+        char *worker_repo_path = cbm_mcp_get_string_arg(invocation.args_json, "repo_path");
+        cbm_index_worker_log_begin(invocation.args_json, worker_repo_path);
+        free(worker_repo_path);
+        cbm_daemon_ipc_endpoint_t *worker_endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
         cbm_project_lock_manager_t *worker_project_locks =
             worker_endpoint ? cbm_project_lock_manager_new(worker_endpoint) : NULL;
         cbm_version_cohort_manager_t *worker_cohort_manager =
@@ -2741,7 +2837,15 @@ int main(int argc, char **argv) {
 
     cbm_daemon_ipc_endpoint_t *endpoint = main_daemon_endpoint_new();
     if (!endpoint) {
-        (void)fprintf(stderr, "codebase-memory-mcp: secure daemon endpoint could not be created\n");
+        /* #1582: this is where an ownership/ancestry refusal lands, and it was
+         * the silent one — stderr only, so an MCP client saw a transport that
+         * closed with no explanation. Include the validation detail, which
+         * names the directory and the rule that refused. */
+        const char *why = cbm_daemon_ipc_validation_detail();
+        char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
+        (void)snprintf(message, sizeof(message), "secure daemon endpoint could not be created%s%s",
+                       (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
+        main_report_client_failure(role, message);
         return EXIT_FAILURE;
     }
 

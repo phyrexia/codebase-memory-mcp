@@ -50,6 +50,26 @@ CBMLanguage cbm_disambiguate_cls(const char *path);
  * On read failure, defaults to CBM_LANG_BITBAKE. */
 CBMLanguage cbm_disambiguate_inc(const char *path);
 
+/* Detect a supported script language from a file's shebang (#!...) first line.
+ * Conservative fallback used only when filename/extension detection is unknown
+ * (see detect_file_language); it never overrides extension or special-filename
+ * matches. Opens the file read-only and reads only a bounded first line.
+ * Recognizes the interpreter *basename* (not the parent path):
+ *   python / python2 / python3 / dotted versions (python3.12) -> CBM_LANG_PYTHON
+ *   sh / bash / dash / ksh / zsh                              -> CBM_LANG_BASH
+ *   node / nodejs                                             -> CBM_LANG_JAVASCRIPT
+ *   ruby -> RUBY, perl -> PERL, php -> PHP, lua -> LUA
+ * Handles direct paths, "env <interp>", "env -S <interp> <args>", and CRLF.
+ * Fails closed (returns CBM_LANG_COUNT) on read error, missing/malformed
+ * shebang, an embedded NUL in the first line, or an unknown interpreter. */
+CBMLanguage cbm_language_from_shebang(const char *path);
+
+/* Disambiguate .cfc files by reading the head of the content.
+ * Returns CBM_LANG_CFML if the component is tag-based (a "<cfcomponent" tag, or a
+ * leading '<'), otherwise CBM_LANG_CFSCRIPT for script-dialect components.
+ * On read failure, defaults to CBM_LANG_CFSCRIPT. */
+CBMLanguage cbm_disambiguate_cfc(const char *path);
+
 /* ── Gitignore pattern matching ──────────────────────────────────── */
 
 typedef struct cbm_gitignore cbm_gitignore_t;

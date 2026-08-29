@@ -34,6 +34,14 @@ const char *cbm_cli_get_version(void);
  * must free. Caller frees the returned JSON string. */
 char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char **err_out);
 
+/* Decide whether `cli <tool>` may take its JSON arguments from stdin, given
+ * that no --args-file, raw-JSON positional and no --flag form was supplied.
+ * stdin_is_tty is the caller's isatty(0) result. True only for a non-terminal
+ * stdin AND a tool whose input_schema declares at least one property; a
+ * zero-argument tool such as list_projects must never read stdin, because an
+ * inherited-but-never-closed pipe makes that read block forever (#1359). */
+bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty);
+
 /* Print per-tool help (usage + the tool's flags with type/description/required)
  * derived from its input_schema, to stdout. Returns 0 if the tool is known,
  * non-zero (and prints nothing) if it is not. */
@@ -185,6 +193,7 @@ typedef struct {
     bool crush;         /* Crush config or CLI exists */
     bool goose;         /* Goose config or CLI exists */
     bool mistral_vibe;  /* $VIBE_HOME, ~/.vibe/, or vibe CLI exists */
+    bool grok;          /* $GROK_HOME, ~/.grok/, or grok CLI exists */
 } cbm_detected_agents_t;
 
 /* Detect which coding agents are installed.
@@ -207,6 +216,10 @@ const char *cbm_cli_clients_token_for_testing(size_t index);
  * not recognisably foreign. Detection must be positive evidence — see the
  * implementation comment. */
 const char *cbm_cli_external_manager_name_for_testing(const char *self_path);
+/* #1558: expose the config-key table so a test can prove a key is discoverable
+ * (`config list`/`set` both walk it). */
+size_t cbm_cli_config_key_count_for_testing(void);
+const char *cbm_cli_config_key_at_for_testing(size_t index);
 #endif
 
 #ifdef CBM_CLI_ENABLE_TEST_API
@@ -235,6 +248,7 @@ bool cbm_hook_augment_invocation_supported_for_testing(const char *dialect,
 bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
                                         bool case_insensitive);
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event);
+bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out, size_t out_sz);
 bool cbm_mcp_command_path_probe_safe_for_testing(const char *command, bool windows);
 void cbm_set_mcp_command_path_probe_counter_for_testing(int *counter);
 int cbm_install_editor_mcp_with_previous_for_testing(const char *binary_path,
@@ -297,7 +311,7 @@ const char *cbm_get_aider_instructions(void);
 /* ── Pre-tool hook management ─────────────────────────────────── */
 
 /* Upsert a PreToolUse hook in ~/.claude/settings.json for Claude Code.
- * Adds a Grep|Glob matcher that reminds to use MCP tools.
+ * Adds a Grep|Glob|Bash matcher that reminds to use MCP tools.
  * Returns 0 on success. */
 int cbm_upsert_claude_hooks(const char *settings_path);
 
@@ -435,6 +449,10 @@ int cbm_config_metrics_prune(cbm_config_t *cfg, const char *older_than_bucket);
 #define CBM_CONFIG_IGNORE_WORKTREES "ignore_worktrees"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 #define CBM_CONFIG_WATCHER_ENABLED "watcher_enabled"
+/* #1558: the graph UI's loopback listener. Stored in the UI config file rather
+ * than the key-value store, but surfaced through `config` so it is findable. */
+#define CBM_CONFIG_UI_ENABLED "ui_enabled"
+#define CBM_CONFIG_UI_PORT "ui_port"
 
 /* Whether the background watcher subsystem should run at all (default true).
  * When false, the daemon host skips building and starting the watcher entirely:
@@ -500,6 +518,12 @@ int cbm_cmd_uninstall(int argc, char **argv);
 
 /* update: check latest release, prompt for index deletion, prompt for ui/standard,
  * download and replace binary. */
+/* True when the installer script (install.sh / install.ps1 on Windows) is
+ * present beside the binary. `update` prints a command built from this;
+ * naming a path that does not exist ends the interaction on a failing
+ * command (#1632). Exposed for testing. */
+bool cbm_cli_installer_beside_binary(const char *dir);
+
 int cbm_cmd_update(int argc, char **argv);
 
 /* config: get/set/list/reset runtime config values. */
@@ -507,7 +531,7 @@ int cbm_cmd_config(int argc, char **argv);
 
 /* hook-augment: stdin-driven Claude Code PreToolUse augmenter.
  * Reads the hook JSON from stdin and emits hookSpecificOutput.additionalContext
- * with search_graph hits for Grep/Glob calls. NEVER blocks: every failure
+ * with search_graph hits for Grep/Glob/Bash search calls. NEVER blocks: every failure
  * path returns 0 with no stdout output. */
 int cbm_cmd_hook_augment(int argc, char **argv);
 
@@ -525,6 +549,10 @@ char *cbm_hook_augment_lifecycle_json_for(const char *input, const char *forced_
  * hard fail-open deadline without constructing a local MCP/store instance. */
 void cbm_hook_augment_arm_deadline(void);
 char *cbm_hook_augment_read_stdin(void);
+/* Pure no-op gate for the hook-client fast path (see hook_augment.c). */
+bool cbm_hook_augment_input_is_noop_bash(const char *input);
+/* Hand back stdin bytes main() consumed early; the next read returns them. */
+void cbm_hook_augment_prefetch_stdin(char *owned);
 
 /* Why a hook client is not augmenting. The hook caller only ever sees stdout,
  * so each reason that is actionable by the user must have a stdout notice

@@ -19,6 +19,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "pipeline/pass_ensemble_routing.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
 #include "git/git_context.h"
@@ -151,6 +152,7 @@ struct cbm_pipeline {
     char *project_name;
     cbm_git_context_t git_ctx;
     char *branch_qn;
+    cbm_index_mode_t requested_mode;
     cbm_index_mode_t mode;
     atomic_int cancelled_storage;
     atomic_int *cancelled;
@@ -189,6 +191,10 @@ struct cbm_pipeline {
     int committed_nodes;
     int committed_edges;
 
+    /* #769: set when a stale-format index was routed through the one-time
+     * full rebuild, so the MCP response can surface the migration. */
+    bool format_migration;
+
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
     char *saved_adr;
@@ -221,6 +227,10 @@ CBMHashTable *cbm_pipeline_get_pkgmap(void) {
 
 void cbm_pipeline_set_pkgmap(CBMHashTable *map) {
     g_pkgmap = map;
+}
+
+bool cbm_pipeline_had_format_migration(const cbm_pipeline_t *p) {
+    return p && p->format_migration;
 }
 
 /* ── Timing helper ──────────────────────────────────────────────── */
@@ -268,6 +278,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->project_name = cbm_project_name_from_path(repo_path);
     (void)cbm_git_context_resolve(repo_path, &p->git_ctx);
     p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
+    p->requested_mode = mode;
     p->mode = mode;
     p->persistence = false;
     p->committed_nodes = -1;
@@ -936,17 +947,22 @@ static void predump_cfg(cbm_pipeline_ctx_t *ctx) {
 static void predump_complexity(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_complexity(ctx);
 }
+static void predump_ensemble(cbm_pipeline_ctx_t *ctx) {
+    cbm_pipeline_pass_ensemble_routing(ctx);
+}
+
 static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
         predump_pass_fn fn;
         const char *name;
         bool moderate_only; /* true = skip in fast mode */
     } passes[] = {
-        {predump_deco, "decorator_tags", false}, {predump_cfg, "configlink", false},
-        {predump_route, "route_match", false},   {predump_sim, "similarity", true},
-        {predump_sem, "semantic_edges", true},   {predump_complexity, "complexity", false},
+        {predump_deco, "decorator_tags", false},   {predump_cfg, "configlink", false},
+        {predump_route, "route_match", false},     {predump_ensemble, "ensemble_routing", false},
+        {predump_sim, "similarity", true},         {predump_sem, "semantic_edges", true},
+        {predump_complexity, "complexity", false},
     };
-    enum { PREDUMP_PASS_COUNT = 6 };
+    enum { PREDUMP_PASS_COUNT = 7 };
     struct timespec t;
     for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
         /* "moderate_only" passes (similarity/semantic edges) run in FULL,
@@ -1258,17 +1274,44 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * Built ONCE here; shared READ-ONLY across all files of that language
      * during resolve. Per-file work is then: parse + AST walk + O(1) lookups
      * — no registry build, no Phase 1b mutations. Languages added so far:
-     * Go, Python. Others (C/C++, TS/JS, PHP, C#) fall back to per-file. */
+     * Go, Python, C/C++, C#, TS/JS, Java. Others (Kotlin, PHP) fall back to per-file. */
     CBMArena cross_lsp_arena;
     cbm_arena_init(&cross_lsp_arena);
     CBMCrossLspRegistries cross_registries = {0};
     if (all_defs) {
+        /* Per-builder split of lsp_cross_prepare — attributes a slow prepare to
+         * ONE language instead of re-diagnosing the whole pass (the cs builder
+         * hid ~140 s behind the pass total, #1669 follow-up). */
+        struct timespec t_b;
+        long b_ms[6];
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.go = cbm_go_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        b_ms[0] = (long)elapsed_ms(t_b);
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.python =
             cbm_py_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        b_ms[1] = (long)elapsed_ms(t_b);
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.c = cbm_c_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        b_ms[2] = (long)elapsed_ms(t_b);
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.cs = cbm_cs_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        b_ms[3] = (long)elapsed_ms(t_b);
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.ts = cbm_ts_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        b_ms[4] = (long)elapsed_ms(t_b);
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
+        cross_registries.java =
+            cbm_java_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        b_ms[5] = (long)elapsed_ms(t_b);
+        char b_buf[6][CBM_SZ_16];
+        const char *b_name[6] = {"go", "python", "c", "cs", "ts", "java"};
+        for (int bi = 0; bi < 6; bi++) {
+            snprintf(b_buf[bi], sizeof(b_buf[bi]), "%ld", b_ms[bi]);
+        }
+        cbm_log_info("lsp_cross_prepare.builders", b_name[0], b_buf[0], b_name[1], b_buf[1],
+                     b_name[2], b_buf[2], b_name[3], b_buf[3], b_name[4], b_buf[4], b_name[5],
+                     b_buf[5]);
         /* Rust: NOT built here. The shared all_defs registry is built LAZILY on the
          * first NULL-filter rust file (the amplifier files) inside cbm_parallel_resolve
          * — repos whose rust files all filter to subsets never pay the build/RSS. */
@@ -1348,7 +1391,7 @@ static int capture_existing_adr(cbm_pipeline_t *p, const char *db_path) {
  * metadata write has succeeded. */
 static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count,
                                         const cbm_file_hash_t *baseline_manifest,
-                                        int baseline_count) {
+                                        int baseline_count, bool force_full_on_mismatch) {
     char *db_path = resolve_db_path(p);
     if (!db_path) {
         return CBM_PIPELINE_FORCE_FULL_REINDEX;
@@ -1368,9 +1411,27 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         free(db_path);
         return CBM_PIPELINE_FORCE_FULL_REINDEX;
     }
+
+    cbm_store_t *fmt_store = cbm_store_open_path_query(db_path);
+    int fmt = 0;
+    if (fmt_store) {
+        cbm_store_get_format_version(fmt_store, &fmt);
+        cbm_store_close(fmt_store);
+    }
+    if (fmt != CBM_INDEX_FORMAT_VERSION) {
+        cbm_log_info("pipeline.route", "path", "format_change_reindex", "stored_format",
+                     itoa_buf(fmt));
+        p->format_migration = true;
+        int adr_rc = capture_existing_adr(p, db_path);
+        (void)cbm_unlink(db_path);
+        (void)cbm_remove_db_sidecars(db_path);
+        free(db_path);
+        return adr_rc != 0 ? adr_rc : CBM_PIPELINE_FORCE_FULL_REINDEX;
+    }
+
     cbm_log_info("pipeline.route", "path", "incremental_manifest");
     int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count, baseline_manifest,
-                                          baseline_count);
+                                          baseline_count, force_full_on_mismatch);
     /* Delete the existing generation ONLY when we are about to rebuild it.
      * On main this was guarded by an early `return rc` for the incremental
      * path; this function has no such early return, so the delete must be
@@ -1419,19 +1480,20 @@ static int pipeline_mode_coverage_rank(cbm_index_mode_t mode) {
  * must never erase files that the cheaper discovery intentionally skips. The
  * exact-manifest pipeline therefore keeps the most comprehensive successfully
  * published mode and performs any changed rebuild at that coverage level. */
-static void promote_mode_to_existing_coverage(cbm_pipeline_t *p) {
+static bool promote_mode_to_existing_coverage(cbm_pipeline_t *p) {
     if (!p || !p->project_name) {
-        return;
+        return false;
     }
     char *db_path = resolve_db_path(p);
     if (!db_path) {
-        return;
+        return false;
     }
     cbm_store_t *store = cbm_store_open_path_query(db_path);
     free(db_path);
     if (!store) {
-        return;
+        return false;
     }
+    bool promoted = false;
     cbm_coverage_meta_t meta = {0};
     if (cbm_store_coverage_meta_get(store, p->project_name, &meta) == CBM_STORE_OK &&
         meta.index_mode) {
@@ -1447,31 +1509,12 @@ static void promote_mode_to_existing_coverage(cbm_pipeline_t *p) {
             cbm_log_info("pipeline.mode", "requested", pipeline_mode_name(p->mode), "effective",
                          pipeline_mode_name(stored_mode), "reason", "preserve_existing_coverage");
             p->mode = stored_mode;
+            promoted = true;
         }
     }
     cbm_store_coverage_meta_clear(&meta);
     cbm_store_close(store);
-}
-
-int cbm_pipeline_refresh_artifact(cbm_pipeline_t *p, const char *db_path) {
-    if (!p || !db_path || !p->repo_path || !p->project_name) {
-        return 0;
-    }
-    bool existing = cbm_artifact_exists(p->repo_path);
-    if (!p->persistence && !existing) {
-        return 0;
-    }
-    int quality = p->persistence ? CBM_ARTIFACT_BEST : CBM_ARTIFACT_FAST;
-    int rc = cbm_artifact_export(db_path, p->repo_path, p->project_name, quality);
-    if (rc != 0) {
-        const char *err = cbm_artifact_export_last_error();
-        if (p->persistence) {
-            cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
-            return rc;
-        }
-        cbm_log_warn("artifact.refresh_failed", "err", err ? err : "unknown");
-    }
-    return 0;
+    return promoted;
 }
 
 /* Defined below, next to the other publication helpers. */
@@ -1740,6 +1783,11 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
         ok = cbm_store_adr_store(store, generation->project, generation->adr_content) ==
              CBM_STORE_OK;
     }
+
+    if (ok) {
+        ok = cbm_store_set_format_version(store, CBM_INDEX_FORMAT_VERSION) == CBM_STORE_OK;
+    }
+
     cbm_log_info("publish.timing", "block", "writes", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t_pub)));
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
@@ -1810,6 +1858,15 @@ int cbm_pipeline_finalize_staged_generation(char *stage_path, const char *final_
     struct timespec t_fin;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_fin);
     if (cbm_remove_db_sidecars(stage_path) != 0) {
+        /* This returned PERSIST_FAILED with no log at all, which is how #1620
+         * presented: every pass succeeded, the worker exited 0, no error-level
+         * line was emitted anywhere, and the user was told "Pipeline failed.
+         * Check repo_path exists and contains source files" — pointed at their
+         * repository for a filesystem permission problem. A publish that fails
+         * must say so. */
+        char errno_text[16];
+        (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
+        cbm_log_error("finalize.sidecar_removal_failed", "errno", errno_text, "stage", stage_path);
         discard_generation_stage(stage_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
@@ -1983,8 +2040,8 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
     if (rc != 0) {
         /* db_path is this function's strdup (resolve_db_path); every return
-         * must release it -- refresh_artifact below only borrows it. LSan on
-         * the Linux leg caught exactly this pair of exits leaking. */
+         * must release it. LSan on the Linux leg caught exactly this pair of
+         * exits leaking. */
         free(db_path);
         return rc;
     }
@@ -1997,12 +2054,8 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
     free(p->saved_adr);
     p->saved_adr = NULL;
 
-    /* The SQLite generation is the commit point. Automatic refresh of an
-     * existing artifact is best-effort, but an explicitly requested artifact
-     * is caller-visible and must report an export failure. */
-    int artifact_rc = cbm_pipeline_refresh_artifact(p, db_path);
     free(db_path);
-    return artifact_rc;
+    return 0;
 }
 
 /* Run githistory pass. */
@@ -2126,11 +2179,10 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return rc;
 }
 
-static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
+static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
-    *was_incremental = false;
 
     CBM_PROF_START(t_pipeline_total);
     struct timespec t0;
@@ -2138,8 +2190,15 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
     cbm_path_alias_collection_t *path_aliases = NULL;
     cbm_file_hash_t *baseline_manifest = NULL;
     int baseline_count = 0;
+    char **requested_excluded_dirs = NULL;
+    int requested_excluded_count = 0;
+    cbm_ignored_file_t *requested_ignored_files = NULL;
+    int requested_ignored_count = 0;
+    int requested_ignored_total = 0;
+    bool restore_requested_discovery = false;
 
-    promote_mode_to_existing_coverage(p);
+    p->mode = p->requested_mode;
+    bool mode_promoted = promote_mode_to_existing_coverage(p);
 
     /* cbm_pipeline_new() may precede the actual run by an arbitrary interval.
      * Refresh once here, then use this exact snapshot for both Branch graph
@@ -2162,7 +2221,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
     /* Phase 1: Discover files */
     CBM_PROF_START(t_discover);
     cbm_discover_opts_t opts = {
-        .mode = p->mode,
+        .mode = p->requested_mode,
         .ignore_file = NULL,
         .max_file_size = 0,
     };
@@ -2196,25 +2255,61 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
     /* Snapshot every semantic input once before routing/extraction. The same
      * bytes drive exact no-op comparison and are checked against a fresh
      * rediscovery immediately before any replacement is published. */
-    rc = cbm_pipeline_build_semantic_manifest(p->project_name, p->repo_path, files, file_count,
-                                              p->excluded_dirs, p->excluded_count, &p->git_ctx,
-                                              p->userconfig, &baseline_manifest, &baseline_count);
+    rc = mode_promoted
+             ? cbm_pipeline_build_fresh_semantic_manifest(p->project_name, p->repo_path, p->mode,
+                                                          &baseline_manifest, &baseline_count)
+             : cbm_pipeline_build_semantic_manifest(p->project_name, p->repo_path, files,
+                                                    file_count, p->excluded_dirs, p->excluded_count,
+                                                    &p->git_ctx, p->userconfig, &baseline_manifest,
+                                                    &baseline_count);
     if (rc != 0) {
         rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
         goto cleanup;
     }
 
     /* Check for existing DB → try incremental or delete for reindex */
-    rc = try_incremental_or_delete_db(p, files, file_count, baseline_manifest, baseline_count);
+    rc = try_incremental_or_delete_db(p, files, file_count, baseline_manifest, baseline_count,
+                                      mode_promoted);
     if (rc == CBM_PIPELINE_ABORT_PRESERVE_DB || rc == CBM_PIPELINE_PERSIST_FAILED) {
         goto cleanup;
     }
     if (rc >= 0) {
-        *was_incremental = true;
         goto cleanup;
     }
     if (rc != CBM_PIPELINE_FORCE_FULL_REINDEX) {
         goto cleanup;
+    }
+
+    /* A changed downgrade rebuilds the complete graph at the stored effective
+     * mode. Keep the requested discovery lists to report the caller's scope. */
+    if (mode_promoted) {
+        cbm_discover_free(files, file_count);
+        files = NULL;
+        file_count = 0;
+
+        requested_excluded_dirs = p->excluded_dirs;
+        requested_excluded_count = p->excluded_count;
+        requested_ignored_files = p->ignored_files;
+        requested_ignored_count = p->ignored_count;
+        requested_ignored_total = p->ignored_total;
+        restore_requested_discovery = true;
+
+        p->excluded_dirs = NULL;
+        p->excluded_count = 0;
+        p->ignored_files = NULL;
+        p->ignored_count = 0;
+        p->ignored_total = 0;
+
+        opts.mode = p->mode;
+        rc = cbm_discover_ex2(p->repo_path, &opts, &files, &file_count, &p->excluded_dirs,
+                              &p->excluded_count, &p->ignored_files, &p->ignored_count,
+                              &p->ignored_total);
+        cbm_log_info("pipeline.rediscover", "requested_mode", pipeline_mode_name(p->requested_mode),
+                     "effective_mode", pipeline_mode_name(p->mode), "files", itoa_buf(file_count));
+        if (rc != 0 || check_cancel(p)) {
+            rc = CBM_NOT_FOUND;
+            goto cleanup;
+        }
     }
     cbm_log_info("pipeline.route", "path", "full");
 
@@ -2265,6 +2360,15 @@ cleanup:
     cbm_registry_free(p->registry);
     p->registry = NULL;
     cbm_path_alias_collection_free(path_aliases);
+    if (restore_requested_discovery) {
+        cbm_discover_free_excluded(p->excluded_dirs, p->excluded_count);
+        cbm_discover_free_ignored(p->ignored_files, p->ignored_count);
+        p->excluded_dirs = requested_excluded_dirs;
+        p->excluded_count = requested_excluded_count;
+        p->ignored_files = requested_ignored_files;
+        p->ignored_count = requested_ignored_count;
+        p->ignored_total = requested_ignored_total;
+    }
     /* Clear and free user extension config */
     cbm_set_user_lang_config(NULL);
     cbm_userconfig_free(p->userconfig);
@@ -2427,7 +2531,7 @@ static int seal_staging_db(const char *staging_path) {
     return rc;
 }
 
-static int export_after_publish(cbm_pipeline_t *p, const char *final_path, bool was_incremental) {
+static int export_after_publish(cbm_pipeline_t *p, const char *final_path) {
     if (p->persistence) {
         CBM_PROF_START(t_art);
         int rc = cbm_artifact_export(final_path, p->repo_path, p->project_name, CBM_ARTIFACT_BEST);
@@ -2438,7 +2542,7 @@ static int export_after_publish(cbm_pipeline_t *p, const char *final_path, bool 
         }
         return rc;
     }
-    if (was_incremental && p->repo_path && cbm_artifact_exists(p->repo_path)) {
+    if (p->repo_path && cbm_artifact_exists(p->repo_path)) {
         (void)cbm_artifact_export(final_path, p->repo_path, p->project_name, CBM_ARTIFACT_FAST);
     }
     return 0;
@@ -2480,8 +2584,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         free(final_path);
         return CBM_NOT_FOUND;
     }
-    bool was_incremental = false;
-    int rc = cbm_pipeline_run_staged(p, &was_incremental);
+    int rc = cbm_pipeline_run_staged(p);
     free(p->db_path);
     p->db_path = configured_db_path;
 
@@ -2551,7 +2654,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 
-    rc = export_after_publish(p, final_path, was_incremental);
+    rc = export_after_publish(p, final_path);
     free(staging_path);
     free(final_path);
     return rc;

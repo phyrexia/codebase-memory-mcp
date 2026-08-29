@@ -275,12 +275,31 @@ static TSNode resolve_ocaml_func_name(TSNode node) {
     return null_node;
 }
 
-// SQL: resolve create_function name from object_reference→identifier or direct identifier.
+// Last identifier (DFS pre-order) under `node`. For a schema-qualified
+// object_reference (schema.table) this is the table name; the schema prefix is
+// ignored. Leaves *found false and returns `best` unchanged if none is present.
+static TSNode sql_last_identifier(TSNode node, TSNode best, bool *found) {
+    if (strcmp(ts_node_type(node), "identifier") == 0) {
+        best = node;
+        *found = true;
+    }
+    uint32_t cc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < cc; i++) {
+        best = sql_last_identifier(ts_node_child(node, i), best, found);
+    }
+    return best;
+}
+
+// SQL: resolve create_function / create_table / create_view name. The name sits
+// on an object_reference; for a schema-qualified name (schema.table) take the
+// last identifier (the table), not the first (the schema).
 static TSNode resolve_sql_func_name(TSNode node) {
     TSNode obj_ref = cbm_find_child_by_kind(node, "object_reference");
     if (!ts_node_is_null(obj_ref)) {
-        TSNode id = cbm_find_child_by_kind(obj_ref, "identifier");
-        if (!ts_node_is_null(id)) {
+        bool found = false;
+        TSNode empty = {0};
+        TSNode id = sql_last_identifier(obj_ref, empty, &found);
+        if (found) {
             return id;
         }
     }
@@ -726,9 +745,14 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
         }
 
         /* Swift and newer tree-sitter-kotlin: function_declaration has no `name`
-         * field; the function name is a `simple_identifier` child. */
+         * field; the function name is a `simple_identifier` child. A Swift
+         * protocol requirement (a bodyless `func` inside a protocol) is a
+         * separate node type with the same shape; it is named here as well as in
+         * resolve_method_name because swift_func_types now admits it, so it can
+         * reach the free-function path too and would otherwise land unnamed. */
         if ((lang == CBM_LANG_SWIFT || lang == CBM_LANG_KOTLIN) &&
-            strcmp(kind, "function_declaration") == 0) {
+            (strcmp(kind, "function_declaration") == 0 ||
+             strcmp(kind, "protocol_function_declaration") == 0)) {
             TSNode si = cbm_find_child_by_kind(node, "simple_identifier");
             if (!ts_node_is_null(si)) {
                 return si;
@@ -1021,6 +1045,18 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
             TSNode nm = ts_node_child_by_field_name(node, TS_FIELD("function"));
             if (ts_node_is_null(nm)) {
                 nm = ts_node_child_by_field_name(node, TS_FIELD("method"));
+            }
+            if (!ts_node_is_null(nm)) {
+                return nm;
+            }
+        }
+
+        /* PL/SQL: create_function / create_procedure / function_* / procedure_*
+         * carry fnc_name / prc_name, not the generic name field. */
+        if (lang == CBM_LANG_PLSQL) {
+            TSNode nm = ts_node_child_by_field_name(node, TS_FIELD("fnc_name"));
+            if (ts_node_is_null(nm)) {
+                nm = ts_node_child_by_field_name(node, TS_FIELD("prc_name"));
             }
             if (!ts_node_is_null(nm)) {
                 return nm;
@@ -2526,7 +2562,7 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
     }
     // Languages whose heritage is not exposed via a tree-sitter field need
     // dedicated walkers; the generic field/keyword path mis-captures them.
-    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS) {
         const char **ts_result = extract_ts_bases(a, node, source);
         if (ts_result) {
             return ts_result;
@@ -3073,7 +3109,7 @@ static char *resolve_param_type_text(CBMArena *a, TSNode param, const char *sour
         return ts_node_is_null(typename) ? NULL : cbm_node_text(a, typename, source);
     }
 
-    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS) {
         if (strcmp(pk, "required_parameter") == 0 || strcmp(pk, "optional_parameter") == 0) {
             return extract_ts_param_type(a, param, source);
         }
@@ -3206,7 +3242,7 @@ static bool is_signature_implicit_receiver(CBMArena *a, TSNode param, const char
         return true;
     }
 
-    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS) {
         char *name = signature_receiver_name(a, param, source, false);
         return name && strcmp(name, "this") == 0;
     }
@@ -3634,7 +3670,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     if (ctx->enclosing_class_qn &&
         (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA ||
          ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX ||
-         ctx->language == CBM_LANG_NIX)) {
+         ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_NIX)) {
         def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, qn_name);
     }
     def.label = "Function";
@@ -3747,6 +3783,14 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         def.is_test = true;
     }
 
+    // A function/method defined in a file cbm treats as a test file is itself
+    // a test, regardless of its own name (tests/helpers/fixtures.c has none
+    // of the test_/_test naming conventions, but every function in it is
+    // still test code) (#1294). OR'd so the Rust attribute check above, which
+    // additionally catches #[test] functions embedded in an otherwise regular
+    // .rs file, is never downgraded by this.
+    def.is_test = def.is_test || ctx->result->is_test_file;
+
     // Docstring
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
 
@@ -3760,7 +3804,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
 
     // JS/TS export detection
     if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-        ctx->language == CBM_LANG_TSX) {
+        ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
         if (is_js_exported(node)) {
             def.is_entry_point = true;
         }
@@ -4016,11 +4060,73 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
     return true;
 }
 
+// Collect FROM/JOIN table references (tree-sitter-sql `relation` nodes) anywhere
+// under `node` and emit them as usages scoped to enclosing_qn. pass_usages then
+// resolves each ref_name to the referenced Table/View def and creates a USAGE
+// lineage edge (e.g. a view -> the tables it selects from). Emitting them here
+// (rather than via the generic identifier walker) sets the correct enclosing
+// scope and bypasses the is_definition_name suppression that drops them.
+static void collect_sql_relation_usages(CBMExtractCtx *ctx, TSNode node, const char *enclosing_qn) {
+    if (strcmp(ts_node_type(node), "relation") == 0) {
+        TSNode nm = resolve_sql_func_name(node); // object_reference -> identifier
+        if (!ts_node_is_null(nm)) {
+            char *tname = cbm_node_text(ctx->arena, nm, ctx->source);
+            if (tname && tname[0]) {
+                CBMUsage usage = {0};
+                usage.ref_name = tname;
+                usage.enclosing_func_qn = enclosing_qn;
+                cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+            }
+        }
+    }
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        collect_sql_relation_usages(ctx, ts_node_child(node, i), enclosing_qn);
+    }
+}
+
+// Handle SQL DDL relation defs: CREATE TABLE / VIEW / MATERIALIZED VIEW become
+// first-class Table/View nodes rather than generic Variable nodes. The relation
+// name sits on an object_reference child (the same shape create_function uses),
+// so resolve_sql_func_name locates it. Also emits FROM/JOIN dependencies as
+// usages so lineage edges form. Returns true if handled.
+static bool extract_sql_ddl_class_def(CBMExtractCtx *ctx, TSNode node, const char *kind) {
+    if (ctx->language != CBM_LANG_SQL) {
+        return false;
+    }
+    const char *label;
+    if (strcmp(kind, "create_table") == 0) {
+        label = "Table";
+    } else if (strcmp(kind, "create_view") == 0 || strcmp(kind, "create_materialized_view") == 0) {
+        label = "View";
+    } else {
+        return false;
+    }
+    TSNode name_node = resolve_sql_func_name(node);
+    if (ts_node_is_null(name_node)) {
+        return false;
+    }
+    char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    if (!name || !name[0]) {
+        return false;
+    }
+    push_simple_class_def(ctx, node, name, label);
+    // Must match push_simple_class_def's QN exactly (qn_safe_segment included)
+    // or pass_usages cannot find the enclosing def for the lineage source.
+    const char *qn =
+        cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, qn_safe_segment(ctx->arena, name));
+    collect_sql_relation_usages(ctx, node, qn);
+    return true;
+}
+
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
     const char *kind = ts_node_type(node);
 
     if (extract_config_class_def(ctx, node, kind)) {
+        return;
+    }
+    if (extract_sql_ddl_class_def(ctx, node, kind)) {
         return;
     }
 
@@ -4159,6 +4265,16 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             name_node = ts_node_child_by_field_name(node, TS_FIELD("component"));
         } else if (strcmp(kind, "type_declaration") == 0) {
             name_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
+        }
+    }
+    // PL/SQL: package / type / trigger names use dedicated fields, not `name`.
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_PLSQL) {
+        name_node = ts_node_child_by_field_name(node, TS_FIELD("package_name"));
+        if (ts_node_is_null(name_node)) {
+            name_node = ts_node_child_by_field_name(node, TS_FIELD("type_name"));
+        }
+        if (ts_node_is_null(name_node)) {
+            name_node = ts_node_child_by_field_name(node, TS_FIELD("trigger_name"));
         }
     }
     // Verilog/SystemVerilog (FIELD_COUNT 0): module/class/interface/package use a
@@ -4301,16 +4417,17 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             label = "Interface";
         }
     }
-    // Rust/Swift/D: a struct is a distinct kind from a class — emit the precise
-    // "Struct" label rather than collapsing it to "Class". Scoped to these three
-    // grammar/LSP languages. Rust's struct node is `struct_item`; D's is
-    // `struct_declaration`. C/C++/Obj-C keep `struct_specifier` → "Class"
-    // (a C++ struct is class-like). "Struct" is a type-like container: every
-    // type-resolution / registry / IMPLEMENTS / LSP-registrar consumer routes
-    // through cbm_label_is_type_like(), so a struct still resolves as a type for
-    // its methods, fields, inheritance and impls.
+    // Rust/Swift/D/ArkTS: a struct is a distinct kind from a class — emit the
+    // precise "Struct" label rather than collapsing it to "Class". Scoped to
+    // these grammar/LSP languages. Rust's struct node is `struct_item`; D's and
+    // ArkTS's is `struct_declaration` (an ArkUI @Component custom component).
+    // C/C++/Obj-C keep `struct_specifier` → "Class" (a C++ struct is
+    // class-like). "Struct" is a type-like container: every type-resolution /
+    // registry / IMPLEMENTS / LSP-registrar consumer routes through
+    // cbm_label_is_type_like(), so a struct still resolves as a type for its
+    // methods, fields, inheritance and impls.
     if (ctx->language == CBM_LANG_RUST || ctx->language == CBM_LANG_SWIFT ||
-        ctx->language == CBM_LANG_DLANG) {
+        ctx->language == CBM_LANG_DLANG || ctx->language == CBM_LANG_ARKTS) {
         if (strcmp(kind, "struct_item") == 0 || strcmp(kind, "struct_declaration") == 0) {
             label = "Struct";
         }
@@ -4490,6 +4607,7 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
     static const char *body_types[] = {"class_body",
                                        "interface_body",
                                        "enum_body",
+                                       "protocol_body",
                                        "template_body",
                                        "interface_type",
                                        "struct_type",
@@ -4610,7 +4728,8 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
     }
 
     if ((lang == CBM_LANG_SWIFT || lang == CBM_LANG_KOTLIN) &&
-        strcmp(ck, "function_declaration") == 0) {
+        (strcmp(ck, "function_declaration") == 0 ||
+         strcmp(ck, "protocol_function_declaration") == 0)) {
         return cbm_find_child_by_kind(child, "simple_identifier");
     }
 
@@ -4727,6 +4846,10 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
 
     // MinHash fingerprint
     compute_fingerprint(ctx, &def, child);
+
+    // A method on a class defined in a test file (e.g. a JUnit/pytest
+    // TestFoo.test_bar) is itself a test, same as free functions (#1294).
+    def.is_test = def.is_test || ctx->result->is_test_file;
 
     cbm_defs_push(&ctx->result->defs, a, def);
 }
@@ -5392,6 +5515,7 @@ static void extract_vars_mainstream(CBMExtractCtx *ctx, TSNode node, CBMArena *a
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         extract_js_vars(ctx, node, a);
         break;
     case CBM_LANG_JAVA: {
@@ -5888,6 +6012,7 @@ static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
     case CBM_LANG_JAVA:
     case CBM_LANG_CSHARP:
     case CBM_LANG_CPP:
@@ -6583,6 +6708,10 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
         def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
         def.is_exported = cbm_is_exported(name, ctx->language);
+        /* Field decorators/annotations (ArkTS @State/@Prop/@Link state members,
+         * TS @Input()-style fields, JVM field annotations via the modifiers
+         * child) — same extraction the class and method paths already run. */
+        def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);
 
         cbm_defs_push(&ctx->result->defs, a, def);
     }
@@ -7381,7 +7510,8 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
                 bool descend_into_func =
                     (ctx->language == CBM_LANG_WOLFRAM || ctx->language == CBM_LANG_TYPESCRIPT ||
                      ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TSX ||
-                     ctx->language == CBM_LANG_ADA || ctx->language == CBM_LANG_NIX);
+                     ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_ADA ||
+                     ctx->language == CBM_LANG_NIX);
                 if (!descend_into_func) {
                     continue;
                 }
@@ -7401,7 +7531,8 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
          * the class/func paths on the namespace node itself. */
         if (is_namespace_scope_kind(ctx->language, kind, node)) {
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
-            if (ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX) {
+            if (ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX ||
+                ctx->language == CBM_LANG_ARKTS) {
                 extract_typescript_namespace_def(ctx, node, frame.enclosing_class_qn);
             }
             wd_push_children_reverse(&s, node, new_enclosing);
@@ -7422,6 +7553,19 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
     }
     free(s.data);
+}
+
+void cbm_extract_definitions_without_module(CBMExtractCtx *ctx) {
+    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
+    if (!spec) {
+        return;
+    }
+
+    // Walk AST for function/class definitions
+    walk_defs(ctx, ctx->root, spec, 0);
+
+    // Extract module-level variables
+    extract_variables(ctx, ctx->root, spec);
 }
 
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
@@ -7445,9 +7589,5 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     mod.is_test = ctx->result->is_test_file;
     cbm_defs_push(&ctx->result->defs, a, mod);
 
-    // Walk AST for function/class definitions
-    walk_defs(ctx, ctx->root, spec, 0);
-
-    // Extract module-level variables
-    extract_variables(ctx, ctx->root, spec);
+    cbm_extract_definitions_without_module(ctx);
 }

@@ -8,7 +8,7 @@ This page documents the configuration files that `codebase-memory-mcp` reads or 
 |---|---|---|---|
 | Global custom extension mapping | `$XDG_CONFIG_HOME/codebase-memory-mcp/config.json` | JSON | Falls back to `~/.config/codebase-memory-mcp/config.json` when `XDG_CONFIG_HOME` is unset. |
 | Per-project custom extension mapping | `{repo_root}/.codebase-memory.json` | JSON | Overrides conflicting global `extra_extensions` entries. |
-| CLI-managed runtime settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db` | SQLite | Written by `codebase-memory-mcp config set/reset`. Also holds the `metrics_requests` table: hourly request counters (source, tool/path, project, count, errors, duration) flushed by the daemon once a minute, retained 90 days, served at `GET /api/metrics` and shown in the UI Control tab. |
+| CLI-managed runtime settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db` | SQLite | Written by `codebase-memory-mcp config set/reset`. The same database also holds additive `metrics_requests` hourly counters, flushed once a minute, retained for 90 days, served at `GET /api/metrics`, and shown in the UI **Control** tab. |
 | UI settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/config.json` | JSON | Stores `ui_enabled` and `ui_port`. |
 | Daemon operation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/cbm-daemon.log` | Structured log | Durable daemon lifecycle, watcher/indexing, UI, resource, and error events. |
 | Admission conflict log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/daemon-conflicts.ndjson` | NDJSON | Exact-build, ABI, and canonical-cache conflicts. |
@@ -87,36 +87,7 @@ Current keys:
 |---|---|---|
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
-| `ignore_worktrees` | `false` | Skip linked git worktrees (`git worktree add`) when indexing automatically. |
-
-### `ignore_worktrees`
-
-Every indexed project is registered under its own absolute root path, so each
-linked worktree becomes a separate permanent index. On machines that create many
-short-lived worktrees, the automatic paths (`auto_index`, and the session hook's
-"index this project first" guidance) turn every throwaway checkout into another
-stored index of what is largely the same repository.
-
-Enable the key to keep those checkouts out of the index:
-
-```bash
-codebase-memory-mcp config set ignore_worktrees true
-```
-
-With it enabled:
-
-- automatic indexing skips a session whose root is a linked worktree;
-- the `hook-augment` context says the worktree is unindexed on purpose instead
-  of telling the agent to run `index_repository`;
-- an explicit `index_repository` call on a linked worktree is refused, and names
-  both ways forward — pass `index_worktree=true` for that one call, or turn the
-  key back off.
-
-The main checkout of the same repository is unaffected, as are ordinary clones
-and submodules. Detection is git plumbing only: a linked worktree's `.git` is a
-file pointing at a gitdir that contains a `commondir` entry.
-
-The default is `false`, so indexing behavior is unchanged unless you opt in.
+| `ignore_worktrees` | `false` | Skip linked git worktrees (`git worktree add`) on automatic indexing paths. |
 | `auto_watch` | `true` | Register the session's project with the background git watcher on connect. Set `false` to keep a session from registering its project (the watcher still runs for other projects). |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
 
@@ -145,6 +116,34 @@ The default is `false`, so indexing behavior is unchanged unless you opt in.
 > Disabling the watcher does not disable anything else: the daemon still starts,
 > `auto_index` still runs, and `index_repository` stays available for manual
 > reindexing.
+
+### `ignore_worktrees`
+
+Every indexed project is registered under its own absolute root path, so a linked
+worktree would otherwise become a separate permanent index. Enable the policy to
+keep short-lived worktrees out of the automatic paths:
+
+```bash
+codebase-memory-mcp config set ignore_worktrees true
+```
+
+With the policy enabled, connection-time and background automatic indexing skip
+sessions rooted in linked worktrees, and hook guidance reports that the checkout
+is intentionally unindexed instead of asking the agent to index it. An explicit
+`index_repository` call on a linked worktree is refused unless that call passes
+`index_worktree=true`.
+
+The check applies only to linked worktrees: the repository's main checkout,
+ordinary clones, and submodules are excluded. Detection uses git plumbing — the
+linked checkout has a `.git` file whose referenced gitdir contains a `commondir`
+entry — rather than treating every `.git` file as a worktree.
+
+The default is `false`, preserving existing indexing behavior. Turn the policy
+back off with:
+
+```bash
+codebase-memory-mcp config set ignore_worktrees false
+```
 
 ## 3. UI Settings
 
@@ -180,9 +179,47 @@ These environment variables affect runtime behavior:
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. The daemon records the randomized paths in the `diagnostics.start` discovery record (a single JSON line) in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`; that one record is emitted even when `CBM_LOG_LEVEL` suppresses ordinary logging, so the paths always remain discoverable. |
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
 | `CBM_LOG_LEVEL` | `info` | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin-frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
+| `CBM_RUNTIME_DIR` | `%LOCALAPPDATA%` (Windows), `/private/tmp` (macOS), `/tmp` (other) | Parent directory for the daemon/CLI rendezvous directory, which CBM creates inside it as `cbm-daemon-<uid>` (`cbm-daemon-<key>` on Windows). Set it when the default ancestry cannot pass the private-directory check — see below. `CBM_CACHE_DIR` does **not** move the rendezvous. |
 | `CBM_WORKERS` | auto-detected | Override the indexing worker count. |
 
-Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific and a conflicting `CBM_CACHE_DIR` is rejected. One-shot CLI commands connect to the existing daemon — or start a temporary one when none is running, in which case that temporary daemon captures its environment from the command that spawned it. To pin daemon-owned settings deterministically, export them before `codebase-memory-mcp daemon start`.
+### Relocating the daemon rendezvous directory
+
+Before it is used, the rendezvous directory and every ancestor of it are checked:
+each ancestor must be owned by you or by root, must not be world-writable (unless
+it is the standard root-owned sticky directory such as `/tmp`), and must carry no
+allow-ACL — on Windows, no ACE granting mutation rights to another identity. The
+rendezvous directory itself is then forced to owner-only (`0700`, no extended ACL
+/ an owner-only DACL).
+
+That ancestry is not always acceptable in the default location. A Windows profile
+that has acquired a capability-SID ACE with `WRITE_DAC` / `WRITE_OWNER` / `DELETE`
+on `%LOCALAPPDATA%` — something an installed packaged app can add — fails the walk,
+and so can an unusual `/tmp` or home directory on POSIX. When that happens *every*
+command fails, `config list` included, so the settings surface cannot be reached
+either:
+
+```text
+codebase-memory-mcp: secure daemon endpoint could not be created
+```
+
+`CBM_RUNTIME_DIR` points the rendezvous at an ancestry you choose:
+
+```bash
+export CBM_RUNTIME_DIR="$HOME/cbm-runtime"   # any directory you own
+```
+
+```powershell
+$env:CBM_RUNTIME_DIR = "D:\cbm-runtime"
+```
+
+The check is not relaxed for the directory you name: it goes through exactly the
+same validation as the default, and a value that fails it is refused rather than
+silently ignored. Because the rendezvous is how sessions find each other, every
+process that should share one daemon must see the same value — set it in the
+environment of your MCP client and your shell alike, or a CLI invocation without
+it will coordinate through the default location instead.
+
+Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
 
 
 ### Roots that are always refused

@@ -14,7 +14,7 @@ Usage: scripts/test.sh [--suites LIST] [--arch ARCH] [VAR=VAL ...]
 
 The canonical test entry: identical in local CI, PR CI, dry run and release.
 DEFAULT (no --suites) is exactly what CI runs: static contract checks
-(Step 0a-0j), a CLEAN sanitizer build, every suite via the parallel harness,
+(Step 0a-0t), a CLEAN sanitizer build, every suite via the parallel harness,
 then the prod-binary regression guards (Steps 4-6).
 
 Modes:
@@ -248,6 +248,27 @@ bash "$ROOT/tests/test_mcpb_bundle_contract.sh"
 echo "=== Step 0p: MCPB registry entries contract (#1246) ==="
 bash "$ROOT/tests/test_mcpb_registry_entries_contract.sh"
 
+echo "=== Step 0q: release candidate derivation contract ==="
+bash "$ROOT/tests/test_release_candidate_derivation_contract.sh"
+
+echo "=== Step 0r: VirusTotal candidate-selection contract ==="
+bash "$ROOT/tests/test_vt_candidate_selection_contract.sh"
+
+echo "=== Step 0s: release gate-chain ordering contract ==="
+bash "$ROOT/tests/test_release_gate_chain_contract.sh"
+
+echo "=== Step 0t: test runtime isolation contract (#1691) ==="
+bash "$ROOT/tests/test_runtime_isolation_contract.sh"
+
+echo "=== Step 0u: shell line-ending contract ==="
+bash "$ROOT/tests/test_shell_line_endings.sh"
+
+echo "=== Step 0v: nomic blob generator contract ==="
+bash "$ROOT/tests/test_nomic_blob_generator_contract.sh"
+
+echo "=== Step 0w: published language-count contract ==="
+bash "$ROOT/tests/test_language_count_contract.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
@@ -321,10 +342,20 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_error_response.
 echo "=== Step 5e: watcher_enabled kill-switch regression (#335) ==="
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_watcher_disabled.sh"
 
+# Step 5e: watcher_enabled kill-switch process regression (#335). Reuses the
+# prod binary built in Step 5; drives a real daemon against an isolated cache
+# and proves watcher_enabled=false stops the watcher from being built, started
+# or registered, while auto_index and manual index_repository keep working.
+# Every wait is a bounded poll on an asserted state (a closed daemon lifecycle),
+# never a fixed sleep — see the header of the test for why.
+echo "=== Step 5e: watcher_enabled kill-switch regression (#335) ==="
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_watcher_disabled.sh"
+
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string
 # audit must allow-list it (Windows-only — Linux smoke never saw it).
 echo "=== Step 6: security-strings allow-list regression ==="
 bash "$ROOT/tests/test_security_strings_allowlist.sh"
+bash "$ROOT/tests/test_destructive_ordering_contract.sh"
 
 echo "=== All tests passed ==="
