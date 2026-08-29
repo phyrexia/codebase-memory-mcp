@@ -1320,13 +1320,14 @@ TEST(daemon_frontend_idle_uses_one_maintenance_observer) {
         .output = output,
         .result = -1,
     };
-    if (output) {
-        fixture.client = NULL; /* cbm_daemon_frontend_mcp_run consumes it. */
-    }
+    cbm_version_cohort_test_terminal_observation_reset();
     cbm_daemon_frontend_test_observer_reset(true);
     cbm_thread_t frontend_thread;
     bool thread_started =
         output && cbm_thread_create(&frontend_thread, 0, frontend_idle_run, &run) == 0;
+    if (thread_started) {
+        fixture.client = NULL; /* The frontend thread now owns and consumes it. */
+    }
     uint64_t deadline = cbm_now_ms() + 10000U;
     while (thread_started && cbm_now_ms() < deadline &&
            (!cbm_daemon_frontend_test_monitor_waiting() ||
@@ -1334,8 +1335,7 @@ TEST(daemon_frontend_idle_uses_one_maintenance_observer) {
         cbm_usleep(1000);
     }
     bool monitor_waiting = cbm_daemon_frontend_test_monitor_waiting();
-    uint64_t monitor_observations = cbm_daemon_frontend_test_monitor_observations();
-    uint64_t worker_observations = cbm_daemon_frontend_test_worker_observations();
+    uint64_t terminal_observations = cbm_version_cohort_test_terminal_observations();
     uint64_t idle_cycles = cbm_daemon_frontend_test_worker_idle_cycles();
     cbm_daemon_frontend_test_observer_release();
     bool input_closed = !pipe_ready || frontend_test_close_fd(input_pipe[1]) == 0;
@@ -1348,9 +1348,8 @@ TEST(daemon_frontend_idle_uses_one_maintenance_observer) {
     ASSERT_TRUE(pipe_ready);
     ASSERT_TRUE(thread_started);
     ASSERT_TRUE(monitor_waiting);
-    ASSERT_EQ(monitor_observations, 1);
     ASSERT_TRUE(idle_cycles > 0);
-    ASSERT_EQ(worker_observations, 0);
+    ASSERT_EQ(terminal_observations, 0);
     ASSERT_TRUE(input_closed);
     ASSERT_TRUE(joined);
     ASSERT_EQ(run.result, 0);
@@ -1363,11 +1362,11 @@ TEST(daemon_frontend_idle_uses_one_maintenance_observer) {
 
 #ifndef _WIN32
 /* RED: an MCP frontend's main thread can remain blocked forever in stdio while
- * install/update/uninstall owns maintenance intent. The already-present
- * frontend worker must observe that native intent and terminate this stateless
- * child, releasing its cohort lease and kernel IPC ownership. A deliberately
- * invalid client pointer is safe only if the maintenance path exits before
- * ordinary EOF/session-close handling, which also pins that exact path. */
+ * install/update/uninstall owns maintenance intent. The independent monitor
+ * must observe that native intent and terminate this stateless child, releasing
+ * its cohort lease and kernel IPC ownership. A deliberately invalid client
+ * pointer is safe only if the monitor exits before ordinary EOF/session-close
+ * handling, which also pins that exact path. */
 TEST(daemon_frontend_maintenance_exits_while_stdio_reader_is_blocked) {
     frontend_maintenance_fixture_t fixture;
     ASSERT_TRUE(frontend_maintenance_fixture_start(&fixture, "blocked-stdio"));

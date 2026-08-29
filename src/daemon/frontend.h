@@ -43,14 +43,12 @@ cbm_daemon_maintenance_monitor_t *cbm_daemon_maintenance_monitor_start(
 bool cbm_daemon_maintenance_monitor_stop(cbm_daemon_maintenance_monitor_t **monitor_io);
 
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-/* Deterministic observer accounting for the idle-frontend regression test.
- * The hold is inert until reset(true), and production builds contain neither
- * these controls nor their counters. */
+/* Deterministic monitor hold and worker-idle accounting for the idle-frontend
+ * regression test. The hold is inert until reset(true), and production builds
+ * contain neither these controls nor the counter. */
 void cbm_daemon_frontend_test_observer_reset(bool hold_monitor);
 void cbm_daemon_frontend_test_observer_release(void);
 bool cbm_daemon_frontend_test_monitor_waiting(void);
-uint64_t cbm_daemon_frontend_test_monitor_observations(void);
-uint64_t cbm_daemon_frontend_test_worker_observations(void);
 uint64_t cbm_daemon_frontend_test_worker_idle_cycles(void);
 #endif
 

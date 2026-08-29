@@ -9,6 +9,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,18 @@ static const char VERSION_COHORT_ADMISSION_FILE[] = "cbm-version-cohort-admissio
 static const char VERSION_COHORT_LIFETIME_FILE[] = "cbm-version-cohort-lifetime-v1.lock";
 static const char VERSION_COHORT_MAINTENANCE_FILE[] = "cbm-version-cohort-maintenance-v1.lock";
 static const char VERSION_COHORT_DAEMON_FILE[] = "cbm-version-cohort-daemon-v1.lock";
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static atomic_uint_fast64_t version_cohort_test_terminal_observations = ATOMIC_VAR_INIT(0);
+
+void cbm_version_cohort_test_terminal_observation_reset(void) {
+    atomic_store_explicit(&version_cohort_test_terminal_observations, 0, memory_order_release);
+}
+
+uint64_t cbm_version_cohort_test_terminal_observations(void) {
+    return atomic_load_explicit(&version_cohort_test_terminal_observations, memory_order_acquire);
+}
+#endif
 
 struct cbm_version_cohort_manager {
     cbm_private_lock_directory_t *directory;
@@ -704,6 +717,10 @@ cbm_version_cohort_maintenance_presence_t cbm_version_cohort_maintenance_presenc
 
 cbm_version_cohort_maintenance_presence_t cbm_version_cohort_maintenance_presence_terminal(
     cbm_version_cohort_manager_t *manager) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    atomic_fetch_add_explicit(&version_cohort_test_terminal_observations, 1,
+                              memory_order_release);
+#endif
     return version_cohort_maintenance_presence_internal(manager, true);
 }
 

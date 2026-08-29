@@ -107,6 +107,13 @@ cbm_version_cohort_maintenance_presence_t cbm_version_cohort_maintenance_presenc
 cbm_version_cohort_maintenance_presence_t cbm_version_cohort_maintenance_presence_terminal(
     cbm_version_cohort_manager_t *manager);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Counts calls at the terminal-presence boundary so tests detect every caller,
+ * including direct calls that bypass frontend-specific helpers. */
+void cbm_version_cohort_test_terminal_observation_reset(void);
+uint64_t cbm_version_cohort_test_terminal_observations(void);
+#endif
+
 /* The daemon holds this separate EX marker for its generation after taking
  * the stable daemon lifetime reservation. A local CLI can therefore
  * distinguish a current coordinated daemon from a pre-cohort daemon without

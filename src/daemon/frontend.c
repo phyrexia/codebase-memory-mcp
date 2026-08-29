@@ -62,7 +62,6 @@ typedef struct {
 typedef struct {
     cbm_mutex_t mutex;
     cbm_daemon_runtime_client_t *client;
-    cbm_version_cohort_manager_t *cohort_manager;
     FILE *out;
     frontend_item_t queue[FRONTEND_QUEUE_CAPACITY];
     size_t head;
@@ -101,13 +100,9 @@ struct cbm_daemon_maintenance_monitor {
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 static atomic_bool frontend_test_hold_monitor = ATOMIC_VAR_INIT(false);
 static atomic_bool frontend_test_monitor_is_waiting = ATOMIC_VAR_INIT(false);
-static atomic_uint_fast64_t frontend_test_monitor_observation_count = ATOMIC_VAR_INIT(0);
-static atomic_uint_fast64_t frontend_test_worker_observation_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t frontend_test_worker_idle_count = ATOMIC_VAR_INIT(0);
 
 void cbm_daemon_frontend_test_observer_reset(bool hold_monitor) {
-    atomic_store_explicit(&frontend_test_monitor_observation_count, 0, memory_order_release);
-    atomic_store_explicit(&frontend_test_worker_observation_count, 0, memory_order_release);
     atomic_store_explicit(&frontend_test_worker_idle_count, 0, memory_order_release);
     atomic_store_explicit(&frontend_test_monitor_is_waiting, false, memory_order_release);
     atomic_store_explicit(&frontend_test_hold_monitor, hold_monitor, memory_order_release);
@@ -121,25 +116,15 @@ bool cbm_daemon_frontend_test_monitor_waiting(void) {
     return atomic_load_explicit(&frontend_test_monitor_is_waiting, memory_order_acquire);
 }
 
-uint64_t cbm_daemon_frontend_test_monitor_observations(void) {
-    return atomic_load_explicit(&frontend_test_monitor_observation_count, memory_order_acquire);
-}
-
-uint64_t cbm_daemon_frontend_test_worker_observations(void) {
-    return atomic_load_explicit(&frontend_test_worker_observation_count, memory_order_acquire);
-}
-
 uint64_t cbm_daemon_frontend_test_worker_idle_cycles(void) {
     return atomic_load_explicit(&frontend_test_worker_idle_count, memory_order_acquire);
 }
 #endif
 
-static cbm_version_cohort_maintenance_presence_t frontend_observe_maintenance(
-    cbm_version_cohort_manager_t *manager, bool independent_monitor) {
+static void *frontend_maintenance_monitor_worker(void *opaque) {
+    cbm_daemon_maintenance_monitor_t *monitor = opaque;
+    while (!atomic_load_explicit(&monitor->stopping, memory_order_acquire)) {
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-    if (independent_monitor) {
-        atomic_fetch_add_explicit(&frontend_test_monitor_observation_count, 1,
-                                  memory_order_release);
         if (atomic_load_explicit(&frontend_test_hold_monitor, memory_order_acquire)) {
             atomic_store_explicit(&frontend_test_monitor_is_waiting, true, memory_order_release);
             while (atomic_load_explicit(&frontend_test_hold_monitor, memory_order_acquire)) {
@@ -147,20 +132,9 @@ static cbm_version_cohort_maintenance_presence_t frontend_observe_maintenance(
             }
             atomic_store_explicit(&frontend_test_monitor_is_waiting, false, memory_order_release);
         }
-    } else {
-        atomic_fetch_add_explicit(&frontend_test_worker_observation_count, 1, memory_order_release);
-    }
-#else
-    (void)independent_monitor;
 #endif
-    return cbm_version_cohort_maintenance_presence_terminal(manager);
-}
-
-static void *frontend_maintenance_monitor_worker(void *opaque) {
-    cbm_daemon_maintenance_monitor_t *monitor = opaque;
-    while (!atomic_load_explicit(&monitor->stopping, memory_order_acquire)) {
         cbm_version_cohort_maintenance_presence_t presence =
-            frontend_observe_maintenance(monitor->manager, true);
+            cbm_version_cohort_maintenance_presence_terminal(monitor->manager);
         if (presence == CBM_VERSION_COHORT_MAINTENANCE_ABSENT) {
             cbm_usleep(FRONTEND_MAINTENANCE_POLL_MS * 1000U);
             continue;
@@ -632,7 +606,6 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
     }
     frontend_state_t state = {
         .client = client,
-        .cohort_manager = cohort_manager,
         .out = out,
     };
     cbm_mutex_init(&state.mutex);
