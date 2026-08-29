@@ -6936,7 +6936,7 @@ size_t cbm_config_max_index_jobs(cbm_config_t *cfg) {
 
     const unsigned char *value = sqlite3_column_text(stmt, 0);
     int value_bytes = sqlite3_column_bytes(stmt, 0);
-    if (!value || value_bytes < 1 || value_bytes > 2) {
+    if (!value || value_bytes < 1) {
         sqlite3_finalize(stmt);
         return result;
     }

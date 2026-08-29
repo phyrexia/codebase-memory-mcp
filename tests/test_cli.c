@@ -12919,7 +12919,9 @@ TEST(cli_config_max_index_jobs_is_discoverable_strict_bounded_and_persistent) {
     const struct {
         const char *stored;
         size_t expected;
-    } valid[] = {{"1", 1}, {"2", 2}, {"02", 2}, {"7", 7}, {"16", 16}};
+    } valid[] = {
+        {"1", 1}, {"2", 2}, {"02", 2}, {"002", 2}, {"7", 7}, {"0007", 7}, {"16", 16}
+    };
     for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); i++) {
         ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MAX_INDEX_JOBS, valid[i].stored), 0);
         ASSERT_EQ(cbm_config_max_index_jobs(cfg), valid[i].expected);
