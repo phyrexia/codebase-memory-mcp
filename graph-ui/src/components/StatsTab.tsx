@@ -262,13 +262,13 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
       setRoots(data.roots ?? ["/"]);
       setParentPath(data.parent ?? "/");
       setBrowseNotice(data.truncated ? browseCopyRef.current.truncated : null);
-    } catch (caught) {
+    } catch {
       if (generation !== browseGenerationRef.current) return;
       if (controller.signal.aborted && !timedOut) return;
       if (timedOut) {
         setError(browseCopyRef.current.timeout);
       } else if (!silent) {
-        setError(caught instanceof Error ? caught.message : browseCopyRef.current.failed);
+        setError(browseCopyRef.current.failed);
       }
     } finally {
       window.clearTimeout(timeoutId);

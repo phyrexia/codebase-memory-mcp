@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor, act } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StatsTab, IndexProgress } from "./StatsTab";
 import { messages } from "../lib/i18n";
+import * as i18n from "../lib/i18n";
 
 function mockProjectsFetch(extra?: (url: string, init?: RequestInit) => Response | undefined) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -343,6 +344,39 @@ describe("StatsTab index modal", () => {
 
     expect(await screen.findByText(messages.en.index.browseTruncated)).toBeInTheDocument();
     expect(screen.getByText("alpha")).toBeInTheDocument();
+  });
+
+  it("shows the localized English fallback instead of a raw browse failure", async () => {
+    const rawFailure = "RAW_BACKEND_EN_SENTINEL";
+    mockProjectsFetch((url) => url.startsWith("/api/browse")
+      ? new Response(JSON.stringify({ error: rawFailure }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        })
+      : undefined);
+
+    render(<StatsTab onSelectProject={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Index your first repository" }));
+
+    expect(await screen.findByText(messages.en.index.browseFailed)).toBeInTheDocument();
+    expect(screen.queryByText(rawFailure)).not.toBeInTheDocument();
+  });
+
+  it("shows the localized Chinese fallback instead of a raw browse failure", async () => {
+    const rawFailure = "RAW_BACKEND_ZH_SENTINEL";
+    vi.spyOn(i18n, "useUiMessages").mockReturnValue(messages.zh);
+    mockProjectsFetch((url) => url.startsWith("/api/browse")
+      ? new Response(JSON.stringify({ error: rawFailure }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        })
+      : undefined);
+
+    render(<StatsTab onSelectProject={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "索引第一个仓库" }));
+
+    expect(await screen.findByText(messages.zh.index.browseFailed)).toBeInTheDocument();
+    expect(screen.queryByText(rawFailure)).not.toBeInTheDocument();
   });
 
   it("posts empty ADR content when deleting an existing ADR", async () => {
