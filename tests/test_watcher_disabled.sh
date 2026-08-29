@@ -261,7 +261,9 @@ CBM_CACHE_DIR="${c_offm}" "${BINARY}" config set max_index_jobs 2 >/dev/null
 CBM_PROFILE=1 run_session "${c_offm}" "${work}/offm.out" \
   "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"index_repository\",\"arguments\":{\"repo_path\":\"${repo}\",\"mode\":\"full\"}}}"
 
-grep 'msg=daemon\.start' "${DAEMON_LOG}" | grep -q 'physical_job_limit=2' \
+PHYSICAL_LIMIT_EVIDENCE="$(grep 'msg=daemon\.start' "${DAEMON_LOG}" \
+  | grep -m 1 'physical_job_limit=2' || true)"
+[[ -n "${PHYSICAL_LIMIT_EVIDENCE}" ]] \
   || fail "rollout profile did not use max_index_jobs=2"
 log_has "${DAEMON_LOG}" 'msg=index\.supervisor\.profile_log .*log=' \
   || fail "profiled index worker did not expose its retained log"
@@ -272,7 +274,9 @@ for candidate in "${c_offm}"/logs/.worker-log-*; do
   break
 done
 [[ -n "${WORKER_LOG}" ]] || fail "profiled index worker log was not retained"
-grep 'msg=pipeline\.mode' "${WORKER_LOG}" | grep 'mode=parallel' | grep -q 'workers=4' \
+WORKER_MODE_EVIDENCE="$(grep 'msg=pipeline\.mode' "${WORKER_LOG}" \
+  | grep 'mode=parallel' | grep -m 1 'workers=4' || true)"
+[[ -n "${WORKER_MODE_EVIDENCE}" ]] \
   || fail "CBM_WORKERS=4 did not drive the parallel full-index fixture"
 log_has "${DAEMON_LOG}" 'msg=watcher\.disabled( |$)' \
   || fail "watcher.disabled not emitted when disabled"
@@ -292,6 +296,8 @@ case "${resp}" in
   *nodes*) : ;;
   *) fail "index_repository response reports no indexed nodes: ${resp}" ;;
 esac
+echo "evidence: ${PHYSICAL_LIMIT_EVIDENCE}"
+echo "evidence: ${WORKER_MODE_EVIDENCE}"
 echo "ok: disabled — watcher.disabled emitted, no watcher.start/watch, manual index_repository served"
 
 # =============================================================================

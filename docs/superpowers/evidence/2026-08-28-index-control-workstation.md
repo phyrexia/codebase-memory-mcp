@@ -24,6 +24,7 @@ task4_run_root="$(mktemp -d /private/tmp/cbm-task4-gate.XXXXXX)"
 mkdir -m 700 "$task4_run_root/runtime" "$task4_run_root/cache"
 CBM_RUNTIME_DIR="$task4_run_root/runtime" \
 CBM_CACHE_DIR="$task4_run_root/cache" \
+CBM_WORKERS=4 \
 make -f Makefile.cbm test-focused TEST_SUITES="cli daemon_application pipeline"
 
 make -f Makefile.cbm cbm TEST_SEAMS=1
@@ -51,23 +52,25 @@ The real-binary regression emitted these summary lines:
 
 ```text
 ok: configured max_index_jobs snapshot advances only on daemon restart
+evidence: level=info msg=daemon.start version=dev pid=18674 cache_fingerprint=4b9cefc2e32bdbd26a29ab95baa50999419176577224c37b3d101f0ea12295fa memory_budget_bytes=25769803776 physical_job_limit=2 worker_memory_budget_bytes=12884901888
+evidence: level=info msg=pipeline.mode mode=parallel workers=4 files=65
 ok: disabled — watcher.disabled emitted, no watcher.start/watch, manual index_repository served
 ok: disabled+auto_index — auto-index still ran, no watcher.start, no registration
 ok: enabled — watcher.start emitted and session project registered
 PASS: watcher_enabled kill-switch process regression (#335)
 ```
 
-Before each summary was printed, the closed-lifecycle log assertions matched
-the rollout fragments `physical_job_limit=2`, `pipeline.mode mode=parallel
-workers=4`, and `watcher.disabled ... reason=config`; they also asserted the
-absence of `watcher.start` and `watcher.watch` for the disabled/manual run. The
-manual request returned a successful full index, while the enabled positive
-control observed watcher start and project registration.
+The two `evidence:` lines are the exact matched log records emitted only after
+the process test asserted that both captures were non-empty. The same closed
+lifecycle also asserted `watcher.disabled ... reason=config` and the absence of
+`watcher.start` and `watcher.watch` for the disabled/manual run. The manual
+request returned a successful full index, while the enabled positive control
+observed watcher start and project registration.
 
 ## Native and concurrency gates
 
-- ASan/UBSan focused command: PASS for `cli`, `daemon_application`, and
-  `pipeline` (`604 passed`).
+- ASan/UBSan focused command with explicit `CBM_WORKERS=4`: PASS for `cli`,
+  `daemon_application`, and `pipeline` (`604 passed`).
 - TSan command: PASS for `daemon_application`, `watcher`, and `pipeline` with
   `CBM_WORKERS=4` (`382 passed`), with no race report.
 - Production binary build with `TEST_SEAMS=1`: PASS.
