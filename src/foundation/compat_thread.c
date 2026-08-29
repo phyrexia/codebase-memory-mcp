@@ -12,8 +12,11 @@
 
 #include <mimalloc.h> /* mi_thread_done at thread exit */
 
+#include <errno.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
+#include <time.h>
 
 /* Default 8MB stack for all threads. macOS ARM64 default is only 512KB,
  * which is too small for deep pipeline passes (configlink, etc.). */
@@ -215,6 +218,42 @@ void cbm_mutex_destroy(cbm_mutex_t *m) {
     DeleteCriticalSection(&m->cs);
 }
 
+bool cbm_condition_init(cbm_thread_condition_t *condition) {
+    if (!condition) return false;
+    InitializeConditionVariable(&condition->condition);
+    return true;
+}
+
+cbm_condition_wait_result_t cbm_condition_wait(cbm_thread_condition_t *condition,
+                                                cbm_mutex_t *mutex) {
+    return condition && mutex &&
+                   SleepConditionVariableCS(&condition->condition, &mutex->cs, INFINITE)
+               ? CBM_CONDITION_SIGNALED
+               : CBM_CONDITION_ERROR;
+}
+
+cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_thread_condition_t *condition,
+                                                      cbm_mutex_t *mutex, uint32_t timeout_ms) {
+    if (timeout_ms == UINT32_MAX) return cbm_condition_wait(condition, mutex);
+    if (!condition || !mutex) return CBM_CONDITION_ERROR;
+    if (SleepConditionVariableCS(&condition->condition, &mutex->cs, (DWORD)timeout_ms)) {
+        return CBM_CONDITION_SIGNALED;
+    }
+    return GetLastError() == ERROR_TIMEOUT ? CBM_CONDITION_TIMED_OUT : CBM_CONDITION_ERROR;
+}
+
+void cbm_condition_signal(cbm_thread_condition_t *condition) {
+    if (condition) WakeConditionVariable(&condition->condition);
+}
+
+void cbm_condition_broadcast(cbm_thread_condition_t *condition) {
+    if (condition) WakeAllConditionVariable(&condition->condition);
+}
+
+void cbm_condition_destroy(cbm_thread_condition_t *condition) {
+    (void)condition;
+}
+
 #else /* POSIX */
 
 void cbm_mutex_init(cbm_mutex_t *m) {
@@ -231,6 +270,74 @@ void cbm_mutex_unlock(cbm_mutex_t *m) {
 
 void cbm_mutex_destroy(cbm_mutex_t *m) {
     pthread_mutex_destroy(&m->mtx);
+}
+
+#ifndef __APPLE__
+static void condition_timespec_add_ms(struct timespec *value, uint32_t timeout_ms) {
+    value->tv_sec += (time_t)(timeout_ms / 1000U);
+    value->tv_nsec += (long)(timeout_ms % 1000U) * 1000000L;
+    if (value->tv_nsec >= 1000000000L) {
+        value->tv_sec++;
+        value->tv_nsec -= 1000000000L;
+    }
+}
+#endif
+
+bool cbm_condition_init(cbm_thread_condition_t *condition) {
+    if (!condition) return false;
+#ifdef __APPLE__
+    return pthread_cond_init(&condition->condition, NULL) == 0;
+#else
+    pthread_condattr_t attributes;
+    if (pthread_condattr_init(&attributes) != 0) return false;
+    int clock_result = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+    int init_result = clock_result == 0
+                          ? pthread_cond_init(&condition->condition, &attributes)
+                          : clock_result;
+    (void)pthread_condattr_destroy(&attributes);
+    return init_result == 0;
+#endif
+}
+
+cbm_condition_wait_result_t cbm_condition_wait(cbm_thread_condition_t *condition,
+                                                cbm_mutex_t *mutex) {
+    if (!condition || !mutex) return CBM_CONDITION_ERROR;
+    return pthread_cond_wait(&condition->condition, &mutex->mtx) == 0
+               ? CBM_CONDITION_SIGNALED
+               : CBM_CONDITION_ERROR;
+}
+
+cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_thread_condition_t *condition,
+                                                      cbm_mutex_t *mutex, uint32_t timeout_ms) {
+    if (timeout_ms == UINT32_MAX) return cbm_condition_wait(condition, mutex);
+    if (!condition || !mutex) return CBM_CONDITION_ERROR;
+#ifdef __APPLE__
+    struct timespec relative = {
+        .tv_sec = (time_t)(timeout_ms / 1000U),
+        .tv_nsec = (long)(timeout_ms % 1000U) * 1000000L,
+    };
+    int result =
+        pthread_cond_timedwait_relative_np(&condition->condition, &mutex->mtx, &relative);
+#else
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) return CBM_CONDITION_ERROR;
+    condition_timespec_add_ms(&deadline, timeout_ms);
+    int result = pthread_cond_timedwait(&condition->condition, &mutex->mtx, &deadline);
+#endif
+    if (result == 0) return CBM_CONDITION_SIGNALED;
+    return result == ETIMEDOUT ? CBM_CONDITION_TIMED_OUT : CBM_CONDITION_ERROR;
+}
+
+void cbm_condition_signal(cbm_thread_condition_t *condition) {
+    if (condition) (void)pthread_cond_signal(&condition->condition);
+}
+
+void cbm_condition_broadcast(cbm_thread_condition_t *condition) {
+    if (condition) (void)pthread_cond_broadcast(&condition->condition);
+}
+
+void cbm_condition_destroy(cbm_thread_condition_t *condition) {
+    if (condition) (void)pthread_cond_destroy(&condition->condition);
 }
 
 #endif

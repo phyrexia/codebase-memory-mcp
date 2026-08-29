@@ -7,7 +7,9 @@
 #ifndef CBM_COMPAT_THREAD_H
 #define CBM_COMPAT_THREAD_H
 
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* ── Thread ───────────────────────────────────────────────────── */
 
@@ -58,10 +60,33 @@ typedef struct {
 
 #endif
 
+typedef enum {
+    CBM_CONDITION_ERROR = -1,
+    CBM_CONDITION_SIGNALED = 0,
+    CBM_CONDITION_TIMED_OUT = 1,
+} cbm_condition_wait_result_t;
+
+typedef struct {
+#ifdef _WIN32
+    CONDITION_VARIABLE condition;
+#else
+    pthread_cond_t condition;
+#endif
+} cbm_thread_condition_t;
+
 void cbm_mutex_init(cbm_mutex_t *m);
 void cbm_mutex_lock(cbm_mutex_t *m);
 void cbm_mutex_unlock(cbm_mutex_t *m);
 void cbm_mutex_destroy(cbm_mutex_t *m);
+
+bool cbm_condition_init(cbm_thread_condition_t *condition);
+cbm_condition_wait_result_t cbm_condition_wait(cbm_thread_condition_t *condition,
+                                                cbm_mutex_t *mutex);
+cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_thread_condition_t *condition,
+                                                      cbm_mutex_t *mutex, uint32_t timeout_ms);
+void cbm_condition_signal(cbm_thread_condition_t *condition);
+void cbm_condition_broadcast(cbm_thread_condition_t *condition);
+void cbm_condition_destroy(cbm_thread_condition_t *condition);
 
 /* ── Aligned allocation ───────────────────────────────────────── */
 

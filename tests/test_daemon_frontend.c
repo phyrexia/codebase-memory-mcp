@@ -1655,7 +1655,79 @@ TEST(daemon_local_participant_monitor_joins_before_manager_teardown) {
     PASS();
 }
 
+typedef struct {
+    cbm_mutex_t mutex;
+    cbm_thread_condition_t condition;
+    unsigned int ready;
+    unsigned int released;
+    bool release;
+} frontend_condition_fixture_t;
+
+static void *frontend_condition_waiter(void *opaque) {
+    frontend_condition_fixture_t *fixture = opaque;
+    cbm_mutex_lock(&fixture->mutex);
+    fixture->ready++;
+    cbm_condition_broadcast(&fixture->condition);
+    while (!fixture->release) {
+        if (cbm_condition_wait(&fixture->condition, &fixture->mutex) == CBM_CONDITION_ERROR) {
+            cbm_mutex_unlock(&fixture->mutex);
+            return NULL;
+        }
+    }
+    fixture->released++;
+    cbm_mutex_unlock(&fixture->mutex);
+    return NULL;
+}
+
+TEST(daemon_frontend_portable_condition_broadcasts_and_times_out) {
+    frontend_condition_fixture_t fixture = {0};
+    cbm_mutex_init(&fixture.mutex);
+    bool initialized = cbm_condition_init(&fixture.condition);
+    cbm_thread_t first;
+    cbm_thread_t second;
+    bool first_started = initialized &&
+                         cbm_thread_create(&first, 0, frontend_condition_waiter, &fixture) == 0;
+    bool second_started = first_started &&
+                          cbm_thread_create(&second, 0, frontend_condition_waiter, &fixture) == 0;
+
+    cbm_condition_wait_result_t ready_wait = CBM_CONDITION_SIGNALED;
+    cbm_mutex_lock(&fixture.mutex);
+    while (second_started && fixture.ready != 2 && ready_wait == CBM_CONDITION_SIGNALED) {
+        ready_wait = cbm_condition_timed_wait(&fixture.condition, &fixture.mutex, 2000);
+    }
+    fixture.release = true;
+    if (initialized) {
+        cbm_condition_broadcast(&fixture.condition);
+    }
+    cbm_mutex_unlock(&fixture.mutex);
+
+    bool first_joined = first_started && cbm_thread_join(&first) == 0;
+    bool second_joined = second_started && cbm_thread_join(&second) == 0;
+    cbm_condition_wait_result_t timeout = CBM_CONDITION_ERROR;
+    if (initialized) {
+        cbm_mutex_lock(&fixture.mutex);
+        timeout = cbm_condition_timed_wait(&fixture.condition, &fixture.mutex, 20);
+        cbm_mutex_unlock(&fixture.mutex);
+    }
+    unsigned int released = fixture.released;
+    if (initialized) {
+        cbm_condition_destroy(&fixture.condition);
+    }
+    cbm_mutex_destroy(&fixture.mutex);
+
+    ASSERT_TRUE(initialized);
+    ASSERT_TRUE(first_started);
+    ASSERT_TRUE(second_started);
+    ASSERT_TRUE(first_joined);
+    ASSERT_TRUE(second_joined);
+    ASSERT_EQ(ready_wait, CBM_CONDITION_SIGNALED);
+    ASSERT_EQ(released, 2);
+    ASSERT_EQ(timeout, CBM_CONDITION_TIMED_OUT);
+    PASS();
+}
+
 SUITE(daemon_frontend) {
+    RUN_TEST(daemon_frontend_portable_condition_broadcasts_and_times_out);
     RUN_TEST(daemon_frontend_recognizes_exact_cancellation_notification);
     RUN_TEST(daemon_frontend_correlates_cancellation_to_exact_request);
     RUN_TEST(daemon_frontend_ignores_cancellation_text_in_string_content);
