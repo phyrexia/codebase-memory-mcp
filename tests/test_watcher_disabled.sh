@@ -33,6 +33,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY="${CBM_TEST_BINARY:-${ROOT}/build/c/codebase-memory-mcp}"
 
+self_registration_count="$(grep -Fc 'bash "$ROOT/tests/test_watcher_disabled.sh"' "${ROOT}/scripts/test.sh" || true)"
+[ "${self_registration_count}" -eq 1 ] \
+  || { echo "FAIL [self-registration]: scripts/test.sh must invoke test_watcher_disabled.sh exactly once (found ${self_registration_count})" >&2; exit 1; }
+
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) echo "skipping watcher_disabled test on Windows"; exit 0 ;;
 esac
