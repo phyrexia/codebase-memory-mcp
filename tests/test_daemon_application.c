@@ -2602,6 +2602,7 @@ TEST(daemon_application_auto_index_retries_transient_busy_admission) {
         .root = occupied_root,
         .result = -1,
     };
+    atomic_init(&occupied.done, false);
     cbm_thread_t occupied_thread;
     bool occupied_started =
         application && dirs_ok &&
@@ -4248,6 +4249,7 @@ TEST(daemon_application_reserved_mutation_delays_worker_start) {
         .root = root,
         .result = -1,
     };
+    atomic_init(&request.done, false);
     cbm_thread_t thread;
     bool thread_started =
         root_ok && lease_held && cbm_thread_create(&thread, 0, app_index_thread, &request) == 0;
@@ -4304,6 +4306,7 @@ TEST(daemon_application_mutation_does_not_block_other_project) {
         .root = root,
         .result = -1,
     };
+    atomic_init(&request.done, false);
     cbm_thread_t thread;
     bool thread_started =
         root_ok && lease_held && cbm_thread_create(&thread, 0, app_index_thread, &request) == 0;
@@ -4407,6 +4410,7 @@ TEST(daemon_application_worker_boundary_is_sole_os_project_lock_owner) {
         .root = root,
         .result = -1,
     };
+    atomic_init(&request.done, false);
     cbm_thread_t thread;
     bool thread_started =
         root_ok && application && cbm_thread_create(&thread, 0, app_index_thread, &request) == 0;
@@ -4497,6 +4501,7 @@ TEST(daemon_application_worker_lock_serializes_external_mutation) {
         .root = blocked_root,
         .result = -1,
     };
+    atomic_init(&blocked_request.done, false);
     cbm_thread_t blocked_thread;
     bool blocked_thread_started =
         external_lease_held &&
@@ -4515,6 +4520,7 @@ TEST(daemon_application_worker_lock_serializes_external_mutation) {
         .root = other_root,
         .result = -1,
     };
+    atomic_init(&other_request.done, false);
     cbm_thread_t other_thread;
     bool other_thread_started =
         blocked_waiting &&
@@ -5135,6 +5141,7 @@ TEST(daemon_application_queues_explicit_index_behind_physical_job_limit) {
             .root = roots[i],
             .result = -1,
         };
+        atomic_init(&admitted_requests[i].done, false);
         started[i] =
             cbm_thread_create(&admitted_threads[i], 0, app_index_thread, &admitted_requests[i]) == 0;
     }
@@ -5280,6 +5287,7 @@ TEST(daemon_application_default_limit_admits_two_and_rejects_third) {
             .root = roots[i],
             .result = -1,
         };
+        atomic_init(&requests[i].done, false);
         started[i] = cbm_thread_create(&threads[i], 0, app_index_thread, &requests[i]) == 0;
     }
     bool all_started = true;
@@ -5295,6 +5303,7 @@ TEST(daemon_application_default_limit_admits_two_and_rejects_third) {
         .root = roots[DEFAULT_CAP_RUNNING],
         .result = -1,
     };
+    atomic_init(&third_request.done, false);
     cbm_thread_t third_thread;
     bool third_started =
         two_admitted && cbm_thread_create(&third_thread, 0, app_index_thread, &third_request) == 0;
