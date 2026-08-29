@@ -3642,11 +3642,30 @@ static void metrics_add_locked(cbm_daemon_application_t *application, const char
                 }
             }
         }
+        if (!slot) {
+            /* This bucket/source has no representation to promote (including
+             * snapshot restoration after concurrent refill or hour rollover).
+             * Reuse the single global fallback regardless of its original
+             * bucket so bounded storage never discards aggregate totals. */
+            for (size_t i = 0; i < application->metrics_slot_count; i++) {
+                cbm_daemon_metrics_slot_t *candidate = &application->metrics_slots[i];
+                if (strcmp(candidate->source, "_other") == 0 &&
+                    strcmp(candidate->name, "_other") == 0 && candidate->project[0] == '\0') {
+                    slot = candidate;
+                    break;
+                }
+            }
+        }
+        if (!slot) {
+            /* Full storage guarantees at least one slot. Promoting it keeps
+             * its counters while accepting this previously unseen source. */
+            slot = &application->metrics_slots[0];
+            snprintf(slot->source, sizeof(slot->source), "%s", "_other");
+            snprintf(slot->name, sizeof(slot->name), "%s", "_other");
+            slot->project[0] = '\0';
+        }
     }
     if (!slot) {
-        if (application->metrics_slot_count >= APPLICATION_METRICS_SLOTS) {
-            return;
-        }
         slot = &application->metrics_slots[application->metrics_slot_count++];
         memset(slot, 0, sizeof(*slot));
         snprintf(slot->bucket_hour, sizeof(slot->bucket_hour), "%s", bucket);
@@ -3675,6 +3694,19 @@ void cbm_daemon_application_metrics_record(cbm_daemon_application_t *application
                        is_error ? 1 : 0, (int64_t)dur_us, (int64_t)dur_us);
     cbm_mutex_unlock(&application->mutex);
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+size_t cbm_daemon_application_metrics_slot_count_for_test(
+    cbm_daemon_application_t *application) {
+    if (!application) {
+        return 0;
+    }
+    cbm_mutex_lock(&application->mutex);
+    size_t count = application->metrics_slot_count;
+    cbm_mutex_unlock(&application->mutex);
+    return count;
+}
+#endif
 
 void cbm_daemon_application_metrics_flush(cbm_daemon_application_t *application) {
     if (!application || !application->config) {

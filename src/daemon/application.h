@@ -135,6 +135,12 @@ void cbm_daemon_application_metrics_record(cbm_daemon_application_t *application
  * host loop once a minute. */
 void cbm_daemon_application_metrics_flush(cbm_daemon_application_t *application);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Read-only synchronization seam for deterministic flush/restoration tests. */
+size_t cbm_daemon_application_metrics_slot_count_for_test(
+    cbm_daemon_application_t *application);
+#endif
+
 /* Thin-client request helpers. Every helper performs one bounded runtime
  * exchange. MCP notifications succeed with a NULL/zero response. Returned
  * response bytes are malloc-owned and include one trailing NUL for text use;
