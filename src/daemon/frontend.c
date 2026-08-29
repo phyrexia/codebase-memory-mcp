@@ -23,15 +23,6 @@ enum {
     FRONTEND_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000,
     FRONTEND_CLOSE_TIMEOUT_MS = 5000,
     FRONTEND_JOIN_WATCHDOG_MS = FRONTEND_CLOSE_TIMEOUT_MS,
-    /* A regular-file/buffered client can write several complete requests and
-     * close stdin before the worker is scheduled. Give already-accepted input
-     * a short FIFO drain window so EOF cannot silently discard it. A genuinely
-     * active long operation is still cancelled at this deadline. */
-    FRONTEND_WAIT_US = 1000,
-    /* An idle thin frontend owns no work and only needs to notice the next
-     * queue item promptly. Ten milliseconds avoids a 1 kHz wake-up loop per
-     * connected coding-agent session without perceptible request latency. */
-    FRONTEND_IDLE_WAIT_US = 10 * 1000,
     /* EOF-drain progress window. Sized to cover a cold daemon spawn plus one
      * request round-trip on the slowest platform (several seconds on Windows
      * under CI load): the drain aborts only after this long with NO item
@@ -61,6 +52,7 @@ typedef struct {
 
 typedef struct {
     cbm_mutex_t mutex;
+    cbm_thread_condition_t changed;
     cbm_daemon_runtime_client_t *client;
     FILE *out;
     frontend_item_t queue[FRONTEND_QUEUE_CAPACITY];
@@ -79,11 +71,11 @@ typedef struct {
     /* Monotonic count of fully processed queue items (responses written or
      * cancellations acknowledged). The EOF drain below watches it to tell a
      * batch that is still making progress from a genuinely stuck request. */
-    atomic_uint_fast64_t completed_items;
+    uint64_t completed_items;
 } frontend_state_t;
 
 typedef struct {
-    atomic_bool complete;
+    frontend_state_t *state;
 } frontend_join_watchdog_t;
 
 struct cbm_daemon_maintenance_monitor {
@@ -128,7 +120,7 @@ static void *frontend_maintenance_monitor_worker(void *opaque) {
         if (atomic_load_explicit(&frontend_test_hold_monitor, memory_order_acquire)) {
             atomic_store_explicit(&frontend_test_monitor_is_waiting, true, memory_order_release);
             while (atomic_load_explicit(&frontend_test_hold_monitor, memory_order_acquire)) {
-                cbm_usleep(FRONTEND_WAIT_US);
+                cbm_usleep(FRONTEND_MAINTENANCE_POLL_MS * 1000U);
             }
             atomic_store_explicit(&frontend_test_monitor_is_waiting, false, memory_order_release);
         }
@@ -231,6 +223,19 @@ static void frontend_item_free(frontend_item_t *item) {
     }
 }
 
+static uint32_t frontend_deadline_remaining_ms(uint64_t deadline_ms) {
+    uint64_t now_ms = cbm_now_ms();
+    if (now_ms >= deadline_ms) {
+        return 0;
+    }
+    uint64_t remaining = deadline_ms - now_ms;
+    return remaining >= UINT32_MAX ? UINT32_MAX - 1U : (uint32_t)remaining;
+}
+
+static void frontend_changed_locked(frontend_state_t *state) {
+    cbm_condition_broadcast(&state->changed);
+}
+
 static bool frontend_should_stop(frontend_state_t *state) {
     cbm_mutex_lock(&state->mutex);
     /* The input-closed leg must also require that no item is IN FLIGHT: the
@@ -249,6 +254,7 @@ static bool frontend_should_stop(frontend_state_t *state) {
 static void frontend_worker_mark_done(frontend_state_t *state) {
     cbm_mutex_lock(&state->mutex);
     state->worker_done = true;
+    frontend_changed_locked(state);
     cbm_mutex_unlock(&state->mutex);
 }
 
@@ -262,25 +268,29 @@ static bool frontend_worker_is_done(frontend_state_t *state) {
 static void frontend_input_closed(frontend_state_t *state) {
     cbm_mutex_lock(&state->mutex);
     state->input_closed = true;
+    frontend_changed_locked(state);
     cbm_mutex_unlock(&state->mutex);
 }
 
 static void *frontend_join_watchdog(void *opaque) {
     frontend_join_watchdog_t *watchdog = opaque;
-    uint64_t now = cbm_now_ms();
-    uint64_t deadline =
-        now > UINT64_MAX - FRONTEND_JOIN_WATCHDOG_MS ? UINT64_MAX : now + FRONTEND_JOIN_WATCHDOG_MS;
-    while (!atomic_load_explicit(&watchdog->complete, memory_order_acquire) &&
-           cbm_now_ms() < deadline) {
-        cbm_usleep(FRONTEND_WAIT_US);
+    frontend_state_t *state = watchdog->state;
+    uint64_t deadline = cbm_now_ms() + FRONTEND_JOIN_WATCHDOG_MS;
+    cbm_mutex_lock(&state->mutex);
+    while (!state->worker_done) {
+        uint32_t remaining_ms = frontend_deadline_remaining_ms(deadline);
+        if (remaining_ms == 0 ||
+            cbm_condition_timed_wait(&state->changed, &state->mutex, remaining_ms) ==
+                CBM_CONDITION_ERROR) {
+            cbm_mutex_unlock(&state->mutex);
+            /* A thin frontend owns no durable state. If stdout is backpressured,
+             * fclose/IPC cancellation cannot portably wake its worker on every
+             * platform. Fail-stop releases the authenticated connection and lets
+             * the daemon cancel this exact session instead of hanging forever. */
+            _Exit(EXIT_FAILURE);
+        }
     }
-    if (!atomic_load_explicit(&watchdog->complete, memory_order_acquire)) {
-        /* A thin frontend owns no durable state. If stdout is backpressured,
-         * fclose/IPC cancellation cannot portably wake its worker on every
-         * platform. Fail-stop releases the authenticated connection and lets
-         * the daemon cancel this exact session instead of hanging forever. */
-        _Exit(EXIT_FAILURE);
-    }
+    cbm_mutex_unlock(&state->mutex);
     return NULL;
 }
 
@@ -290,7 +300,18 @@ static void *frontend_join_watchdog(void *opaque) {
 static bool frontend_pop_begin(frontend_state_t *state, frontend_item_t *item) {
     bool popped = false;
     cbm_mutex_lock(&state->mutex);
-    if (!state->stopping && state->count > 0) {
+    while (!state->stopping && !state->failed && state->count == 0 && !state->input_closed) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        atomic_fetch_add_explicit(&frontend_test_worker_idle_count, 1, memory_order_release);
+#endif
+        if (cbm_condition_wait(&state->changed, &state->mutex) == CBM_CONDITION_ERROR) {
+            state->failed = true;
+            state->stopping = true;
+            frontend_changed_locked(state);
+            break;
+        }
+    }
+    if (!state->stopping && !state->failed && state->count > 0) {
         frontend_item_t *queued = &state->queue[state->head];
         cbm_daemon_runtime_application_token_t request_token =
             CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
@@ -299,6 +320,7 @@ static bool frontend_pop_begin(frontend_state_t *state, frontend_item_t *item) {
         if (!token_ready) {
             state->failed = true;
             state->stopping = true;
+            frontend_changed_locked(state);
             cbm_mutex_unlock(&state->mutex);
             return false;
         }
@@ -313,6 +335,7 @@ static bool frontend_pop_begin(frontend_state_t *state, frontend_item_t *item) {
         state->active_id_str = item->id_str;
         item->request_token = request_token;
         state->active_request_token = request_token;
+        frontend_changed_locked(state);
         popped = true;
     }
     cbm_mutex_unlock(&state->mutex);
@@ -327,6 +350,8 @@ static void frontend_end_request(frontend_state_t *state, bool failed) {
     state->active_id_str = NULL;
     state->active_request_token = CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
     state->failed = state->failed || failed;
+    state->completed_items++;
+    frontend_changed_locked(state);
     cbm_mutex_unlock(&state->mutex);
 }
 
@@ -450,14 +475,7 @@ static void *frontend_worker(void *opaque) {
     for (;;) {
         frontend_item_t item = {0};
         if (!frontend_pop_begin(state, &item)) {
-            if (frontend_should_stop(state)) {
-                break;
-            }
-#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-            atomic_fetch_add_explicit(&frontend_test_worker_idle_count, 1, memory_order_release);
-#endif
-            cbm_usleep(FRONTEND_IDLE_WAIT_US);
-            continue;
+            break;
         }
         uint8_t *response = NULL;
         uint32_t response_length = 0;
@@ -484,7 +502,6 @@ static void *frontend_worker(void *opaque) {
         bool expected_stop = failed && frontend_should_stop(state);
         frontend_end_request(state, failed && !expected_stop);
         frontend_item_free(&item);
-        atomic_fetch_add_explicit(&state->completed_items, 1, memory_order_release);
         if (failed) {
             if (!expected_stop) {
                 /* A failed daemon transport cannot wake a thread blocked in
@@ -524,10 +541,9 @@ static bool frontend_enqueue(frontend_state_t *state, char *message, bool conten
      * matter how long we wait; only that case is a hard failure. */
     if (length > FRONTEND_QUEUE_BYTES_MAX) {
         cbm_mutex_lock(&state->mutex);
-        if (!state->stopping && !state->failed) {
-            state->failed = true;
-            state->stopping = true;
-        }
+        state->failed = true;
+        state->stopping = true;
+        frontend_changed_locked(state);
         cbm_mutex_unlock(&state->mutex);
         free(id_str);
         return false;
@@ -540,41 +556,44 @@ static bool frontend_enqueue(frontend_state_t *state, char *message, bool conten
      * pipelined requests (e.g. an agent issuing parallel tool calls) died with
      * rc=1 and zero output (#1522 follow-up). Waits are bounded only by the
      * stop/fail flags, which every teardown path already sets — the same
-     * condition the polling worker and watchdogs key on. */
-    for (;;) {
-        cbm_mutex_lock(&state->mutex);
-        bool stopped = state->stopping || state->failed;
-        if (stopped) {
-            cbm_mutex_unlock(&state->mutex);
-            free(id_str);
-            return false;
+     * condition the blocking worker and watchdog key on. */
+    cbm_mutex_lock(&state->mutex);
+    while (!state->stopping && !state->failed &&
+           !(state->count < FRONTEND_QUEUE_CAPACITY &&
+             state->queued_bytes <= FRONTEND_QUEUE_BYTES_MAX &&
+             length <= FRONTEND_QUEUE_BYTES_MAX - state->queued_bytes)) {
+        if (cbm_condition_wait(&state->changed, &state->mutex) == CBM_CONDITION_ERROR) {
+            state->failed = true;
+            state->stopping = true;
+            frontend_changed_locked(state);
+            break;
         }
-        bool capacity = state->count < FRONTEND_QUEUE_CAPACITY &&
-                        state->queued_bytes <= FRONTEND_QUEUE_BYTES_MAX &&
-                        length <= FRONTEND_QUEUE_BYTES_MAX - state->queued_bytes;
-        if (capacity) {
-            size_t tail = (state->head + state->count) % FRONTEND_QUEUE_CAPACITY;
-            state->queue[tail] = (frontend_item_t){
-                .message = message,
-                .length = length,
-                .content_length_framed = content_length_framed,
-                .has_id = has_id,
-                .id = id,
-                .id_str = id_str,
-            };
-            state->count++;
-            state->queued_bytes += length;
-            cbm_mutex_unlock(&state->mutex);
-            return true;
-        }
-        cbm_mutex_unlock(&state->mutex);
-        cbm_usleep(FRONTEND_WAIT_US);
     }
+    if (state->stopping || state->failed) {
+        cbm_mutex_unlock(&state->mutex);
+        free(id_str);
+        return false;
+    }
+    size_t tail = (state->head + state->count) % FRONTEND_QUEUE_CAPACITY;
+    state->queue[tail] = (frontend_item_t){
+        .message = message,
+        .length = length,
+        .content_length_framed = content_length_framed,
+        .has_id = has_id,
+        .id = id,
+        .id_str = id_str,
+    };
+    state->count++;
+    state->queued_bytes += length;
+    frontend_changed_locked(state);
+    cbm_mutex_unlock(&state->mutex);
+    return true;
 }
 
 static bool frontend_stop_begin(frontend_state_t *state) {
     cbm_mutex_lock(&state->mutex);
     state->stopping = true;
+    frontend_changed_locked(state);
     cbm_mutex_unlock(&state->mutex);
     /* Retain the client allocation until the worker is joined. This covers the
      * boundary where the worker has claimed an item but has not yet entered the
@@ -591,12 +610,40 @@ static bool frontend_cancel_for_maintenance(void *opaque) {
     if (state->in_request) {
         request_token = state->active_request_token;
     }
+    frontend_changed_locked(state);
     cbm_mutex_unlock(&state->mutex);
     if (request_token == CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID) {
         return false;
     }
     return cbm_daemon_runtime_client_application_cancel(state->client, request_token) ==
            CBM_DAEMON_RUNTIME_CANCEL_ACCEPTED;
+}
+
+static bool frontend_wait_for_eof_drain(frontend_state_t *state) {
+    cbm_mutex_lock(&state->mutex);
+    uint64_t completed = state->completed_items;
+    uint64_t deadline = cbm_now_ms() + FRONTEND_EOF_DRAIN_MS;
+    while (!state->worker_done) {
+        uint32_t remaining_ms = frontend_deadline_remaining_ms(deadline);
+        if (remaining_ms == 0) {
+            break;
+        }
+        cbm_condition_wait_result_t waited =
+            cbm_condition_timed_wait(&state->changed, &state->mutex, remaining_ms);
+        if (waited == CBM_CONDITION_ERROR) {
+            state->failed = true;
+            state->stopping = true;
+            frontend_changed_locked(state);
+            cbm_mutex_unlock(&state->mutex);
+            return false;
+        }
+        if (state->completed_items != completed) {
+            completed = state->completed_items;
+            deadline = cbm_now_ms() + FRONTEND_EOF_DRAIN_MS;
+        }
+    }
+    cbm_mutex_unlock(&state->mutex);
+    return true;
 }
 
 int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
@@ -609,11 +656,16 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
         .out = out,
     };
     cbm_mutex_init(&state.mutex);
-    atomic_init(&state.completed_items, 0);
+    if (!cbm_condition_init(&state.changed)) {
+        cbm_mutex_destroy(&state.mutex);
+        (void)cbm_daemon_runtime_client_close(client, FRONTEND_CLOSE_TIMEOUT_MS);
+        return -1;
+    }
     cbm_daemon_maintenance_monitor_t *maintenance_monitor =
         frontend_maintenance_monitor_start(cohort_manager, frontend_cancel_for_maintenance, &state,
                                            EXIT_SUCCESS, "MCP frontend", true);
     if (!maintenance_monitor) {
+        cbm_condition_destroy(&state.changed);
         cbm_mutex_destroy(&state.mutex);
         (void)cbm_daemon_runtime_client_close(client, FRONTEND_CLOSE_TIMEOUT_MS);
         return -1;
@@ -623,6 +675,7 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
         if (!cbm_daemon_maintenance_monitor_stop(&maintenance_monitor)) {
             _Exit(EXIT_FAILURE);
         }
+        cbm_condition_destroy(&state.changed);
         cbm_mutex_destroy(&state.mutex);
         (void)cbm_daemon_runtime_client_close(client, FRONTEND_CLOSE_TIMEOUT_MS);
         return -1;
@@ -681,17 +734,7 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
          * seconds on Windows), so batch clients that close stdin right after
          * writing — file redirects, piped harnesses, hook one-shots —
          * intermittently lost their tail responses. */
-        uint64_t drained = atomic_load_explicit(&state.completed_items, memory_order_acquire);
-        uint64_t drain_deadline = cbm_now_ms() + FRONTEND_EOF_DRAIN_MS;
-        while (!frontend_worker_is_done(&state) && cbm_now_ms() < drain_deadline) {
-            cbm_usleep(FRONTEND_WAIT_US);
-            uint64_t now_drained =
-                atomic_load_explicit(&state.completed_items, memory_order_acquire);
-            if (now_drained != drained) {
-                drained = now_drained;
-                drain_deadline = cbm_now_ms() + FRONTEND_EOF_DRAIN_MS;
-            }
-        }
+        (void)frontend_wait_for_eof_drain(&state);
     }
     if (!close_begun) {
         close_begun = frontend_stop_begin(&state);
@@ -700,7 +743,7 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
     cbm_thread_t watchdog_thread;
     bool watchdog_started = false;
     if (!frontend_worker_is_done(&state)) {
-        atomic_init(&watchdog.complete, false);
+        watchdog.state = &state;
         if (cbm_thread_create(&watchdog_thread, 0, frontend_join_watchdog, &watchdog) != 0) {
             _Exit(EXIT_FAILURE);
         }
@@ -711,7 +754,6 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
         _Exit(EXIT_FAILURE);
     }
     if (watchdog_started) {
-        atomic_store_explicit(&watchdog.complete, true, memory_order_release);
         if (cbm_thread_join(&watchdog_thread) != 0) {
             _Exit(EXIT_FAILURE);
         }
@@ -730,6 +772,7 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
     if (state.failed) {
         result = -1;
     }
+    cbm_condition_destroy(&state.changed);
     cbm_mutex_destroy(&state.mutex);
     return result;
 }

@@ -1304,7 +1304,7 @@ TEST(daemon_frontend_rejects_non_notification_cancellation_shapes) {
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 /* An idle frontend has one independent maintenance observer. Hold that
  * observer before its first secure presence read, then require the real worker
- * to complete an idle cycle. Any worker-side presence read is therefore an
+ * to enter its idle wait. Any worker-side presence read is therefore an
  * exact duplicate, independent of elapsed time or scheduler cadence. */
 TEST(daemon_frontend_idle_uses_one_maintenance_observer) {
     frontend_idle_fixture_t fixture;
@@ -1336,7 +1336,9 @@ TEST(daemon_frontend_idle_uses_one_maintenance_observer) {
     }
     bool monitor_waiting = cbm_daemon_frontend_test_monitor_waiting();
     uint64_t terminal_observations = cbm_version_cohort_test_terminal_observations();
-    uint64_t idle_cycles = cbm_daemon_frontend_test_worker_idle_cycles();
+    uint64_t idle_waits_before = cbm_daemon_frontend_test_worker_idle_cycles();
+    cbm_usleep(100U * 1000U);
+    uint64_t idle_waits_after = cbm_daemon_frontend_test_worker_idle_cycles();
     cbm_daemon_frontend_test_observer_release();
     bool input_closed = !pipe_ready || frontend_test_close_fd(input_pipe[1]) == 0;
     bool joined = thread_started && cbm_thread_join(&frontend_thread) == 0;
@@ -1348,7 +1350,8 @@ TEST(daemon_frontend_idle_uses_one_maintenance_observer) {
     ASSERT_TRUE(pipe_ready);
     ASSERT_TRUE(thread_started);
     ASSERT_TRUE(monitor_waiting);
-    ASSERT_TRUE(idle_cycles > 0);
+    ASSERT_TRUE(idle_waits_before > 0);
+    ASSERT_EQ(idle_waits_after, idle_waits_before);
     ASSERT_EQ(terminal_observations, 0);
     ASSERT_TRUE(input_closed);
     ASSERT_TRUE(joined);
