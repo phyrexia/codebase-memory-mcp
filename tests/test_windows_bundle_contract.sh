@@ -345,10 +345,33 @@ require(
     and windows_test_driver.count("$buildExit = $LASTEXITCODE") >= 1,
     "Windows build helpers must not leak compiler output into returned artifact paths",
 )
+required_no_skip_match = re.search(
+    r"\$requiredNoSkipGuards\s*=\s*@\((.*?)\)", windows_test_driver, re.DOTALL
+)
+required_no_skip_block = required_no_skip_match.group(1) if required_no_skip_match else ""
+required_guard_branch = windows_test_driver.find(
+    "elseif ($requiredNoSkipGuards -contains $t)"
+)
+precondition_skip_branch = windows_test_driver.find("elseif ($code -eq 2)")
+required_guard_block = (
+    windows_test_driver[required_guard_branch:precondition_skip_branch]
+    if required_guard_branch >= 0 and precondition_skip_branch > required_guard_branch
+    else ""
+)
 require(
-    '$code -eq 1 -or $t -eq "tests\\windows\\test_windows_update_handoff.py"'
-    in windows_test_driver,
-    "the update-handoff guard must fail instead of skip on driver/precondition errors",
+    all(
+        guard in required_no_skip_block
+        for guard in (
+            "tests\\windows\\test_ui_drive_listing.py",
+            "tests\\windows\\test_windows_update_handoff.py",
+        )
+    )
+    and required_guard_branch >= 0
+    and precondition_skip_branch > required_guard_branch
+    and "$guardFailures += $t" in required_guard_block
+    and "$guardSkips += $t" not in required_guard_block,
+    "the drive-listing and update-handoff guards must fail instead of skip on "
+    "driver/precondition errors",
 )
 require(
     all(

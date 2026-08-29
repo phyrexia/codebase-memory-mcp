@@ -46,8 +46,8 @@
 
 .PARAMETER Target
     Makefile.cbm target used when building: 'cbm-with-ui' (default; needed for the
-    drive-picker guard's embedded HTTP UI) or 'cbm' (no UI - the drive guard then
-    reports a precondition and is skipped).
+    drive-picker guard's embedded HTTP UI) or 'cbm' (no UI - the required drive
+    guard then fails because it cannot verify the release contract).
 
 .PARAMETER GuardsOnly
     Run only the green guards (the CI gate). Skips the opt-in known-red repros.
@@ -154,10 +154,9 @@ try {
     $env:TMPDIR = $guardRoot
     $env:PYTHONUTF8 = "1"           # encode argv/stdio as UTF-8
 
-# Green regression guards - must stay GREEN (exit 0). RED (exit 1) = the fix for
-# the referenced issue regressed. The drive-picker guard needs the embedded HTTP
-# UI (build target cbm-with-ui); against a non-UI binary it reports a precondition
-# (exit 2) and is skipped rather than failed.
+# Green regression guards. RED (exit 1) = the referenced fix regressed. Guards
+# may document precondition skips unless listed in $requiredNoSkipGuards; those
+# are release gates and every nonzero exit is a failure.
 $guards = @(
     "tests\windows\test_non_ascii_path.py",
     "tests\windows\test_non_ascii_cache_dump.py",
@@ -166,6 +165,11 @@ $guards = @(
     "tests\windows\test_hook_augment.py",
     "tests\windows\test_ui_drive_listing.py",
     "tests\windows\test_cli_non_ascii_arg.py",
+    "tests\windows\test_windows_update_handoff.py"
+)
+
+$requiredNoSkipGuards = @(
+    "tests\windows\test_ui_drive_listing.py",
     "tests\windows\test_windows_update_handoff.py"
 )
 
@@ -184,14 +188,17 @@ foreach ($t in $guards) {
     $code = $LASTEXITCODE
     if ($code -eq 0) {
         Write-Host "GREEN ($t)" -ForegroundColor Green
-    } elseif ($code -eq 1 -or $t -eq "tests\windows\test_windows_update_handoff.py") {
+    } elseif ($code -eq 1) {
         Write-Host "RED ($t) - REGRESSION: a fixed Windows bug is broken again" -ForegroundColor Red
         $guardFailures += $t
+    } elseif ($requiredNoSkipGuards -contains $t) {
+        Write-Host "FAILED ($t) exit=$code - required release guard may not skip" -ForegroundColor Red
+        $guardFailures += $t
     } elseif ($code -eq 2) {
-        # Exit 2 is the guards' DOCUMENTED precondition-skip contract; every
-        # other unexpected code (a crashed python, an access-violation status,
-        # a mistyped guard) is a FAILURE - an uncontracted exit once let a
-        # crashing guard read as an invisible skip under a green banner.
+        # Exit 2 is the remaining guards' DOCUMENTED precondition-skip contract;
+        # every other unexpected code (a crashed python, an access-violation
+        # status, a mistyped guard) is a FAILURE - an uncontracted exit once let
+        # a crashing guard read as an invisible skip under a green banner.
         Write-Host "PRECONDITION ($t) exit=2 - skipped (see message above)" -ForegroundColor Yellow
         $guardSkips += $t
     } else {
@@ -227,8 +234,7 @@ if (-not $GuardsOnly) {
 
 Write-Host ""
 if ($guardSkips.Count -gt 0) {
-    Write-Host ("Guards skipped (precondition): {0} - e.g. the drive-picker guard " -f $guardSkips.Count) -ForegroundColor Yellow
-    Write-Host "needs a UI build (-Target cbm-with-ui, the default)." -ForegroundColor Yellow
+    Write-Host ("Guards skipped (documented precondition): {0}" -f $guardSkips.Count) -ForegroundColor Yellow
 }
 if ($fixedKeepers.Count -gt 0) {
     Write-Host ("Known-red repros that are now GREEN (promote to guards): {0}" -f ($fixedKeepers -join ", ")) -ForegroundColor Green
