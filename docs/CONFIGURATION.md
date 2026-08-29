@@ -78,6 +78,7 @@ codebase-memory-mcp config get auto_index
 codebase-memory-mcp config set auto_index true
 codebase-memory-mcp config set auto_index_limit 50000
 codebase-memory-mcp config set watcher_enabled false
+codebase-memory-mcp config set max_index_jobs 2
 codebase-memory-mcp config reset auto_index
 ```
 
@@ -90,6 +91,7 @@ Current keys:
 | `ignore_worktrees` | `false` | Skip linked git worktrees (`git worktree add`) on automatic indexing paths. |
 | `auto_watch` | `true` | Register the session's project with the background git watcher on connect. Set `false` to keep a session from registering its project (the watcher still runs for other projects). |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
+| `max_index_jobs` | `2` | Maximum concurrent distinct physical index jobs. Strict decimal range `1..16`; missing or invalid values use `2`. Read once when the daemon starts. |
 
 > **`watcher_enabled` vs `auto_watch`.** `watcher_enabled` controls whether the
 > watcher *subsystem* starts at all (the background poll thread). `auto_watch` is
@@ -116,6 +118,83 @@ Current keys:
 > Disabling the watcher does not disable anything else: the daemon still starts,
 > `auto_index` still runs, and `index_repository` stays available for manual
 > reindexing.
+
+### Index concurrency and the many-project workstation profile
+
+`max_index_jobs` limits distinct physical index processes owned by one daemon
+generation. Its product default is `2`, which is also the recommended rollout
+value. A missing value or anything other than an ASCII decimal integer in
+`1..16` falls back to `2`; invalid configuration cannot raise concurrency.
+Semantically identical requests still coalesce into one physical job before the
+capacity limit is applied.
+
+`CBM_WORKERS` is separate: it limits parallel workers *inside each physical
+index process*. The many-project workstation profile is:
+
+```text
+watcher_enabled=false
+max_index_jobs=2
+CBM_WORKERS=4
+```
+
+This is an opt-in workstation profile, not a change to the compatibility
+default: `watcher_enabled` remains `true`. With the watcher disabled, manual
+`index_repository(mode="full")` remains available.
+
+The daemon snapshots persisted daemon settings such as `watcher_enabled` and
+`max_index_jobs`, plus daemon-owned environment such as `CBM_WORKERS`, when a
+generation starts. Reconnecting a client is insufficient. Retire the current
+daemon and start the next generation with the intended environment:
+
+```bash
+codebase-memory-mcp daemon stop
+CBM_WORKERS=4 codebase-memory-mcp daemon start
+codebase-memory-mcp daemon status
+```
+
+The aggregate indexing memory budget is divided into equal fixed slices using
+the effective physical-job limit. If that budget is smaller than the configured
+limit, CBM reduces effective capacity before dividing so every admitted worker
+still receives a non-zero slice and the aggregate budget is not exceeded.
+
+These controls govern scheduling only. They do not select `fast` or `moderate`
+mode, change semantic index version `3`, disable cross-file LSP, or remove stored
+coverage. The canonical full-mode quality contract remains unchanged.
+
+#### Isolated rollout rehearsal
+
+The following rehearsal uses a disposable cache and does not change the live
+cache, daemon, installed binary, or global launch configuration:
+
+```bash
+rollout_cache="$(mktemp -d)"
+rollout_runtime="$(mktemp -d)"
+CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+  codebase-memory-mcp config set max_index_jobs 2
+CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+  codebase-memory-mcp config set watcher_enabled false
+CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+  codebase-memory-mcp config get max_index_jobs
+CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+  codebase-memory-mcp config get watcher_enabled
+CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+  CBM_WORKERS=4 codebase-memory-mcp daemon start
+CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+  codebase-memory-mcp daemon status
+CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+  codebase-memory-mcp daemon stop
+```
+
+Running equivalent commands against the real cache or global launch
+configuration is a separate external-effect gate and requires explicit
+authorization.
+
+> **No automatic stage or activation-backup cleanup.** CBM does not provide
+> startup garbage collection, age-based deletion, or orphan deletion for stage
+> files or activation backups. Manual cleanup requires checking artifact age,
+> active CBM processes, live worker ownership, and `PRAGMA quick_check(1)` on the
+> relevant database before deleting anything. A backup may be the only
+> crash-recovery artifact.
 
 ### `ignore_worktrees`
 
@@ -180,7 +259,7 @@ These environment variables affect runtime behavior:
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
 | `CBM_LOG_LEVEL` | `info` | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin-frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
 | `CBM_RUNTIME_DIR` | `%LOCALAPPDATA%` (Windows), `/private/tmp` (macOS), `/tmp` (other) | Parent directory for the daemon/CLI rendezvous directory, which CBM creates inside it as `cbm-daemon-<uid>` (`cbm-daemon-<key>` on Windows). Set it when the default ancestry cannot pass the private-directory check — see below. `CBM_CACHE_DIR` does **not** move the rendezvous. |
-| `CBM_WORKERS` | auto-detected | Override the indexing worker count. |
+| `CBM_WORKERS` | auto-detected | Override parallel workers inside each physical index process. It is captured by the daemon generation and is separate from `max_index_jobs`. |
 
 ### Relocating the daemon rendezvous directory
 

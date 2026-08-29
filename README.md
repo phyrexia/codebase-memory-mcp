@@ -716,8 +716,15 @@ codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-in
 codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
 codebase-memory-mcp config set ignore_worktrees true     # skip linked git worktrees when auto-indexing (default: false)
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
+codebase-memory-mcp config set max_index_jobs 2          # physical index processes (1-16; default 2)
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
+
+`max_index_jobs` caps distinct physical index jobs owned by one daemon
+generation. `CBM_WORKERS` caps parallel workers inside each physical index job;
+it is a separate control, not a replacement for `max_index_jobs`. Both are
+captured by the daemon generation, so retire/restart the daemon after changing
+either one. Identical requests still coalesce into one physical job.
 
 ### Environment Variables
 
