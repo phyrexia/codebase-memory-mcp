@@ -1946,12 +1946,14 @@ typedef struct {
     const char *project;
     const char *root;
     int result;
+    atomic_bool done;
 } app_index_thread_t;
 
 static void *app_index_thread(void *opaque) {
     app_index_thread_t *request = opaque;
     request->result =
         cbm_daemon_application_index(request->application, request->project, request->root);
+    atomic_store(&request->done, true);
     return NULL;
 }
 
@@ -5097,6 +5099,7 @@ static void *app_session_request_thread(void *opaque) {
  * to completion once the occupying job finishes. The non-session coordinator
  * API keeps its non-blocking busy answer. */
 TEST(daemon_application_queues_explicit_index_behind_physical_job_limit) {
+    enum { CONFIGURED_CAP_RUNNING = 3, CONFIGURED_CAP_TOTAL = 4 };
     app_fake_worker_context_t fake;
     app_fake_worker_context_init(&fake);
     cbm_daemon_application_worker_ops_t worker_ops = {
@@ -5109,28 +5112,45 @@ TEST(daemon_application_queues_explicit_index_behind_physical_job_limit) {
     };
     cbm_daemon_application_config_t config = {
         .worker_ops = &worker_ops,
-        .physical_job_limit = 1,
+        .physical_job_limit = CONFIGURED_CAP_RUNNING,
     };
     cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
-    char first_root[APP_TEST_PATH_CAP];
-    char second_root[APP_TEST_PATH_CAP];
-    snprintf(first_root, sizeof(first_root), "%s/cbm-app-cap-first-XXXXXX", cbm_tmpdir());
-    snprintf(second_root, sizeof(second_root), "%s/cbm-app-cap-second-XXXXXX", cbm_tmpdir());
-    bool roots_ok = cbm_mkdtemp(first_root) != NULL && cbm_mkdtemp(second_root) != NULL;
-    app_index_thread_t first = {
-        .application = application,
-        .project = "cap-first",
-        .root = first_root,
-        .result = -1,
-    };
-    cbm_thread_t thread;
-    bool started =
-        application && roots_ok && cbm_thread_create(&thread, 0, app_index_thread, &first) == 0;
-    bool admitted = started && app_wait_for_subscribers(application, "cap-first", 1) &&
-                    app_wait_for_atomic_int(&fake.starts, 1);
+    size_t effective_limit = cbm_daemon_application_physical_job_limit(application);
+    char roots[CONFIGURED_CAP_TOTAL][APP_TEST_PATH_CAP];
+    char projects[CONFIGURED_CAP_TOTAL][32];
+    bool roots_ok = true;
+    for (int i = 0; i < CONFIGURED_CAP_TOTAL; i++) {
+        (void)snprintf(roots[i], sizeof(roots[i]), "%s/cbm-app-cap-%d-XXXXXX", cbm_tmpdir(),
+                       i);
+        (void)snprintf(projects[i], sizeof(projects[i]), "cap-%d", i);
+        roots_ok = roots_ok && cbm_mkdtemp(roots[i]) != NULL;
+    }
+    app_index_thread_t admitted_requests[CONFIGURED_CAP_RUNNING];
+    cbm_thread_t admitted_threads[CONFIGURED_CAP_RUNNING];
+    bool started[CONFIGURED_CAP_RUNNING] = {false};
+    for (int i = 0; application && roots_ok && i < CONFIGURED_CAP_RUNNING; i++) {
+        admitted_requests[i] = (app_index_thread_t){
+            .application = application,
+            .project = projects[i],
+            .root = roots[i],
+            .result = -1,
+        };
+        started[i] =
+            cbm_thread_create(&admitted_threads[i], 0, app_index_thread, &admitted_requests[i]) == 0;
+    }
+    bool all_started = true;
+    for (int i = 0; i < CONFIGURED_CAP_RUNNING; i++) {
+        all_started = all_started && started[i];
+    }
+    bool admitted = all_started &&
+                    app_wait_for_active_jobs(application, CONFIGURED_CAP_RUNNING) &&
+                    app_wait_for_atomic_int(&fake.starts, CONFIGURED_CAP_RUNNING);
     /* The programmatic coordinator API stays non-blocking: callers with their
      * own retry policy (watcher, auto-index) still get the busy answer. */
-    int busy = admitted ? cbm_daemon_application_index(application, "cap-second", second_root) : -1;
+    int busy = admitted ? cbm_daemon_application_index(
+                              application, projects[CONFIGURED_CAP_RUNNING],
+                              roots[CONFIGURED_CAP_RUNNING])
+                        : -1;
 
     cbm_daemon_runtime_application_callbacks_t callbacks =
         cbm_daemon_application_runtime_callbacks(application);
@@ -5138,11 +5158,12 @@ TEST(daemon_application_queues_explicit_index_behind_physical_job_limit) {
     uint8_t *session_context = NULL;
     uint32_t session_context_length = 0;
     char args[APP_TEST_PATH_CAP + 32];
-    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", second_root);
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", roots[CONFIGURED_CAP_RUNNING]);
     uint8_t *tool = NULL;
     uint32_t tool_length = 0;
     bool session_encoded = admitted && session &&
-                           app_test_context_request(second_root, second_root, &session_context,
+                           app_test_context_request(roots[CONFIGURED_CAP_RUNNING],
+                                                    roots[CONFIGURED_CAP_RUNNING], &session_context,
                                                     &session_context_length) &&
                            app_test_tool_request("index_repository", args, &tool, &tool_length);
     uint8_t *context_response = NULL;
@@ -5166,7 +5187,7 @@ TEST(daemon_application_queues_explicit_index_behind_physical_job_limit) {
         context_ok &&
         cbm_thread_create(&request_thread, 0, app_session_request_thread, &queued) == 0;
     /* Positive queue signal: the request entered the busy-wait loop instead
-     * of erroring — and no second worker was started while parked. */
+     * of erroring — and no fourth worker was started while parked. */
     bool queued_parked = false;
     if (request_started) {
         uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
@@ -5178,10 +5199,11 @@ TEST(daemon_application_queues_explicit_index_behind_physical_job_limit) {
             cbm_usleep(1000);
         }
     }
-    bool no_second_start_while_parked = queued_parked && atomic_load(&fake.starts) == 1;
+    bool no_fourth_start_while_parked =
+        queued_parked && atomic_load(&fake.starts) == CONFIGURED_CAP_RUNNING;
 
-    /* Release the slot: the first job completes, the queued request must be
-     * admitted and complete on its own. */
+    /* Release the slots: the admitted jobs complete, and the queued request
+     * must be admitted and complete on its own. */
     atomic_store(&fake.allow_completion, true);
     bool request_joined = request_started && cbm_thread_join(&request_thread) == 0;
     bool queued_succeeded = request_joined && queued.status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
@@ -5190,8 +5212,10 @@ TEST(daemon_application_queues_explicit_index_behind_physical_job_limit) {
 
     callbacks.session_close(callbacks.context, session);
     bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
-    if (started) {
-        (void)cbm_thread_join(&thread);
+    for (int i = 0; i < CONFIGURED_CAP_RUNNING; i++) {
+        if (started[i]) {
+            (void)cbm_thread_join(&admitted_threads[i]);
+        }
     }
     cbm_daemon_application_free(application);
     free(session_context);
@@ -5199,25 +5223,27 @@ TEST(daemon_application_queues_explicit_index_behind_physical_job_limit) {
     free(queued.response);
 
     ASSERT_TRUE(roots_ok);
-    ASSERT_TRUE(started);
+    ASSERT_TRUE(all_started);
     ASSERT_TRUE(admitted);
+    ASSERT_EQ(effective_limit, CONFIGURED_CAP_RUNNING);
     ASSERT_EQ(busy, 1);
     ASSERT_TRUE(context_ok);
     ASSERT_TRUE(request_started);
     ASSERT_TRUE(queued_parked);
-    ASSERT_TRUE(no_second_start_while_parked);
+    ASSERT_TRUE(no_fourth_start_while_parked);
     ASSERT_TRUE(queued_succeeded);
     ASSERT_TRUE(stopped);
-    ASSERT_EQ(atomic_load(&fake.starts), 2);
-    ASSERT_EQ(atomic_load(&fake.destroys), 2);
+    ASSERT_EQ(atomic_load(&fake.starts), CONFIGURED_CAP_TOTAL);
+    ASSERT_EQ(atomic_load(&fake.destroys), CONFIGURED_CAP_TOTAL);
 
-    (void)cbm_rmdir(first_root);
-    (void)cbm_rmdir(second_root);
+    for (int i = 0; i < CONFIGURED_CAP_TOTAL; i++) {
+        (void)cbm_rmdir(roots[i]);
+    }
     PASS();
 }
 
-TEST(daemon_application_default_limit_admits_four_and_rejects_fifth) {
-    enum { DEFAULT_CAP_RUNNING = 4, DEFAULT_CAP_TOTAL = 5 };
+TEST(daemon_application_default_limit_admits_two_and_rejects_third) {
+    enum { DEFAULT_CAP_RUNNING = 2, DEFAULT_CAP_TOTAL = 3 };
     const size_t aggregate_budget = 4099;
     app_fake_worker_context_t fake;
     app_fake_worker_context_init(&fake);
@@ -5260,16 +5286,38 @@ TEST(daemon_application_default_limit_admits_four_and_rejects_fifth) {
     for (int i = 0; i < DEFAULT_CAP_RUNNING; i++) {
         all_started = all_started && started[i];
     }
-    bool four_admitted = all_started &&
-                         app_wait_for_active_jobs(application, DEFAULT_CAP_RUNNING) &&
-                         app_wait_for_atomic_int(&fake.starts, DEFAULT_CAP_RUNNING);
-    int fifth =
-        four_admitted ? cbm_daemon_application_index(application, projects[4], roots[4]) : -1;
+    bool two_admitted = all_started &&
+                        app_wait_for_active_jobs(application, DEFAULT_CAP_RUNNING) &&
+                        app_wait_for_atomic_int(&fake.starts, DEFAULT_CAP_RUNNING);
+    app_index_thread_t third_request = {
+        .application = application,
+        .project = projects[DEFAULT_CAP_RUNNING],
+        .root = roots[DEFAULT_CAP_RUNNING],
+        .result = -1,
+    };
+    cbm_thread_t third_thread;
+    bool third_started =
+        two_admitted && cbm_thread_create(&third_thread, 0, app_index_thread, &third_request) == 0;
+    bool third_decided = false;
+    if (third_started) {
+        uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
+        while (cbm_now_ms() < deadline) {
+            if (atomic_load(&third_request.done) ||
+                atomic_load(&fake.starts) >= DEFAULT_CAP_TOTAL) {
+                third_decided = true;
+                break;
+            }
+            cbm_usleep(1000);
+        }
+    }
     bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
     for (int i = 0; i < DEFAULT_CAP_RUNNING; i++) {
         if (started[i]) {
             (void)cbm_thread_join(&threads[i]);
         }
+    }
+    if (third_started) {
+        (void)cbm_thread_join(&third_thread);
     }
     cbm_daemon_application_free(application);
     for (int i = 0; i < DEFAULT_CAP_TOTAL; i++) {
@@ -5278,8 +5326,10 @@ TEST(daemon_application_default_limit_admits_four_and_rejects_fifth) {
 
     ASSERT_TRUE(roots_ok);
     ASSERT_TRUE(all_started);
-    ASSERT_TRUE(four_admitted);
-    ASSERT_EQ(fifth, 1);
+    ASSERT_TRUE(two_admitted);
+    ASSERT_TRUE(third_started);
+    ASSERT_TRUE(third_decided);
+    ASSERT_EQ(third_request.result, 1);
     ASSERT_TRUE(stopped);
     ASSERT_EQ(atomic_load(&fake.starts), DEFAULT_CAP_RUNNING);
     ASSERT_EQ(atomic_load(&fake.cancels), DEFAULT_CAP_RUNNING);
@@ -5290,6 +5340,31 @@ TEST(daemon_application_default_limit_admits_four_and_rejects_fifth) {
         assigned_budget += fake.memory_budgets[i];
     }
     ASSERT_TRUE(assigned_budget <= aggregate_budget);
+    PASS();
+}
+
+TEST(daemon_application_physical_limit_preserves_fixed_memory_split_and_nonzero_slice) {
+    cbm_daemon_application_config_t upper = {
+        .physical_job_limit = 16,
+        .aggregate_memory_budget_bytes = 1600,
+    };
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&upper);
+    ASSERT_NOT_NULL(application);
+    ASSERT_EQ(cbm_daemon_application_physical_job_limit(application), 16);
+    ASSERT_EQ(cbm_daemon_application_worker_memory_budget_bytes(application), 100);
+    ASSERT_TRUE(cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS));
+    cbm_daemon_application_free(application);
+
+    cbm_daemon_application_config_t tiny = {
+        .physical_job_limit = 16,
+        .aggregate_memory_budget_bytes = 3,
+    };
+    application = cbm_daemon_application_new(&tiny);
+    ASSERT_NOT_NULL(application);
+    ASSERT_EQ(cbm_daemon_application_physical_job_limit(application), 3);
+    ASSERT_EQ(cbm_daemon_application_worker_memory_budget_bytes(application), 1);
+    ASSERT_TRUE(cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS));
+    cbm_daemon_application_free(application);
     PASS();
 }
 
@@ -5469,7 +5544,8 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_cancellation_between_recovery_attempts_stops_retry);
     RUN_TEST(daemon_application_thread_start_failure_rolls_back_job_reservation);
     RUN_TEST(daemon_application_queues_explicit_index_behind_physical_job_limit);
-    RUN_TEST(daemon_application_default_limit_admits_four_and_rejects_fifth);
+    RUN_TEST(daemon_application_default_limit_admits_two_and_rejects_third);
+    RUN_TEST(daemon_application_physical_limit_preserves_fixed_memory_split_and_nonzero_slice);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
     RUN_TEST(daemon_application_metrics_record_flush_and_accumulate);
     RUN_TEST(daemon_application_metrics_saturation_preserves_per_source_totals);

@@ -68,7 +68,7 @@ typedef struct {
     const cbm_daemon_application_worker_ops_t *worker_ops; /* NULL = production */
     const cbm_daemon_application_update_ops_t *update_ops; /* NULL = production */
     /* Maximum distinct, non-terminal physical index jobs. Zero selects the
-     * conservative daemon default (4). Identical requests still coalesce even
+     * conservative daemon default (2). Identical requests still coalesce even
      * while the limit is full. */
     size_t physical_job_limit;
     /* Aggregate budget shared by every concurrently admitted physical worker.
