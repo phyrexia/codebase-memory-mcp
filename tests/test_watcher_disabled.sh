@@ -43,11 +43,21 @@ esac
 [[ -x "${BINARY}" ]] || { echo "missing binary: ${BINARY}" >&2; exit 2; }
 command -v git >/dev/null 2>&1 || { echo "git required for fixture" >&2; exit 2; }
 
-work="$(mktemp -d)"
+case "$(uname -s)" in
+  Darwin) work_parent="/private/tmp" ;;
+  *) work_parent="/tmp" ;;
+esac
+work="$(mktemp -d "${work_parent}/cbm-watcher-disabled.XXXXXX")"
+chmod 700 "${work}"
+runtime="${work}/runtime"
+mkdir -p "${runtime}"
+chmod 700 "${runtime}"
+export CBM_RUNTIME_DIR="${runtime}"
 
-# Every run gets its own CBM_CACHE_DIR, and the daemon endpoint is derived from
-# it, so these daemons are private to the test and can never touch a developer's
-# real one. Retire them on any exit path regardless.
+# Every binary invocation inherits the private CBM_RUNTIME_DIR above, so clients,
+# daemon generations, workers, and cleanup rendezvous only with this test. Each
+# run also gets its own CBM_CACHE_DIR for isolated state and logs. Retire every
+# private daemon on any exit path regardless.
 cleanup() {
   local cache
   for cache in "${work}"/cache-*; do
@@ -88,6 +98,23 @@ fail() {
   done
   exit 1
 }
+
+assert_private_runtime_contract() {
+  local expected="${work}/runtime"
+  [[ "${CBM_RUNTIME_DIR:-}" == "${expected}" ]] \
+    || fail "CBM_RUNTIME_DIR is not isolated to ${expected}"
+  [[ -d "${CBM_RUNTIME_DIR}" ]] \
+    || fail "private runtime directory does not exist: ${CBM_RUNTIME_DIR}"
+  local mode
+  case "$(uname -s)" in
+    Darwin) mode="$(stat -f '%Lp' "${CBM_RUNTIME_DIR}" 2>/dev/null || true)" ;;
+    *) mode="$(stat -c '%a' "${CBM_RUNTIME_DIR}" 2>/dev/null || true)" ;;
+  esac
+  [[ "${mode}" == "700" ]] \
+    || fail "private runtime directory mode is ${mode:-unknown}, expected 700"
+}
+
+assert_private_runtime_contract
 
 # wait_for <file> <extended-regex> <label>
 # Bounded poll on an asserted state: returns as soon as the state is observed,
@@ -156,6 +183,11 @@ run_session() {
   local fifo="${work}/stdin.fifo"
   rm -f "${fifo}"; mkfifo "${fifo}"
   DAEMON_LOG="${cache}/logs/cbm-daemon.log"
+  mkdir -p "${cache}/logs"
+  # A prior invocation using this cache has already retired its daemon. Start
+  # this invocation with an empty log so waits and assertions can only observe
+  # the generation launched below.
+  : >"${DAEMON_LOG}"
 
   ( cd "${repo}" && CBM_CACHE_DIR="${cache}" "${BINARY}" <"${fifo}" \
       >"${outf}" 2>"${cache}.client.err" ) &
@@ -186,6 +218,13 @@ run_session() {
   CBM_CACHE_DIR="${cache}" "${BINARY}" daemon stop >/dev/null 2>&1 || true
   wait_for "${DAEMON_LOG}" 'msg=daemon\.start( |$)' "the daemon to record its start"
   wait_for "${DAEMON_LOG}" 'msg=daemon\.stop( |$)' "the daemon lifecycle to close"
+  local start_count stop_count
+  start_count="$(grep -Ec 'msg=daemon\.start( |$)' "${DAEMON_LOG}")"
+  stop_count="$(grep -Ec 'msg=daemon\.stop( |$)' "${DAEMON_LOG}")"
+  [[ "${start_count}" -eq 1 ]] \
+    || fail "run_session captured ${start_count} daemon.start records, expected exactly one"
+  [[ "${stop_count}" -eq 1 ]] \
+    || fail "run_session captured ${stop_count} daemon.stop records, expected exactly one"
 }
 
 # =============================================================================
