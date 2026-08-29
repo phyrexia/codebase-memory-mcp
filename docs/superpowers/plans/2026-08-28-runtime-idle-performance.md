@@ -72,17 +72,17 @@ typedef struct {
 #else
     pthread_cond_t condition;
 #endif
-} cbm_condition_t;
+} cbm_thread_condition_t;
 
-bool cbm_condition_init(cbm_condition_t *condition);
-cbm_condition_wait_result_t cbm_condition_wait(cbm_condition_t *condition,
+bool cbm_condition_init(cbm_thread_condition_t *condition);
+cbm_condition_wait_result_t cbm_condition_wait(cbm_thread_condition_t *condition,
                                                 cbm_mutex_t *mutex);
-cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_condition_t *condition,
+cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_thread_condition_t *condition,
                                                       cbm_mutex_t *mutex,
                                                       uint32_t timeout_ms);
-void cbm_condition_signal(cbm_condition_t *condition);
-void cbm_condition_broadcast(cbm_condition_t *condition);
-void cbm_condition_destroy(cbm_condition_t *condition);
+void cbm_condition_signal(cbm_thread_condition_t *condition);
+void cbm_condition_broadcast(cbm_thread_condition_t *condition);
+void cbm_condition_destroy(cbm_thread_condition_t *condition);
 ```
 
 - Contract: `cbm_condition_wait*` return with the same mutex re-acquired. `CBM_CONDITION_TIMED_OUT` is not an error. `cbm_condition_timed_wait(..., UINT32_MAX)` delegates to the infinite wait. Callers still own predicate loops.
@@ -94,7 +94,7 @@ Add this fixture and test above `SUITE(daemon_frontend)` in `tests/test_daemon_f
 ```c
 typedef struct {
     cbm_mutex_t mutex;
-    cbm_condition_t condition;
+    cbm_thread_condition_t condition;
     unsigned int ready;
     unsigned int released;
     bool release;
@@ -172,24 +172,24 @@ Run:
 scripts/test.sh SANITIZE= BUILD_DIR=build/runtime-idle-red-condition --suites daemon_frontend
 ```
 
-Expected RED: compilation fails because `cbm_condition_t`, `CBM_CONDITION_*`, and `cbm_condition_*` are not defined. Record the first compiler diagnostic; if it compiles, stop for overlapping-implementation reconciliation.
+Expected RED: compilation fails because `cbm_thread_condition_t`, `CBM_CONDITION_*`, and `cbm_condition_*` are not defined. Record the first compiler diagnostic; if it compiles, stop for overlapping-implementation reconciliation.
 
 - [ ] **Step 3: Declare the exact API**
 
-In `compat_thread.h`, include `<stdbool.h>` and `<stdint.h>`, place `cbm_condition_t` immediately after `cbm_mutex_t`, and add the signatures from Interfaces. Do not expose native error numbers.
+In `compat_thread.h`, include `<stdbool.h>` and `<stdint.h>`, place `cbm_thread_condition_t` immediately after `cbm_mutex_t`, and add the signatures from Interfaces. Do not expose native error numbers.
 
 - [ ] **Step 4: Implement Win32 conditions**
 
 Add beside the mutex implementation in `compat_thread.c`:
 
 ```c
-bool cbm_condition_init(cbm_condition_t *condition) {
+bool cbm_condition_init(cbm_thread_condition_t *condition) {
     if (!condition) return false;
     InitializeConditionVariable(&condition->condition);
     return true;
 }
 
-cbm_condition_wait_result_t cbm_condition_wait(cbm_condition_t *condition,
+cbm_condition_wait_result_t cbm_condition_wait(cbm_thread_condition_t *condition,
                                                 cbm_mutex_t *mutex) {
     return condition && mutex &&
                    SleepConditionVariableCS(&condition->condition, &mutex->cs, INFINITE)
@@ -197,7 +197,7 @@ cbm_condition_wait_result_t cbm_condition_wait(cbm_condition_t *condition,
                : CBM_CONDITION_ERROR;
 }
 
-cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_condition_t *condition,
+cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_thread_condition_t *condition,
                                                       cbm_mutex_t *mutex,
                                                       uint32_t timeout_ms) {
     if (timeout_ms == UINT32_MAX) return cbm_condition_wait(condition, mutex);
@@ -208,15 +208,15 @@ cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_condition_t *condition,
     return GetLastError() == ERROR_TIMEOUT ? CBM_CONDITION_TIMED_OUT : CBM_CONDITION_ERROR;
 }
 
-void cbm_condition_signal(cbm_condition_t *condition) {
+void cbm_condition_signal(cbm_thread_condition_t *condition) {
     if (condition) WakeConditionVariable(&condition->condition);
 }
 
-void cbm_condition_broadcast(cbm_condition_t *condition) {
+void cbm_condition_broadcast(cbm_thread_condition_t *condition) {
     if (condition) WakeAllConditionVariable(&condition->condition);
 }
 
-void cbm_condition_destroy(cbm_condition_t *condition) {
+void cbm_condition_destroy(cbm_thread_condition_t *condition) {
     (void)condition;
 }
 ```
@@ -235,7 +235,7 @@ static void condition_timespec_add_ms(struct timespec *value, uint32_t timeout_m
     }
 }
 
-bool cbm_condition_init(cbm_condition_t *condition) {
+bool cbm_condition_init(cbm_thread_condition_t *condition) {
     if (!condition) return false;
 #ifdef __APPLE__
     return pthread_cond_init(&condition->condition, NULL) == 0;
@@ -251,7 +251,7 @@ bool cbm_condition_init(cbm_condition_t *condition) {
 #endif
 }
 
-cbm_condition_wait_result_t cbm_condition_wait(cbm_condition_t *condition,
+cbm_condition_wait_result_t cbm_condition_wait(cbm_thread_condition_t *condition,
                                                 cbm_mutex_t *mutex) {
     if (!condition || !mutex) return CBM_CONDITION_ERROR;
     return pthread_cond_wait(&condition->condition, &mutex->mtx) == 0
@@ -259,7 +259,7 @@ cbm_condition_wait_result_t cbm_condition_wait(cbm_condition_t *condition,
                : CBM_CONDITION_ERROR;
 }
 
-cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_condition_t *condition,
+cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_thread_condition_t *condition,
                                                       cbm_mutex_t *mutex,
                                                       uint32_t timeout_ms) {
     if (timeout_ms == UINT32_MAX) return cbm_condition_wait(condition, mutex);
@@ -280,15 +280,15 @@ cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_condition_t *condition,
     return result == ETIMEDOUT ? CBM_CONDITION_TIMED_OUT : CBM_CONDITION_ERROR;
 }
 
-void cbm_condition_signal(cbm_condition_t *condition) {
+void cbm_condition_signal(cbm_thread_condition_t *condition) {
     if (condition) (void)pthread_cond_signal(&condition->condition);
 }
 
-void cbm_condition_broadcast(cbm_condition_t *condition) {
+void cbm_condition_broadcast(cbm_thread_condition_t *condition) {
     if (condition) (void)pthread_cond_broadcast(&condition->condition);
 }
 
-void cbm_condition_destroy(cbm_condition_t *condition) {
+void cbm_condition_destroy(cbm_thread_condition_t *condition) {
     if (condition) (void)pthread_cond_destroy(&condition->condition);
 }
 ```
@@ -325,8 +325,8 @@ Expected: only Task 1 paths. Release `tests/test_daemon_frontend.c` to Task 2 af
 - Test: `tests/test_daemon_frontend.c`
 
 **Interfaces:**
-- Consumes: Task 1 `cbm_condition_t` API; merged `7710f86e` observer functions, including `cbm_daemon_frontend_test_worker_idle_cycles()`.
-- Produces: no new production public API. `frontend_state_t` gains one `cbm_condition_t changed`; `completed_items` becomes a mutex-protected `uint64_t`. Every predicate-changing mutation broadcasts `changed` while `state->mutex` is held.
+- Consumes: Task 1 `cbm_thread_condition_t` API; merged `7710f86e` observer functions, including `cbm_daemon_frontend_test_worker_idle_cycles()`.
+- Produces: no new production public API. `frontend_state_t` gains one `cbm_thread_condition_t changed`; `completed_items` becomes a mutex-protected `uint64_t`. Every predicate-changing mutation broadcasts `changed` while `state->mutex` is held.
 - Preserves: `cbm_daemon_frontend_mcp_run(...)`, maintenance monitor public functions, cancellation parsing/routing, queue size/byte bounds, EOF no-progress reset, and watchdog deadline.
 
 - [ ] **Step 1: Strengthen the idle regression so polling is RED**
@@ -360,7 +360,7 @@ Change the relevant `frontend_state_t` members to:
 
 ```c
 cbm_mutex_t mutex;
-cbm_condition_t changed;
+cbm_thread_condition_t changed;
 /* existing client, queue, identity, and boolean fields */
 uint64_t completed_items;
 ```
@@ -778,7 +778,7 @@ uint64_t cbm_daemon_runtime_service_condition_waits_for_testing(
 #endif
 ```
 
-- Internal fields: `cbm_condition_t state_changed`, `bool state_changed_initialized`, mutex-protected `bool accept_thread_done`, and a test-only mutex-protected wait-entry counter.
+- Internal fields: `cbm_thread_condition_t state_changed`, `bool state_changed_initialized`, mutex-protected `bool accept_thread_done`, and a test-only mutex-protected wait-entry counter.
 
 - [ ] **Step 1: Add RED predicate-loop and idle-accept tests**
 
