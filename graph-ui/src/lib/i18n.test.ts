@@ -36,5 +36,19 @@ describe("i18n", () => {
     expect(messages.zh.tabs.projects).toBe("项目");
     expect(messages.zh.index.newIndex).toBe("新建索引");
     expect(messages.en.index.repositoryPath).toBe("Repository path");
+    expect(messages.en.index.browseTimeout).toBe(
+      "Folder listing timed out after 5 seconds. Showing the last successful listing.",
+    );
+    expect(messages.zh.index.browseTimeout).toBe(
+      "文件夹列表请求在 5 秒后超时。仍显示上次成功的列表。",
+    );
+    expect(messages.en.index.browseFailed).toBe("Unable to browse this folder.");
+    expect(messages.zh.index.browseFailed).toBe("无法浏览此文件夹。");
+    expect(messages.en.index.browseTruncated).toBe(
+      "Showing a partial folder list because a browse limit was reached.",
+    );
+    expect(messages.zh.index.browseTruncated).toBe(
+      "由于达到浏览限制，当前仅显示部分文件夹。",
+    );
   });
 });

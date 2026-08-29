@@ -167,6 +167,17 @@ function joinPath(base: string, dir: string): string {
   return `${base.replace(/[\\/]+$/, "")}${slash}${dir}`;
 }
 
+const BROWSE_TIMEOUT_MS = 5_000;
+
+type BrowseResponse = {
+  path?: string;
+  parent?: string;
+  dirs?: string[];
+  roots?: string[];
+  truncated?: boolean;
+  error?: string;
+};
+
 /* Chip describing how a browsed folder relates to the indexed roots. */
 function DirStateBadge({ match }: { match: DirMatch }) {
   const t = useUiMessages();
@@ -205,34 +216,77 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [browseNotice, setBrowseNotice] = useState<string | null>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   /* Path whose listing is currently shown. Lets the typed-path effect skip a
    * redundant re-fetch after browse() sets currentPath itself. */
   const lastBrowsedRef = useRef<string>("");
+  const browseGenerationRef = useRef(0);
+  const browseAbortRef = useRef<AbortController | null>(null);
+  const browseCopyRef = useRef({
+    timeout: t.index.browseTimeout,
+    failed: t.index.browseFailed,
+    truncated: t.index.browseTruncated,
+  });
+  browseCopyRef.current = {
+    timeout: t.index.browseTimeout,
+    failed: t.index.browseFailed,
+    truncated: t.index.browseTruncated,
+  };
 
   const browse = useCallback(async (path?: string, opts?: { silent?: boolean }) => {
     const silent = opts?.silent ?? false;
-    if (!silent) setLoading(true);
+    const generation = ++browseGenerationRef.current;
+    browseAbortRef.current?.abort();
+    const controller = new AbortController();
+    browseAbortRef.current = controller;
+    let timedOut = false;
+    const timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, BROWSE_TIMEOUT_MS);
+
+    setLoading(!silent);
     setError(null);
+
     try {
       const q = path ? `?path=${encodeURIComponent(path)}` : "";
-      const res = await fetch(`/api/browse${q}`);
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      const res = await fetch(`/api/browse${q}`, { signal: controller.signal });
+      const data = await res.json() as BrowseResponse;
+      if (!res.ok || data.error) throw new Error(data.error ?? browseCopyRef.current.failed);
+      if (generation !== browseGenerationRef.current) return;
+
       lastBrowsedRef.current = data.path ?? "";
       setCurrentPath(data.path ?? "");
-      setDirs((data.dirs ?? []).sort());
+      setDirs([...(data.dirs ?? [])].sort());
       setRoots(data.roots ?? ["/"]);
       setParentPath(data.parent ?? "/");
-    } catch (e) {
-      /* Silent (typed-path) refreshes keep the last good listing instead of
-       * flashing an error while the user is still typing a path. */
-      if (!silent) setError(e instanceof Error ? e.message : "Browse failed");
+      setBrowseNotice(data.truncated ? browseCopyRef.current.truncated : null);
+    } catch (caught) {
+      if (generation !== browseGenerationRef.current) return;
+      if (controller.signal.aborted && !timedOut) return;
+      if (timedOut) {
+        setError(browseCopyRef.current.timeout);
+      } else if (!silent) {
+        setError(caught instanceof Error ? caught.message : browseCopyRef.current.failed);
+      }
+    } finally {
+      window.clearTimeout(timeoutId);
+      if (generation === browseGenerationRef.current) {
+        if (browseAbortRef.current === controller) browseAbortRef.current = null;
+        setLoading(false);
+      }
     }
-    finally { if (!silent) setLoading(false); }
   }, []);
 
-  useEffect(() => { browse(); }, [browse]);
+  useEffect(() => {
+    void browse();
+    return () => {
+      browseGenerationRef.current += 1;
+      browseAbortRef.current?.abort();
+      browseAbortRef.current = null;
+    };
+  }, [browse]);
   useEffect(() => { filterRef.current?.focus(); }, []);
 
   /* Windows only: when the user types a drive path into the Repository path
@@ -444,6 +498,11 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
         {/* Footer */}
         <div className="px-5 py-4 border-t border-border/20 shrink-0">
+          {browseNotice && (
+            <div className="rounded-lg bg-primary/10 border border-primary/20 px-3 py-2 mb-3">
+              <p className="text-primary text-[11px]">{browseNotice}</p>
+            </div>
+          )}
           {error && <div className="rounded-lg bg-destructive/10 border border-destructive/20 px-3 py-2 mb-3"><p className="text-destructive text-[11px]">{error}</p></div>}
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 min-w-0">

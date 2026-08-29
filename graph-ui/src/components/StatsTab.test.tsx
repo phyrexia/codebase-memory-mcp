@@ -41,10 +41,53 @@ function mockProjectsFetch(extra?: (url: string, init?: RequestInit) => Response
   return fetchMock;
 }
 
+type PendingBrowse = {
+  url: string;
+  signal: AbortSignal;
+  resolve: (payload: Record<string, unknown>) => void;
+  reject: (error: unknown) => void;
+};
+
+function deferredBrowseFetch() {
+  const pending: PendingBrowse[] = [];
+  const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "/rpc") {
+      return Promise.resolve(new Response(JSON.stringify({
+        result: { content: [{ text: JSON.stringify({ projects: [] }) }] },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.startsWith("/api/ui-config")) {
+      return Promise.resolve(new Response(JSON.stringify({ lang: "en" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }));
+    }
+    if (!url.startsWith("/api/browse")) {
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    }
+    return new Promise<Response>((resolve, reject) => {
+      pending.push({
+        url,
+        signal: init?.signal as AbortSignal,
+        resolve: (payload) => resolve(new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })),
+        reject,
+      });
+    });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return { fetchMock, pending };
+}
+
 describe("StatsTab index modal", () => {
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("submits a custom path and project name", async () => {
@@ -118,13 +161,19 @@ describe("StatsTab index modal", () => {
     /* Clicking the drive crumb browses to "C:/", not "/C:". */
     fireEvent.click(screen.getByRole("button", { name: "C:" }));
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith("/api/browse?path=C%3A%2F");
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/browse?path=C%3A%2F",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
     });
 
     /* Clicking a nested crumb browses to "C:/Users", not "/C:/Users". */
     fireEvent.click(screen.getByRole("button", { name: "Users" }));
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith("/api/browse?path=C%3A%2FUsers");
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/browse?path=C%3A%2FUsers",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
     });
   });
 
@@ -184,7 +233,10 @@ describe("StatsTab index modal", () => {
     /* Clicking it browses to the drive root, not "/". */
     fireEvent.click(screen.getByRole("button", { name: "Browse C:/" }));
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith("/api/browse?path=C%3A%2F");
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/browse?path=C%3A%2F",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
     });
   });
 
@@ -206,6 +258,91 @@ describe("StatsTab index modal", () => {
     /* Wait past the debounce window; a POSIX path must NOT trigger a re-browse. */
     await new Promise((r) => setTimeout(r, 400));
     expect(browseCalls()).toBe(before);
+  });
+
+  it("aborts a superseded browse and ignores its late response and finally", async () => {
+    const { pending } = deferredBrowseFetch();
+    render(<StatsTab onSelectProject={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Index your first repository" }));
+
+    await waitFor(() => expect(pending).toHaveLength(1));
+    pending[0].resolve({ path: "/good", parent: "/", dirs: ["old"], roots: ["/"], truncated: false });
+    expect(await screen.findByText("old")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Browse old" }));
+    await waitFor(() => expect(pending).toHaveLength(2));
+    fireEvent.click(screen.getByRole("button", { name: "Browse /" }));
+    await waitFor(() => expect(pending).toHaveLength(3));
+
+    expect(pending[1].signal.aborted).toBe(true);
+    pending[1].resolve({ path: "/stale", parent: "/", dirs: ["stale-only"], roots: ["/"], truncated: false });
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByText("Loading...")).toBeInTheDocument();
+    expect(screen.queryByText("stale-only")).not.toBeInTheDocument();
+
+    pending[2].resolve({ path: "/latest", parent: "/", dirs: ["latest-only"], roots: ["/"], truncated: false });
+    expect(await screen.findByText("latest-only")).toBeInTheDocument();
+    expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+    expect(screen.queryByText("stale-only")).not.toBeInTheDocument();
+  });
+
+  it("aborts at five seconds and retains the last good listing", async () => {
+    const { pending } = deferredBrowseFetch();
+    render(<StatsTab onSelectProject={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Index your first repository" }));
+    await waitFor(() => expect(pending).toHaveLength(1));
+    pending[0].resolve({ path: "/good", parent: "/", dirs: ["kept"], roots: ["/"], truncated: false });
+    expect(await screen.findByText("kept")).toBeInTheDocument();
+
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "Browse kept" }));
+    await act(async () => { await Promise.resolve(); });
+    expect(pending).toHaveLength(2);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(4_999); });
+    expect(pending[1].signal.aborted).toBe(false);
+    expect(screen.queryByText(/timed out after 5 seconds/)).not.toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(pending[1].signal.aborted).toBe(true);
+    await act(async () => {
+      pending[1].reject(new DOMException("Aborted", "AbortError"));
+      await Promise.resolve();
+    });
+    expect(screen.getByText(messages.en.index.browseTimeout)).toBeInTheDocument();
+    expect(screen.getByText("kept")).toBeInTheDocument();
+    expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
+  it("aborts the active browse when the modal unmounts", async () => {
+    const { pending } = deferredBrowseFetch();
+    const view = render(<StatsTab onSelectProject={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Index your first repository" }));
+    await waitFor(() => expect(pending).toHaveLength(1));
+    const active = pending[0];
+
+    view.unmount();
+
+    expect(active.signal.aborted).toBe(true);
+  });
+
+  it("shows a localized partial-list notice for a truncated response", async () => {
+    mockProjectsFetch((url) => url.startsWith("/api/browse")
+      ? new Response(JSON.stringify({
+          path: "/home/dev",
+          parent: "/home",
+          dirs: ["alpha"],
+          roots: ["/"],
+          truncated: true,
+        }), { status: 200, headers: { "Content-Type": "application/json" } })
+      : undefined);
+
+    render(<StatsTab onSelectProject={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Index your first repository" }));
+
+    expect(await screen.findByText(messages.en.index.browseTruncated)).toBeInTheDocument();
+    expect(screen.getByText("alpha")).toBeInTheDocument();
   });
 
   it("posts empty ADR content when deleting an existing ADR", async () => {
