@@ -2134,6 +2134,89 @@ cleanup:
     PASS();
 }
 
+typedef struct {
+    cbm_daemon_ipc_listener_t *listener;
+    atomic_bool returned;
+    int result;
+    cbm_daemon_ipc_connection_t *connection;
+} ipc_accept_wait_t;
+
+static void *ipc_accept_wait_forever(void *opaque) {
+    ipc_accept_wait_t *wait = opaque;
+    wait->result = cbm_daemon_ipc_accept(wait->listener, CBM_DAEMON_IPC_WAIT_FOREVER,
+                                         &wait->connection);
+    atomic_store_explicit(&wait->returned, true, memory_order_release);
+    return NULL;
+}
+
+TEST(daemon_ipc_infinite_accept_blocks_until_listener_interrupt) {
+    char parent[TEST_PATH_CAP];
+    bool parent_ready = ipc_test_parent_new(parent, "accept-interrupt");
+    cbm_daemon_ipc_endpoint_t *endpoint =
+        parent_ready ? cbm_daemon_ipc_endpoint_new("0123456789abcdef", parent) : NULL;
+    cbm_daemon_ipc_listener_t *listener = endpoint ? cbm_daemon_ipc_listen(endpoint) : NULL;
+    ipc_accept_wait_t wait = {.listener = listener, .result = -1};
+    atomic_init(&wait.returned, false);
+    cbm_daemon_ipc_accept_observer_reset_for_testing();
+    cbm_thread_t thread;
+    bool started = listener && cbm_thread_create(&thread, 0, ipc_accept_wait_forever, &wait) == 0;
+    uint64_t deadline = cbm_now_ms() + 2000U;
+    while (started && cbm_daemon_ipc_accept_waits_for_testing() < 1 && cbm_now_ms() < deadline) {
+        cbm_usleep(1000);
+    }
+    uint64_t waits_before = cbm_daemon_ipc_accept_waits_for_testing();
+    cbm_usleep(100U * 1000U);
+    bool blocked = !atomic_load_explicit(&wait.returned, memory_order_acquire);
+    uint64_t waits_after = cbm_daemon_ipc_accept_waits_for_testing();
+    uint64_t timeouts = cbm_daemon_ipc_accept_timeouts_for_testing();
+    bool first_interrupt = started && cbm_daemon_ipc_listener_interrupt(listener);
+    bool second_interrupt = started && cbm_daemon_ipc_listener_interrupt(listener);
+    bool joined = started && cbm_thread_join(&thread) == 0;
+    if (wait.connection) cbm_daemon_ipc_connection_close(wait.connection);
+    cbm_daemon_ipc_listener_close(listener);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    bool removed = !parent_ready || th_rmtree(parent) == 0;
+
+    ASSERT_TRUE(parent_ready);
+    ASSERT_TRUE(listener != NULL);
+    ASSERT_TRUE(started);
+    ASSERT_EQ(waits_before, 1);
+    ASSERT_TRUE(blocked);
+    ASSERT_EQ(waits_after, waits_before);
+    ASSERT_EQ(timeouts, 0);
+    ASSERT_TRUE(first_interrupt);
+    ASSERT_TRUE(second_interrupt);
+    ASSERT_TRUE(joined);
+    ASSERT_EQ(wait.result, 0);
+    ASSERT_TRUE(wait.connection == NULL);
+    ASSERT_TRUE(removed);
+    PASS();
+}
+
+TEST(daemon_ipc_finite_accept_timeout_remains_bounded) {
+    char parent[TEST_PATH_CAP];
+    bool parent_ready = ipc_test_parent_new(parent, "accept-timeout");
+    cbm_daemon_ipc_endpoint_t *endpoint =
+        parent_ready ? cbm_daemon_ipc_endpoint_new("0123456789abcdef", parent) : NULL;
+    cbm_daemon_ipc_listener_t *listener = endpoint ? cbm_daemon_ipc_listen(endpoint) : NULL;
+    cbm_daemon_ipc_connection_t *connection = NULL;
+    cbm_daemon_ipc_accept_observer_reset_for_testing();
+    int result = listener ? cbm_daemon_ipc_accept(listener, 20, &connection) : -1;
+    uint64_t timeouts = cbm_daemon_ipc_accept_timeouts_for_testing();
+    if (connection) cbm_daemon_ipc_connection_close(connection);
+    cbm_daemon_ipc_listener_close(listener);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    bool removed = !parent_ready || th_rmtree(parent) == 0;
+
+    ASSERT_TRUE(parent_ready);
+    ASSERT_TRUE(listener != NULL);
+    ASSERT_EQ(result, 0);
+    ASSERT_TRUE(connection == NULL);
+    ASSERT_EQ(timeouts, 1);
+    ASSERT_TRUE(removed);
+    PASS();
+}
+
 TEST(daemon_ipc_bounded_receive_rejects_oversize_before_payload) {
     static const char key[] = "2021222324252627";
     static const uint8_t oversized_payload[] = {'o', 'v', 'e', 'r', '!'};
@@ -4815,6 +4898,8 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_lifetime_reservation_survives_saturated_second_listen);
     RUN_TEST(daemon_ipc_lifetime_reservation_transfers_without_unlock_window);
     RUN_TEST(daemon_ipc_local_frame_roundtrip);
+    RUN_TEST(daemon_ipc_infinite_accept_blocks_until_listener_interrupt);
+    RUN_TEST(daemon_ipc_finite_accept_timeout_remains_bounded);
     RUN_TEST(daemon_ipc_bounded_receive_rejects_oversize_before_payload);
     RUN_TEST(daemon_ipc_wait_forever_is_interruptible);
     RUN_TEST(daemon_ipc_connect_waits_for_delayed_listener);

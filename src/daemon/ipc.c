@@ -29,6 +29,42 @@ enum {
     CBM_DAEMON_IPC_WINDOWS_RENDEZVOUS_RETRY_MS = 250,
 };
 
+typedef enum {
+    CBM_IPC_ACCEPT_WAIT_ERROR = -1,
+    CBM_IPC_ACCEPT_WAIT_TIMEOUT = 0,
+    CBM_IPC_ACCEPT_WAIT_ACCEPTED = 1,
+    CBM_IPC_ACCEPT_WAIT_INTERRUPTED = 2,
+} cbm_ipc_accept_wait_result_t;
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static atomic_uint_fast64_t ipc_accept_wait_count;
+static atomic_uint_fast64_t ipc_accept_timeout_count;
+
+void cbm_daemon_ipc_accept_observer_reset_for_testing(void) {
+    atomic_store_explicit(&ipc_accept_wait_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&ipc_accept_timeout_count, 0, memory_order_relaxed);
+}
+
+uint64_t cbm_daemon_ipc_accept_waits_for_testing(void) {
+    return atomic_load_explicit(&ipc_accept_wait_count, memory_order_relaxed);
+}
+
+uint64_t cbm_daemon_ipc_accept_timeouts_for_testing(void) {
+    return atomic_load_explicit(&ipc_accept_timeout_count, memory_order_relaxed);
+}
+
+static void ipc_accept_wait_observe(void) {
+    (void)atomic_fetch_add_explicit(&ipc_accept_wait_count, 1, memory_order_relaxed);
+}
+
+static void ipc_accept_timeout_observe(void) {
+    (void)atomic_fetch_add_explicit(&ipc_accept_timeout_count, 1, memory_order_relaxed);
+}
+#else
+static void ipc_accept_wait_observe(void) {}
+static void ipc_accept_timeout_observe(void) {}
+#endif
+
 /* Last private-namespace validation refusal, set at the exact failing check.
  * A bare "cache-private" status is undiagnosable in the field; the refusal
  * names the object and rule instead. Last-writer-wins, diagnostic only. */
@@ -407,6 +443,11 @@ struct cbm_daemon_ipc_lifetime_reservation {
 
 struct cbm_daemon_ipc_listener {
     int fd;
+    int wake_read_fd;
+    int wake_write_fd;
+    cbm_mutex_t wake_mutex;
+    bool wake_mutex_initialized;
+    bool wake_pending;
     int dir_fd;
     char *runtime_dir;
     dev_t dir_device;
@@ -2557,6 +2598,29 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         return NULL;
     }
     listener->fd = fd;
+    listener->wake_read_fd = -1;
+    listener->wake_write_fd = -1;
+    listener->dir_fd = -1;
+    cbm_mutex_init(&listener->wake_mutex);
+    listener->wake_mutex_initialized = true;
+    int wake_fds[2] = {-1, -1};
+    if (pipe(wake_fds) != 0 || !fd_set_cloexec(wake_fds[0]) ||
+        !fd_set_nonblocking(wake_fds[0]) || !fd_set_cloexec(wake_fds[1]) ||
+        !fd_set_nonblocking(wake_fds[1])) {
+        cbm_log_error("daemon.ipc.listen_failed", "stage", "wake_pipe_creation");
+        if (wake_fds[0] >= 0) {
+            (void)close(wake_fds[0]);
+        }
+        if (wake_fds[1] >= 0) {
+            (void)close(wake_fds[1]);
+        }
+        cbm_mutex_destroy(&listener->wake_mutex);
+        (void)close(fd);
+        free(listener);
+        return NULL;
+    }
+    listener->wake_read_fd = wake_fds[0];
+    listener->wake_write_fd = wake_fds[1];
     listener->dir_fd = dup(endpoint->dir_fd);
     listener->runtime_dir = string_copy(endpoint->runtime_dir);
     listener->dir_device = endpoint->dir_device;
@@ -2574,6 +2638,9 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         if (listener->dir_fd >= 0) {
             (void)close(listener->dir_fd);
         }
+        (void)close(listener->wake_read_fd);
+        (void)close(listener->wake_write_fd);
+        cbm_mutex_destroy(&listener->wake_mutex);
         (void)close(fd);
         free(listener->runtime_dir);
         free(listener->address);
@@ -2824,6 +2891,21 @@ void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener) {
         (void)close(listener->fd);
         listener->fd = -1;
     }
+    if (listener->wake_mutex_initialized) {
+        cbm_mutex_lock(&listener->wake_mutex);
+        if (listener->wake_read_fd >= 0) {
+            (void)close(listener->wake_read_fd);
+            listener->wake_read_fd = -1;
+        }
+        if (listener->wake_write_fd >= 0) {
+            (void)close(listener->wake_write_fd);
+            listener->wake_write_fd = -1;
+        }
+        listener->wake_pending = false;
+        cbm_mutex_unlock(&listener->wake_mutex);
+        cbm_mutex_destroy(&listener->wake_mutex);
+        listener->wake_mutex_initialized = false;
+    }
     if (listener->dir_fd >= 0) {
         posix_listener_artifacts_remove_if_matches(listener);
         (void)close(listener->dir_fd);
@@ -2839,6 +2921,82 @@ void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener) {
     free(listener);
 }
 
+bool cbm_daemon_ipc_listener_interrupt(cbm_daemon_ipc_listener_t *listener) {
+    if (!listener || !listener->wake_mutex_initialized || listener->owner_pid != getpid()) {
+        return false;
+    }
+    cbm_mutex_lock(&listener->wake_mutex);
+    if (listener->wake_pending) {
+        cbm_mutex_unlock(&listener->wake_mutex);
+        return true;
+    }
+    if (listener->wake_write_fd < 0) {
+        cbm_mutex_unlock(&listener->wake_mutex);
+        return false;
+    }
+    uint8_t wake = 1;
+    ssize_t written;
+    do {
+        written = write(listener->wake_write_fd, &wake, sizeof(wake));
+    } while (written < 0 && errno == EINTR);
+    bool interrupted = written == (ssize_t)sizeof(wake) ||
+                       (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    if (interrupted) {
+        listener->wake_pending = true;
+    }
+    cbm_mutex_unlock(&listener->wake_mutex);
+    return interrupted;
+}
+
+static cbm_ipc_accept_wait_result_t posix_listener_accept_wait(
+    cbm_daemon_ipc_listener_t *listener, uint64_t deadline_ms) {
+    for (;;) {
+        struct pollfd descriptors[2] = {
+            {.fd = listener->wake_read_fd, .events = POLLIN, .revents = 0},
+            {.fd = listener->fd, .events = POLLIN, .revents = 0},
+        };
+        int timeout_ms = deadline_ms == UINT64_MAX ? -1 : deadline_remaining_ms(deadline_ms);
+        ipc_accept_wait_observe();
+        int result = poll(descriptors, 2, timeout_ms);
+        if (result > 0) {
+            if ((descriptors[0].revents & POLLIN) != 0) {
+                cbm_mutex_lock(&listener->wake_mutex);
+                uint8_t wake_buffer[64];
+                bool drained = true;
+                for (;;) {
+                    ssize_t bytes = read(listener->wake_read_fd, wake_buffer, sizeof(wake_buffer));
+                    if (bytes > 0) {
+                        continue;
+                    }
+                    if (bytes < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        drained = false;
+                    }
+                    break;
+                }
+                listener->wake_pending = false;
+                cbm_mutex_unlock(&listener->wake_mutex);
+                return drained ? CBM_IPC_ACCEPT_WAIT_INTERRUPTED : CBM_IPC_ACCEPT_WAIT_ERROR;
+            }
+            if ((descriptors[1].revents & POLLIN) != 0) {
+                return CBM_IPC_ACCEPT_WAIT_ACCEPTED;
+            }
+            return CBM_IPC_ACCEPT_WAIT_ERROR;
+        }
+        if (result == 0) {
+            if (deadline_ms != UINT64_MAX) {
+                ipc_accept_timeout_observe();
+            }
+            return CBM_IPC_ACCEPT_WAIT_TIMEOUT;
+        }
+        if (errno != EINTR) {
+            return CBM_IPC_ACCEPT_WAIT_ERROR;
+        }
+    }
+}
+
 int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_ms,
                           cbm_daemon_ipc_connection_t **connection_out) {
     if (connection_out) {
@@ -2849,9 +3007,12 @@ int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_
     }
     uint64_t deadline_ms = ipc_deadline_after(timeout_ms);
     for (;;) {
-        int ready = poll_until(listener->fd, POLLIN, deadline_ms);
-        if (ready != 1) {
-            return ready;
+        cbm_ipc_accept_wait_result_t wait = posix_listener_accept_wait(listener, deadline_ms);
+        if (wait == CBM_IPC_ACCEPT_WAIT_INTERRUPTED || wait == CBM_IPC_ACCEPT_WAIT_TIMEOUT) {
+            return 0;
+        }
+        if (wait != CBM_IPC_ACCEPT_WAIT_ACCEPTED) {
+            return -1;
         }
         int fd = accept(listener->fd, NULL, NULL);
         if (fd < 0) {
@@ -3454,6 +3615,10 @@ struct cbm_daemon_ipc_listener {
     wchar_t *pipe_name;
     HANDLE pipe;
     bool first_instance;
+    HANDLE interrupt_event;
+    cbm_mutex_t wake_mutex;
+    bool wake_mutex_initialized;
+    bool wake_pending;
     /* The pending overlapped ConnectNamedPipe persists across accept-poll
      * timeouts. Destroying a listening instance on every poll timeout races
      * clients attaching in the teardown window: they end up severed or,
@@ -5432,8 +5597,11 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     listener->pipe_name = wide_copy(generation->pipe_name);
     listener->pipe = INVALID_HANDLE_VALUE;
     listener->first_instance = true;
+    cbm_mutex_init(&listener->wake_mutex);
+    listener->wake_mutex_initialized = true;
+    listener->interrupt_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     listener->lifetime_reservation = lifetime_reservation;
-    if (!listener->pipe_name) {
+    if (!listener->pipe_name || !listener->interrupt_event) {
         listener->lifetime_reservation = NULL;
         cbm_daemon_ipc_listener_close(listener);
         return NULL;
@@ -5485,10 +5653,44 @@ void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener) {
     if (listener->connect_event) {
         (void)CloseHandle(listener->connect_event);
     }
+    if (listener->wake_mutex_initialized) {
+        cbm_mutex_lock(&listener->wake_mutex);
+        if (listener->interrupt_event) {
+            (void)CloseHandle(listener->interrupt_event);
+            listener->interrupt_event = NULL;
+        }
+        listener->wake_pending = false;
+        cbm_mutex_unlock(&listener->wake_mutex);
+        cbm_mutex_destroy(&listener->wake_mutex);
+        listener->wake_mutex_initialized = false;
+    }
     cbm_daemon_ipc_lifetime_reservation_release(listener->lifetime_reservation);
     ipc_participant_guard_release_complete(&listener->participant_guard);
     free(listener->pipe_name);
     free(listener);
+}
+
+bool cbm_daemon_ipc_listener_interrupt(cbm_daemon_ipc_listener_t *listener) {
+    if (!listener || !listener->wake_mutex_initialized) {
+        return false;
+    }
+    cbm_mutex_lock(&listener->wake_mutex);
+    if (listener->wake_pending) {
+        cbm_mutex_unlock(&listener->wake_mutex);
+        return true;
+    }
+    if (!listener->interrupt_event) {
+        cbm_mutex_unlock(&listener->wake_mutex);
+        return false;
+    }
+    listener->wake_pending = true;
+    if (!SetEvent(listener->interrupt_event)) {
+        listener->wake_pending = false;
+        cbm_mutex_unlock(&listener->wake_mutex);
+        return false;
+    }
+    cbm_mutex_unlock(&listener->wake_mutex);
+    return true;
 }
 
 typedef struct {
@@ -5604,6 +5806,26 @@ static bool win_pipe_client_is_current_user(HANDLE pipe) {
     return same_user;
 }
 
+static cbm_ipc_accept_wait_result_t win_listener_accept_wait(
+    cbm_daemon_ipc_listener_t *listener, DWORD timeout_ms) {
+    HANDLE events[2] = {listener->interrupt_event, listener->connect_event};
+    ipc_accept_wait_observe();
+    DWORD wait = WaitForMultipleObjects(2, events, FALSE, timeout_ms);
+    if (wait == WAIT_OBJECT_0) {
+        return CBM_IPC_ACCEPT_WAIT_INTERRUPTED;
+    }
+    if (wait == WAIT_OBJECT_0 + 1) {
+        return CBM_IPC_ACCEPT_WAIT_ACCEPTED;
+    }
+    if (wait == WAIT_TIMEOUT) {
+        if (timeout_ms != INFINITE) {
+            ipc_accept_timeout_observe();
+        }
+        return CBM_IPC_ACCEPT_WAIT_TIMEOUT;
+    }
+    return CBM_IPC_ACCEPT_WAIT_ERROR;
+}
+
 int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_ms,
                           cbm_daemon_ipc_connection_t **connection_out) {
     if (connection_out) {
@@ -5646,15 +5868,28 @@ int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_
     }
 
     if (listener->connect_pending) {
-        DWORD wait = WaitForSingleObject(listener->connect_event, timeout_ms);
-        if (wait == WAIT_TIMEOUT) {
+        cbm_ipc_accept_wait_result_t wait = win_listener_accept_wait(listener, timeout_ms);
+        if (wait == CBM_IPC_ACCEPT_WAIT_INTERRUPTED) {
+            cbm_mutex_lock(&listener->wake_mutex);
+            listener->wake_pending = false;
+            bool reset = ResetEvent(listener->interrupt_event) != 0;
+            cbm_mutex_unlock(&listener->wake_mutex);
+            return reset ? 0 : -1;
+        }
+        if (wait == CBM_IPC_ACCEPT_WAIT_TIMEOUT) {
             /* Keep the instance and its pending connect armed: a listening
              * pipe must stay available for clients between polls. */
             return 0;
         }
+        if (wait != CBM_IPC_ACCEPT_WAIT_ACCEPTED) {
+            listener->connect_pending = false;
+            (void)DisconnectNamedPipe(listener->pipe);
+            (void)CloseHandle(listener->pipe);
+            listener->pipe = INVALID_HANDLE_VALUE;
+            return -1;
+        }
         DWORD transferred = 0;
-        if (wait != WAIT_OBJECT_0 ||
-            !GetOverlappedResult(listener->pipe, &listener->connect_overlapped, &transferred,
+        if (!GetOverlappedResult(listener->pipe, &listener->connect_overlapped, &transferred,
                                  FALSE)) {
             DWORD connect_error = GetLastError();
             listener->connect_pending = false;

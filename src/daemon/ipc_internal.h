@@ -75,6 +75,12 @@ int cbm_daemon_ipc_receive_frame_bounded(cbm_daemon_ipc_connection_t *connection
                                          uint32_t timeout_ms, uint32_t max_payload_length,
                                          cbm_daemon_frame_t *frame_out, uint8_t **payload_out);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+void cbm_daemon_ipc_accept_observer_reset_for_testing(void);
+uint64_t cbm_daemon_ipc_accept_waits_for_testing(void);
+uint64_t cbm_daemon_ipc_accept_timeouts_for_testing(void);
+#endif
+
 /* Narrow crash/fault seams for publication-state and retry-state tests. They
  * are inert unless a test installs a hook/failure count in its own process. */
 typedef enum {

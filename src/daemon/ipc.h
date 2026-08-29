@@ -76,6 +76,13 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     cbm_daemon_ipc_lifetime_reservation_t **reservation_io);
 void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener);
 
+/* Thread-safe, reusable, and coalescing. Wakes an in-progress accept. The
+ * awakened accept returns 0 with *connection_out == NULL. It does not close
+ * the listener; callers may accept again after handling the state change.
+ * listener_interrupt may race accept, but listener_close still requires all
+ * accept callers to be joined before it frees the listener. */
+bool cbm_daemon_ipc_listener_interrupt(cbm_daemon_ipc_listener_t *listener);
+
 /* Create or validate one private current-user directory at an already
  * canonical local path. Ancestors are handle-validated without mutation:
  * POSIX permits only root/current-user owners and no group/other write (apart
