@@ -167,8 +167,25 @@ The following rehearsal uses a disposable cache and does not change the live
 cache, daemon, installed binary, or global launch configuration:
 
 ```bash
-rollout_cache="$(mktemp -d)"
-rollout_runtime="$(mktemp -d)"
+case "$(uname -s)" in
+  Darwin) rollout_parent="/private/tmp" ;;
+  *) rollout_parent="/tmp" ;;
+esac
+rollout_root="$(mktemp -d "$rollout_parent/cbm-index-control.XXXXXX")"
+chmod 700 "$rollout_root"
+rollout_cache="$rollout_root/cache"
+rollout_runtime="$rollout_root/runtime"
+mkdir -m 700 "$rollout_cache" "$rollout_runtime"
+
+cleanup_rollout() {
+  CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+    codebase-memory-mcp daemon stop >/dev/null 2>&1 || true
+  case "$rollout_root" in
+    "$rollout_parent"/cbm-index-control.*) rm -rf -- "$rollout_root" ;;
+  esac
+}
+trap cleanup_rollout EXIT HUP INT TERM
+
 CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
   codebase-memory-mcp config set max_index_jobs 2
 CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
@@ -183,6 +200,8 @@ CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
   codebase-memory-mcp daemon status
 CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
   codebase-memory-mcp daemon stop
+trap - EXIT HUP INT TERM
+cleanup_rollout
 ```
 
 Running equivalent commands against the real cache or global launch
