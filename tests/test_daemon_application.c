@@ -367,6 +367,63 @@ TEST(daemon_application_metrics_record_flush_and_accumulate) {
     PASS();
 }
 
+TEST(daemon_application_metrics_saturation_preserves_per_source_totals) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/dapp-metrics-saturation-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    cbm_daemon_application_config_t app_cfg = {0};
+    app_cfg.config = cfg;
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&app_cfg);
+    ASSERT_NOT_NULL(application);
+
+    for (int i = 0; i < 256; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "tool-%03d", i);
+        cbm_daemon_application_metrics_record(application, "mcp", name, "demo",
+                                              (uint64_t)i + 1U, i == 0);
+    }
+    cbm_daemon_application_metrics_record(application, "mcp", "overflow", "demo", 1000, true);
+    cbm_daemon_application_metrics_flush(application);
+
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", tmpdir);
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(dbpath, &db), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT SUM(count), SUM(errors), SUM(dur_us_sum),"
+                                 " MAX(dur_us_max) FROM metrics_requests WHERE source='mcp'",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int64(stmt, 0), 257);
+    ASSERT_EQ(sqlite3_column_int64(stmt, 1), 2);
+    ASSERT_EQ(sqlite3_column_int64(stmt, 2), 33896);
+    ASSERT_EQ(sqlite3_column_int64(stmt, 3), 1000);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT COUNT(*) FROM metrics_requests WHERE source='mcp'"
+                                 " AND name='_other' AND project=''",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    bool stopped = cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    cbm_config_close(cfg);
+    th_rmtree(tmpdir);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
 TEST(daemon_application_request_cancel_is_scoped_to_exact_token) {
     char root[APP_TEST_PATH_CAP];
     (void)snprintf(root, sizeof(root), "%s/cbm-app-request-cancel-XXXXXX", cbm_tmpdir());
@@ -5250,5 +5307,6 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_default_limit_admits_four_and_rejects_fifth);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
     RUN_TEST(daemon_application_metrics_record_flush_and_accumulate);
+    RUN_TEST(daemon_application_metrics_saturation_preserves_per_source_totals);
     RUN_TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained);
 }

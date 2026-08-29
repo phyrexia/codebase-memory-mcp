@@ -3626,6 +3626,22 @@ static void metrics_add_locked(cbm_daemon_application_t *application, const char
         name = "_other";
         project = "";
         slot = metrics_slot_find_locked(application, bucket, source, name, project);
+        if (!slot) {
+            /* The accumulator filled before this source needed an overflow
+             * slot. Promote one of its existing entries in place, preserving
+             * those counters and making room for this sample without growing
+             * the fixed-size storage. */
+            for (size_t i = 0; i < application->metrics_slot_count; i++) {
+                cbm_daemon_metrics_slot_t *candidate = &application->metrics_slots[i];
+                if (strcmp(candidate->bucket_hour, bucket) == 0 &&
+                    strcmp(candidate->source, source) == 0) {
+                    snprintf(candidate->name, sizeof(candidate->name), "%s", name);
+                    candidate->project[0] = '\0';
+                    slot = candidate;
+                    break;
+                }
+            }
+        }
     }
     if (!slot) {
         if (application->metrics_slot_count >= APPLICATION_METRICS_SLOTS) {
