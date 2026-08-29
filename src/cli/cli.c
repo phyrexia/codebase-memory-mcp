@@ -6916,24 +6916,49 @@ bool cbm_config_watcher_enabled(cbm_config_t *cfg) {
 }
 
 size_t cbm_config_max_index_jobs(cbm_config_t *cfg) {
-    const char *value = cbm_config_get(cfg, CBM_CONFIG_MAX_INDEX_JOBS, NULL);
-    if (!value || !value[0]) {
+    if (!cfg) {
         return CBM_CONFIG_MAX_INDEX_JOBS_DEFAULT;
     }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cfg->db, "SELECT value FROM config WHERE key = ?", SQL_NUL_TERM, &stmt,
+                           NULL) != SQLITE_OK) {
+        return CBM_CONFIG_MAX_INDEX_JOBS_DEFAULT;
+    }
+    sqlite3_bind_text(stmt, SQL_PARAM_1, CBM_CONFIG_MAX_INDEX_JOBS, SQL_NUL_TERM,
+                      cbm_sqlite_transient);
+
+    size_t result = CBM_CONFIG_MAX_INDEX_JOBS_DEFAULT;
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return result;
+    }
+
+    const unsigned char *value = sqlite3_column_text(stmt, 0);
+    int value_bytes = sqlite3_column_bytes(stmt, 0);
+    if (!value || value_bytes < 1 || value_bytes > 2) {
+        sqlite3_finalize(stmt);
+        return result;
+    }
+
     size_t parsed = 0;
-    for (const unsigned char *cursor = (const unsigned char *)value; *cursor; cursor++) {
-        if (*cursor < (unsigned char)'0' || *cursor > (unsigned char)'9') {
-            return CBM_CONFIG_MAX_INDEX_JOBS_DEFAULT;
+    for (int i = 0; i < value_bytes; i++) {
+        if (value[i] < (unsigned char)'0' || value[i] > (unsigned char)'9') {
+            sqlite3_finalize(stmt);
+            return result;
         }
-        size_t digit = (size_t)(*cursor - (unsigned char)'0');
+        size_t digit = (size_t)(value[i] - (unsigned char)'0');
         if (parsed > (CBM_CONFIG_MAX_INDEX_JOBS_MAX - digit) / 10U) {
-            return CBM_CONFIG_MAX_INDEX_JOBS_DEFAULT;
+            sqlite3_finalize(stmt);
+            return result;
         }
         parsed = parsed * 10U + digit;
     }
-    return parsed >= CBM_CONFIG_MAX_INDEX_JOBS_MIN && parsed <= CBM_CONFIG_MAX_INDEX_JOBS_MAX
-               ? parsed
-               : CBM_CONFIG_MAX_INDEX_JOBS_DEFAULT;
+    if (parsed >= CBM_CONFIG_MAX_INDEX_JOBS_MIN && parsed <= CBM_CONFIG_MAX_INDEX_JOBS_MAX) {
+        result = parsed;
+    }
+    sqlite3_finalize(stmt);
+    return result;
 }
 
 /* ── Config CLI subcommand ────────────────────────────────────── */

@@ -12945,6 +12945,55 @@ TEST(cli_config_max_index_jobs_is_discoverable_strict_bounded_and_persistent) {
     PASS();
 }
 
+TEST(cli_config_max_index_jobs_rejects_truncated_and_embedded_nul_values) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-max-index-jobs-bytes-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    char overlong_ending_2x[8195];
+    memset(overlong_ending_2x, '0', sizeof(overlong_ending_2x) - 3);
+    overlong_ending_2x[sizeof(overlong_ending_2x) - 3] = '2';
+    overlong_ending_2x[sizeof(overlong_ending_2x) - 2] = 'x';
+    overlong_ending_2x[sizeof(overlong_ending_2x) - 1] = '\0';
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MAX_INDEX_JOBS, overlong_ending_2x), 0);
+    ASSERT_EQ(cbm_config_max_index_jobs(cfg), 2);
+
+    /* cbm_config_get() truncates database text to 4095 bytes. This value's
+     * truncated prefix is a valid 7, but its complete SQLite value ends in x. */
+    char truncated_to_seven[4097];
+    memset(truncated_to_seven, '0', sizeof(truncated_to_seven) - 3);
+    truncated_to_seven[sizeof(truncated_to_seven) - 3] = '7';
+    truncated_to_seven[sizeof(truncated_to_seven) - 2] = 'x';
+    truncated_to_seven[sizeof(truncated_to_seven) - 1] = '\0';
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MAX_INDEX_JOBS, truncated_to_seven), 0);
+    ASSERT_EQ(cbm_config_max_index_jobs(cfg), 2);
+
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", tmpdir);
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(dbpath, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(stmt, 1, CBM_CONFIG_MAX_INDEX_JOBS, -1, SQLITE_TRANSIENT),
+              SQLITE_OK);
+    const char embedded_nul[] = {'7', '\0', 'x'};
+    ASSERT_EQ(sqlite3_bind_text(stmt, 2, embedded_nul, (int)sizeof(embedded_nul), SQLITE_TRANSIENT),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    ASSERT_EQ(cbm_config_max_index_jobs(cfg), 2);
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_config_delete) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -14141,6 +14190,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
     RUN_TEST(cli_config_max_index_jobs_is_discoverable_strict_bounded_and_persistent);
+    RUN_TEST(cli_config_max_index_jobs_rejects_truncated_and_embedded_nul_values);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
     RUN_TEST(cli_config_watcher_enabled_default_and_persist);
