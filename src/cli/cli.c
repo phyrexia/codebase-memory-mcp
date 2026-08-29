@@ -6915,6 +6915,27 @@ bool cbm_config_watcher_enabled(cbm_config_t *cfg) {
     return cbm_config_get_bool(cfg, CBM_CONFIG_WATCHER_ENABLED, true);
 }
 
+size_t cbm_config_max_index_jobs(cbm_config_t *cfg) {
+    const char *value = cbm_config_get(cfg, CBM_CONFIG_MAX_INDEX_JOBS, NULL);
+    if (!value || !value[0]) {
+        return CBM_CONFIG_MAX_INDEX_JOBS_DEFAULT;
+    }
+    size_t parsed = 0;
+    for (const unsigned char *cursor = (const unsigned char *)value; *cursor; cursor++) {
+        if (*cursor < (unsigned char)'0' || *cursor > (unsigned char)'9') {
+            return CBM_CONFIG_MAX_INDEX_JOBS_DEFAULT;
+        }
+        size_t digit = (size_t)(*cursor - (unsigned char)'0');
+        if (parsed > (CBM_CONFIG_MAX_INDEX_JOBS_MAX - digit) / 10U) {
+            return CBM_CONFIG_MAX_INDEX_JOBS_DEFAULT;
+        }
+        parsed = parsed * 10U + digit;
+    }
+    return parsed >= CBM_CONFIG_MAX_INDEX_JOBS_MIN && parsed <= CBM_CONFIG_MAX_INDEX_JOBS_MAX
+               ? parsed
+               : CBM_CONFIG_MAX_INDEX_JOBS_DEFAULT;
+}
+
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
 /* THE config-key table. list, get, help, and key validation all read this one
@@ -6938,6 +6959,8 @@ static const config_key_def_t CONFIG_KEYS[] = {
      "Skip linked git worktrees when indexing automatically"},
     {CBM_CONFIG_WATCHER_ENABLED, "true",
      "Run the background watcher thread (auto-reindex); false to disable"},
+    {CBM_CONFIG_MAX_INDEX_JOBS, "2",
+     "Maximum concurrent physical index jobs (1-16; invalid values use 2)"},
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},

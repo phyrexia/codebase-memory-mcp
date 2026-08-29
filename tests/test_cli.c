@@ -12899,6 +12899,52 @@ TEST(cli_config_get_int) {
     PASS();
 }
 
+TEST(cli_config_max_index_jobs_is_discoverable_strict_bounded_and_persistent) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-max-index-jobs-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    ASSERT_EQ(cbm_config_max_index_jobs(NULL), 2);
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_max_index_jobs(cfg), 2);
+
+    bool listed = false;
+    for (size_t i = 0; i < cbm_cli_config_key_count_for_testing(); i++) {
+        const char *key = cbm_cli_config_key_at_for_testing(i);
+        listed = listed || (key && strcmp(key, CBM_CONFIG_MAX_INDEX_JOBS) == 0);
+    }
+    ASSERT_TRUE(listed);
+
+    const struct {
+        const char *stored;
+        size_t expected;
+    } valid[] = {{"1", 1}, {"2", 2}, {"02", 2}, {"7", 7}, {"16", 16}};
+    for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); i++) {
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MAX_INDEX_JOBS, valid[i].stored), 0);
+        ASSERT_EQ(cbm_config_max_index_jobs(cfg), valid[i].expected);
+    }
+
+    const char *invalid[] = {
+        "", "0", "-1", "+2", "17", " 2", "2 ", "1.5", "0x10", "2x", "abc",
+        "999999999999999999999999999999999999999999999999999999999999999999"
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MAX_INDEX_JOBS, invalid[i]), 0);
+        ASSERT_EQ(cbm_config_max_index_jobs(cfg), 2);
+    }
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MAX_INDEX_JOBS, "7"), 0);
+    cbm_config_close(cfg);
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_max_index_jobs(cfg), 7);
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_config_delete) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -14094,6 +14140,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_result_storage_is_per_thread);
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
+    RUN_TEST(cli_config_max_index_jobs_is_discoverable_strict_bounded_and_persistent);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
     RUN_TEST(cli_config_watcher_enabled_default_and_persist);

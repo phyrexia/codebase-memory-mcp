@@ -449,6 +449,10 @@ int cbm_config_metrics_prune(cbm_config_t *cfg, const char *older_than_bucket);
 #define CBM_CONFIG_IGNORE_WORKTREES "ignore_worktrees"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 #define CBM_CONFIG_WATCHER_ENABLED "watcher_enabled"
+#define CBM_CONFIG_MAX_INDEX_JOBS "max_index_jobs"
+#define CBM_CONFIG_MAX_INDEX_JOBS_DEFAULT 2U
+#define CBM_CONFIG_MAX_INDEX_JOBS_MIN 1U
+#define CBM_CONFIG_MAX_INDEX_JOBS_MAX 16U
 /* #1558: the graph UI's loopback listener. Stored in the UI config file rather
  * than the key-value store, but surfaced through `config` so it is findable. */
 #define CBM_CONFIG_UI_ENABLED "ui_enabled"
@@ -462,6 +466,11 @@ int cbm_config_metrics_prune(cbm_config_t *cfg, const char *older_than_bucket);
  * default (true), so a failure to open the config store never silently disables
  * the watcher. */
 bool cbm_config_watcher_enabled(cbm_config_t *cfg);
+
+/* Strict persisted daemon physical-index concurrency. Only ASCII decimal
+ * digits whose value is in 1..16 are accepted. Missing or malformed values
+ * return 2. Read by the daemon host once per generation. */
+size_t cbm_config_max_index_jobs(cbm_config_t *cfg);
 
 /* ── Binary activation safety ─────────────────────────────────── */
 
