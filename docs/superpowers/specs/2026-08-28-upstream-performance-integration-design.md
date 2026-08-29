@@ -15,7 +15,17 @@ Integrate the complete current upstream history into the locally deployed custom
 - Unmerged upstream idle-frontend fix: `7710f86e927c5221c395ecbdab9d0f3b75edcb71`.
 - `f5285844` and all request-metrics commits are ancestors of `81b02389`.
 - The current worktree's modified `.gitignore` belongs to the user and must remain untouched.
-- The semantic index version remains `3`; no index reset is part of this work.
+- The semantic index version remains `3` and the compressed artifact format
+  remains `2`. The database format gate is new:
+  `CBM_INDEX_FORMAT_VERSION=1`.
+- The live-cache audit found 94 project databases at SQLite
+  `PRAGMA user_version=0`; 88 registered roots still exist and six are missing.
+  These counts describe this workstation rollout only, not a product-wide
+  migration rule.
+- The first index of a version-0 database under the candidate removes that
+  legacy project database, performs a full rebuild, and seals the replacement
+  with `user_version=1`. Installing or starting the candidate alone does not
+  migrate a database.
 
 The implementation must stop if any pinned reference changes before the isolated integration branch is created. Updating upstream after execution begins requires a new audit, not an implicit moving-target merge.
 
@@ -84,7 +94,13 @@ Adopt upstream's watcher fixes and master kill switch. Preserve the compatibilit
 
 Add persistent `max_index_jobs` with range `1..16` and default `2`. Reuse `cbm_daemon_application_config_t.physical_job_limit`; invalid, zero, negative, overflow, or non-decimal values fall back to `2` and cannot increase concurrency. A daemon generation captures the setting, so changes require session/daemon restart.
 
-The rollout profile also uses `CBM_WORKERS=4`. This is deployment evidence, not a change to graph semantics. Full-mode graph quality remains canonical; the work must not disable cross-file LSP or silently downgrade stored coverage.
+The migration rollout profile uses `auto_index=false`,
+`watcher_enabled=false`, `max_index_jobs=1`, and `CBM_WORKERS=4`. The product
+default for `max_index_jobs` remains `2`; the lower rollout value makes the
+one-time destructive rebuilds serial and observable. This is deployment
+evidence, not a change to graph semantics. Full-mode graph quality remains
+canonical; the work must not disable cross-file LSP or silently downgrade
+stored coverage.
 
 Do not add automatic stage-file garbage collection in this batch. Existing stage names lack durable ownership identity and backups may be the only recovery artifact after a crash. Operational cleanup is allowed only after checking age, active processes, live worker ownership, and database integrity; no backup is automatically deleted.
 
@@ -155,11 +171,54 @@ The candidate is not installed automatically. After all local gates pass, produc
 - cache-copy compatibility evidence;
 - rollback command using the prior binary's guarded installer.
 
+Deployment and index migration are separate operations. Installing the
+candidate may replace the executable and restart the daemon, but it does not
+rewrite project databases. Before either operation, quiesce CBM and take a
+durable backup of the installed binary, configuration database, and complete
+cache. Preserve that backup until every migrated project passes integrity and
+query checks and rollback is no longer required.
+
+The authorized live migration must use this order:
+
+1. Disable automatic indexing and the watcher, set `max_index_jobs=1`, and
+   start the candidate generation with `CBM_WORKERS=4`.
+2. Inventory registered roots without indexing them. Keep missing roots out of
+   the migration queue; do not invent replacement paths.
+3. Explicitly full-index one existing root as a canary. Its version-0 database
+   is expected to be deleted and rebuilt once, then sealed at
+   `user_version=1`.
+4. Validate `PRAGMA quick_check(1)`, the format seal, and a representative graph
+   query before continuing. Run `check_index_coverage` on representative paths
+   and require `coverage_version=3` plus `hash_records_complete=true`; do not use
+   `index_status` as a substitute because it does not expose those fields. The
+   direct-SQL equivalent must find exactly one matching row in
+   `index_coverage_meta`.
+5. Migrate the remaining existing roots one at a time, applying the same
+   checks after each project. For the audited workstation this means one
+   canary followed by the remaining 87 of 88 existing roots; the six missing
+   roots remain untouched.
+6. Treat the legacy/duplicated `centroriente` registration as a separate
+   reconciliation case rather than including it in an automatic batch.
+
+Do not stamp `PRAGMA user_version` externally. Only a successful full rebuild
+may create the version-1 seal. On any failure, stop the serial queue. The format
+gate may already have unlinked the legacy database, so preserve the remaining
+logs and stage artifacts and restore that database from the pre-migration
+snapshot; do not promise that a failed database still exists.
+
+After any project has migrated, rollback is a coordinated state restore, not a
+binary-only downgrade: disable automation, quiesce every CBM process, restore
+the cache and configuration snapshot together with the previous binary, verify
+the restored databases, and only then restart the old generation and restore
+its prior automation settings.
+
 Actual installation, daemon/frontend quiescence, global configuration change, stale-stage deletion, push, PR, and release remain separate external-effect gates requiring explicit authorization.
 
 ## Non-goals
 
-- No semantic index reset or schema generation bump.
+- No semantic-index version or artifact-format bump. The only reset is the
+  required one-time full rebuild of a legacy version-0 project database when
+  that project is explicitly indexed under database format version `1`.
 - No automatic deletion of activation backups or stage artifacts.
 - No rewrite of all polling in unrelated exceptional paths.
 - No downgrade from full graph coverage to improve timings.

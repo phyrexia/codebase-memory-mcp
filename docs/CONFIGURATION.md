@@ -78,7 +78,7 @@ codebase-memory-mcp config get auto_index
 codebase-memory-mcp config set auto_index true
 codebase-memory-mcp config set auto_index_limit 50000
 codebase-memory-mcp config set watcher_enabled false
-codebase-memory-mcp config set max_index_jobs 2
+codebase-memory-mcp config set max_index_jobs 1
 codebase-memory-mcp config reset auto_index
 ```
 
@@ -119,25 +119,27 @@ Current keys:
 > `auto_index` still runs, and `index_repository` stays available for manual
 > reindexing.
 
-### Index concurrency and the many-project workstation profile
+### Index concurrency and the serial migration profile
 
 `max_index_jobs` limits distinct physical index processes owned by one daemon
-generation. Its product default is `2`, which is also the recommended rollout
-value. A missing value or anything other than an ASCII decimal integer in
-`1..16` falls back to `2`; invalid configuration cannot raise concurrency.
+generation. Its product default is `2`; use `1` for a format migration so
+destructive one-time rebuilds remain serial and observable. A missing value or
+anything other than an ASCII decimal integer in `1..16` falls back to `2`;
+invalid configuration cannot raise concurrency.
 Semantically identical requests still coalesce into one physical job before the
 capacity limit is applied.
 
 `CBM_WORKERS` is separate: it limits parallel workers *inside each physical
-index process*. The many-project workstation profile is:
+index process*. The safe format-migration profile is:
 
 ```text
 watcher_enabled=false
-max_index_jobs=2
+auto_index=false
+max_index_jobs=1
 CBM_WORKERS=4
 ```
 
-This is an opt-in workstation profile, not a change to the compatibility
+This is an opt-in migration profile, not a change to the compatibility
 default: `watcher_enabled` remains `true`. With the watcher disabled, manual
 `index_repository(mode="full")` remains available.
 
@@ -161,47 +163,180 @@ These controls govern scheduling only. They do not select `fast` or `moderate`
 mode, change semantic index version `3`, disable cross-file LSP, or remove stored
 coverage. The canonical full-mode quality contract remains unchanged.
 
+#### One-time database format migration
+
+Database format version `1` (`CBM_INDEX_FORMAT_VERSION=1`) leaves semantic index
+version `3` and compressed artifact format `2` unchanged. Deployment does not
+migrate an index: installing or starting the new binary leaves each project
+database untouched. The first index of a legacy database with SQLite
+`PRAGMA user_version=0` removes that project database, performs one full
+rebuild, and seals the replacement with `user_version=1`.
+
+Use this runbook for an existing cache:
+
+1. Stop the daemon and make a durable backup of the installed binary,
+   configuration database, and complete cache. Keep the backup until all
+   projects have passed post-migration checks.
+2. Inventory registered roots and divide them into existing, missing, and any
+   legacy or duplicate registrations. Do not index a missing root or guess a
+   replacement path.
+3. Set `auto_index=false`, `watcher_enabled=false`, and `max_index_jobs=1`.
+   Start a new daemon generation with `CBM_WORKERS=4` and confirm the effective
+   settings.
+4. Run `index_repository(mode="full")` for one existing root as a canary.
+   Confirm `PRAGMA quick_check(1)`, `user_version=1`, and a representative graph
+   query. Run `check_index_coverage` on representative indexed paths and require
+   its metadata to report `coverage_version=3` and
+   `hash_records_complete=true`; `index_status` does not expose these two gates.
+   The equivalent direct-SQL assertion against the rebuilt project database
+   must return `1`:
+
+   ```sql
+   SELECT COUNT(*) = 1
+   FROM index_coverage_meta
+   WHERE coverage_version = 3 AND hash_records_complete = 1;
+   ```
+
+5. Full-index the other existing roots one at a time, repeating those checks
+   after every project. Stop on the first failure. The format gate may already
+   have unlinked the legacy database, so preserve the remaining logs and stage
+   artifacts and recover the database from the pre-migration snapshot.
+6. Reconcile legacy or duplicate registrations separately. Restore ordinary
+   concurrency or automation only after the serial migration is complete.
+
+Never stamp `PRAGMA user_version=1` with SQLite or another external tool. The
+seal is evidence that CBM completed the full rebuild; changing it independently
+would skip the required migration while making the database appear current.
+After any project has migrated, rollback requires a coherent state rollback:
+disable automation, quiesce all CBM processes, restore the cache and
+configuration snapshot together with the previous binary, verify the restored
+databases, and only then restart the old generation and restore its prior
+automation settings. Replacing only the executable is not a valid rollback.
+
 #### Isolated rollout rehearsal
 
 The following rehearsal uses a disposable cache and does not change the live
 cache, daemon, installed binary, or global launch configuration:
 
 ```bash
-case "$(uname -s)" in
-  Darwin) rollout_parent="/private/tmp" ;;
-  *) rollout_parent="/tmp" ;;
-esac
-rollout_root="$(mktemp -d "$rollout_parent/cbm-index-control.XXXXXX")"
-chmod 700 "$rollout_root"
-rollout_cache="$rollout_root/cache"
-rollout_runtime="$rollout_root/runtime"
-mkdir -m 700 "$rollout_cache" "$rollout_runtime"
+(
+  set -euo pipefail
 
-cleanup_rollout() {
-  CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
-    codebase-memory-mcp daemon stop >/dev/null 2>&1 || true
-  case "$rollout_root" in
-    "$rollout_parent"/cbm-index-control.*) rm -rf -- "$rollout_root" ;;
+  binary="$(command -v codebase-memory-mcp)"
+  case "$(uname -s)" in
+    Darwin) rollout_parent="/private/tmp" ;;
+    *) rollout_parent="${TMPDIR:-/tmp}" ;;
   esac
-}
-trap cleanup_rollout EXIT HUP INT TERM
+  rollout_root=""
+  rollout_cache=""
+  rollout_runtime=""
+  cleanup_done=0
 
-CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
-  codebase-memory-mcp config set max_index_jobs 2
-CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
-  codebase-memory-mcp config set watcher_enabled false
-CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
-  codebase-memory-mcp config get max_index_jobs
-CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
-  codebase-memory-mcp config get watcher_enabled
-CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
-  CBM_WORKERS=4 codebase-memory-mcp daemon start
-CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
-  codebase-memory-mcp daemon status
-CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
-  codebase-memory-mcp daemon stop
-trap - EXIT HUP INT TERM
-cleanup_rollout
+  # Invoked indirectly by the EXIT trap.
+  # shellcheck disable=SC2329
+  cleanup_rollout() {
+    [ "$cleanup_done" -eq 0 ] || return 0
+    cleanup_done=1
+    if [ -n "$rollout_cache" ] && [ -n "$rollout_runtime" ]; then
+      CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+        "$binary" daemon stop >/dev/null 2>&1 || true
+    fi
+    case "$rollout_root" in
+      "$rollout_parent"/cbm-index-control.*) rm -rf -- "$rollout_root" ;;
+      "") ;;
+      *) echo "refusing unsafe cleanup: $rollout_root" >&2 ;;
+    esac
+  }
+  trap cleanup_rollout EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  # A failed mktemp exits before rollout_cache can become "/cache".
+  rollout_root="$(mktemp -d "$rollout_parent/cbm-index-control.XXXXXX")"
+  chmod 700 "$rollout_root"
+  rollout_cache="$rollout_root/cache"
+  rollout_runtime="$rollout_root/runtime"
+  fixture_repo="$rollout_root/repo"
+  mkdir -m 700 "$rollout_cache" "$rollout_runtime" "$fixture_repo"
+
+  i=0
+  while [ "$i" -lt 64 ]; do
+    printf 'int worker_%s(void) { return %s; }\n' "$i" "$i" \
+      >"$fixture_repo/worker_$i.c"
+    i=$((i + 1))
+  done
+  git -C "$fixture_repo" init -q
+  git -C "$fixture_repo" -c user.email=rehearsal.invalid \
+    -c user.name=rehearsal add -A
+  git -C "$fixture_repo" -c user.email=rehearsal.invalid \
+    -c user.name=rehearsal commit -q -m fixture
+
+  CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+    "$binary" config set max_index_jobs 1
+  CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+    "$binary" config set auto_index false
+  CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+    "$binary" config set watcher_enabled false
+  [ "$(CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+    "$binary" config get max_index_jobs)" = "1" ]
+  [ "$(CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+    "$binary" config get auto_index)" = "false" ]
+  [ "$(CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+    "$binary" config get watcher_enabled)" = "false" ]
+
+  CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+    CBM_PROFILE=1 CBM_WORKERS=4 "$binary" daemon start
+  response="$rollout_root/index-response.jsonl"
+  (
+    cd "$fixture_repo"
+    printf '%s\n' \
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"rollout-rehearsal","version":"1"}}}' \
+      '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    printf '%s%s%s\n' \
+      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"index_repository","arguments":{"repo_path":"' \
+      "$fixture_repo" '","mode":"full"}}}'
+  ) | CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+    CBM_PROFILE=1 CBM_WORKERS=4 "$binary" >"$response"
+  index_response="$(grep -m 1 '"id":2' "$response")"
+  case "$index_response" in
+    *'"error"'*) echo "fixture full index failed" >&2; exit 1 ;;
+    *nodes*) ;;
+    *) echo "fixture full index returned no nodes" >&2; exit 1 ;;
+  esac
+
+  CBM_CACHE_DIR="$rollout_cache" CBM_RUNTIME_DIR="$rollout_runtime" \
+    "$binary" daemon stop
+  daemon_log="$rollout_cache/logs/cbm-daemon.log"
+  attempts=300
+  while [ "$attempts" -gt 0 ]; do
+    if [ -f "$daemon_log" ] && grep -qE 'msg=daemon\.stop( |$)' "$daemon_log"; then
+      break
+    fi
+    attempts=$((attempts - 1))
+    sleep 0.1
+  done
+  if [ "$attempts" -eq 0 ]; then
+    echo "timed out waiting for the isolated daemon lifecycle to close" >&2
+    exit 1
+  fi
+  grep 'msg=daemon\.start' "$daemon_log" | grep -q 'physical_job_limit=1'
+  grep 'msg=watcher\.disabled' "$daemon_log" | grep -q 'reason=config'
+  if grep -q 'msg=watcher\.start' "$daemon_log"; then
+    echo "watcher started despite watcher_enabled=false" >&2
+    exit 1
+  fi
+  worker_log=""
+  for candidate in "$rollout_cache"/logs/.worker-log-*; do
+    [ -f "$candidate" ] || continue
+    worker_log="$candidate"
+    break
+  done
+  [ -n "$worker_log" ]
+  grep 'msg=pipeline\.mode' "$worker_log" \
+    | grep 'mode=parallel' | grep -q 'workers=4'
+  printf '%s\n' 'PASS: persisted settings and effective rollout profile'
+)
 ```
 
 Running equivalent commands against the real cache or global launch
