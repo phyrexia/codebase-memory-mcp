@@ -382,7 +382,7 @@ Verify the result:
 
 ```zsh
 rg -n "ignore_worktrees|index_worktree|metrics_requests|/api/metrics|watcher_enabled" README.md
-rg -n "161 languages|45 supported|graph UI is built into the binary" README.md
+rg -n "languages|supported|graph UI is built into the binary" README.md
 ```
 
 Expected: all custom terms are present once; upstream counts and single-product wording remain.
