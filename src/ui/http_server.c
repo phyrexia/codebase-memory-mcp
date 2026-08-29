@@ -732,7 +732,8 @@ static bool browse_add_roots(yyjson_mut_doc *doc, yyjson_mut_val *root) {
         if (!(drives & (1u << i)))
             continue;
         char drive[4] = {(char)('A' + i), ':', '/', '\0'};
-        if (!cbm_is_dir(drive))
+        cbm_path_info_t info;
+        if (cbm_path_info_utf8(drive, &info) != 0 || !info.is_directory || info.is_symlink)
             continue;
         if (!yyjson_mut_arr_add_strcpy(doc, roots, drive))
             return false;
@@ -754,7 +755,9 @@ static void handle_browse(cbm_http_server_t *srv, cbm_http_conn_t *c,
     }
     cbm_normalize_path_sep(path);
 
-    if (!cbm_is_dir(path)) {
+    cbm_path_info_t requested;
+    if (cbm_path_info_utf8(path, &requested) != 0 ||
+        !requested.is_directory || requested.is_symlink) {
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"not a directory\"}");
         return;
     }
@@ -786,9 +789,12 @@ static void handle_browse(cbm_http_server_t *srv, cbm_http_conn_t *c,
             break;
         }
         int64_t now_ms = srv->browse_now_ms(srv->browse_clock_context);
-        if (now_ms >= started_ms && now_ms - started_ms >= BROWSE_BUDGET_MS) {
-            truncated = true;
-            break;
+        if (now_ms >= started_ms) {
+            uint64_t elapsed_ms = (uint64_t)now_ms - (uint64_t)started_ms;
+            if (elapsed_ms >= (uint64_t)BROWSE_BUDGET_MS) {
+                truncated = true;
+                break;
+            }
         }
 
         cbm_dirent_t *entry = cbm_readdir(dir);
@@ -804,7 +810,9 @@ static void handle_browse(cbm_http_server_t *srv, cbm_http_conn_t *c,
             truncated = true;
             continue;
         }
-        if (!cbm_is_dir(full))
+        cbm_path_info_t info;
+        if (cbm_path_info_utf8(full, &info) != 0 ||
+            !info.is_directory || info.is_symlink)
             continue;
         encoded = yyjson_mut_arr_add_strcpy(doc, dirs, entry->name);
         if (encoded)

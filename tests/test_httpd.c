@@ -2502,6 +2502,111 @@ TEST(ui_server_index_status_long_paths_no_overflow) {
 
 /* ── Suite ────────────────────────────────────────────────────── */
 
+static bool th_make_directory_alias(const char *target, const char *alias) {
+#ifdef _WIN32
+    char target_native[1024];
+    char alias_native[1024];
+    snprintf(target_native, sizeof(target_native), "%s", target);
+    snprintf(alias_native, sizeof(alias_native), "%s", alias);
+    for (char *p = target_native; *p; p++)
+        if (*p == '/')
+            *p = '\\';
+    for (char *p = alias_native; *p; p++)
+        if (*p == '/')
+            *p = '\\';
+    const char *argv[] = {"cmd.exe", "/d", "/c", "mklink", "/J",
+                          alias_native, target_native, NULL};
+    return cbm_exec_no_shell(argv) == 0;
+#else
+    return symlink(target, alias) == 0;
+#endif
+}
+
+static void th_remove_directory_alias(const char *alias) {
+#ifdef _WIN32
+    (void)cbm_rmdir(alias);
+#else
+    (void)cbm_unlink(alias);
+#endif
+}
+
+TEST(ui_server_browse_omits_symlink_or_reparse_directory) {
+    char *dir = th_mktempdir("cbm_browse_alias_child");
+    ASSERT_NOT_NULL(dir);
+    char real[512];
+    char alias[512];
+    snprintf(real, sizeof(real), "%s/real", dir);
+    snprintf(alias, sizeof(alias), "%s/alias", dir);
+    ASSERT_EQ(th_mkdir_p(real), 0);
+    if (!th_make_directory_alias(real, alias)) {
+        ASSERT_EQ(th_rmtree(dir), 0);
+        SKIP_PLATFORM("directory alias fixture unavailable");
+    }
+
+    int64_t times[] = {0};
+    th_browse_clock_t clock = {.values = times, .count = 1};
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_browse_clock(&ts, th_browse_clock_now, &clock), 0);
+    char request[1024];
+    char response[65536];
+    snprintf(request, sizeof(request), "GET /api/browse?path=%s HTTP/1.1\r\n\r\n", dir);
+    ASSERT_GT(th_http(cbm_http_server_port(ts.srv), request, response, sizeof(response)), 0);
+    yyjson_doc *doc = th_http_json(response);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *dirs = yyjson_obj_get(yyjson_doc_get_root(doc), "dirs");
+    ASSERT_TRUE(yyjson_is_arr(dirs));
+    bool saw_real = false;
+    bool saw_alias = false;
+    size_t idx, max;
+    yyjson_val *value;
+    yyjson_arr_foreach(dirs, idx, max, value) {
+        const char *name = yyjson_get_str(value);
+        saw_real = saw_real || (name && strcmp(name, "real") == 0);
+        saw_alias = saw_alias || (name && strcmp(name, "alias") == 0);
+    }
+    ASSERT_TRUE(saw_real);
+    ASSERT_FALSE(saw_alias);
+    yyjson_doc_free(doc);
+
+    th_server_stop(&ts);
+    th_remove_directory_alias(alias);
+    ASSERT_EQ(th_rmtree(dir), 0);
+    PASS();
+}
+
+TEST(ui_server_browse_rejects_final_symlink_or_reparse_directory) {
+    char *dir = th_mktempdir("cbm_browse_alias_final");
+    ASSERT_NOT_NULL(dir);
+    char real[512];
+    char alias[512];
+    snprintf(real, sizeof(real), "%s/real", dir);
+    snprintf(alias, sizeof(alias), "%s/alias", dir);
+    ASSERT_EQ(th_mkdir_p(real), 0);
+    if (!th_make_directory_alias(real, alias)) {
+        ASSERT_EQ(th_rmtree(dir), 0);
+        SKIP_PLATFORM("directory alias fixture unavailable");
+    }
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char request[1024];
+    char response[65536];
+    snprintf(request, sizeof(request), "GET /api/browse?path=%s HTTP/1.1\r\n\r\n", alias);
+    ASSERT_GT(th_http(cbm_http_server_port(ts.srv), request, response, sizeof(response)), 0);
+    ASSERT_EQ(th_status(response), 400);
+    yyjson_doc *doc = th_http_json(response);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *error = yyjson_obj_get(yyjson_doc_get_root(doc), "error");
+    ASSERT_TRUE(yyjson_is_str(error));
+    ASSERT_STR_EQ(yyjson_get_str(error), "not a directory");
+    yyjson_doc_free(doc);
+
+    th_server_stop(&ts);
+    th_remove_directory_alias(alias);
+    ASSERT_EQ(th_rmtree(dir), 0);
+    PASS();
+}
+
 TEST(ui_server_browse_complete_listing_is_valid_json) {
     char *dir = th_mktempdir("cbm_browse_complete");
     ASSERT_NOT_NULL(dir);
@@ -2611,11 +2716,38 @@ TEST(ui_server_browse_time_budget_is_100ms_and_valid_json) {
     PASS();
 }
 
+TEST(ui_server_browse_extreme_clock_delta_is_ub_safe) {
+    char *dir = th_mktempdir("cbm_browse_clock_extreme");
+    ASSERT_NOT_NULL(dir);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(dir, "would-be-listed")), 0);
+    int64_t times[] = {INT64_MIN, INT64_MAX};
+    th_browse_clock_t clock = {.values = times, .count = 2};
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_browse_clock(&ts, th_browse_clock_now, &clock), 0);
+
+    char request[1024];
+    char response[65536];
+    snprintf(request, sizeof(request), "GET /api/browse?path=%s HTTP/1.1\r\n\r\n", dir);
+    ASSERT_GT(th_http(cbm_http_server_port(ts.srv), request, response, sizeof(response)), 0);
+    yyjson_doc *doc = th_http_json(response);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_TRUE(th_json_truncated(doc));
+    ASSERT_EQ((int)th_json_dirs_count(doc), 0);
+    yyjson_doc_free(doc);
+
+    th_server_stop(&ts);
+    ASSERT_EQ(th_rmtree(dir), 0);
+    PASS();
+}
+
 SUITE(httpd) {
+    RUN_TEST(ui_server_browse_omits_symlink_or_reparse_directory);
+    RUN_TEST(ui_server_browse_rejects_final_symlink_or_reparse_directory);
     RUN_TEST(ui_server_browse_complete_listing_is_valid_json);
     RUN_TEST(ui_server_browse_result_cap_is_200_and_valid_json);
     RUN_TEST(ui_server_browse_scan_cap_is_4096_and_valid_json);
     RUN_TEST(ui_server_browse_time_budget_is_100ms_and_valid_json);
+    RUN_TEST(ui_server_browse_extreme_clock_delta_is_ub_safe);
     RUN_TEST(ui_server_browse_wide_dir_no_overflow);
     RUN_TEST(ui_server_logs_escape_dense_no_overflow);
     RUN_TEST(ui_server_index_status_long_paths_no_overflow);

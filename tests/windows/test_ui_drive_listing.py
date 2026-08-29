@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -140,6 +141,9 @@ def main():
             print("PRECONDITION: response has no 'roots' field; build predates "
                   "#548 or endpoint non-functional.")
             return 2
+        if not isinstance(ctrl.get("truncated"), bool):
+            print("RED: control browse response has missing/non-boolean truncated: %s" % ctrl)
+            return 1
 
         # Invariant 1: every fixed drive is advertised in roots.
         adv = {norm(r) for r in roots}
@@ -157,6 +161,11 @@ def main():
             drive_root = norm(d) + "/"   # "D:/"
             try:
                 resp = browse(port, drive_root)
+                if not isinstance(resp.get("truncated"), bool):
+                    print("  browse(%r) has missing/non-boolean truncated: %s" %
+                          (drive_root, resp))
+                    unreachable.append(d)
+                    continue
                 if resp.get("roots") is None and "dirs" not in resp:
                     unreachable.append(d)
             except Exception as ex:
@@ -166,6 +175,42 @@ def main():
             print("\nRED: drives advertised in roots but not browsable: %s" %
                   unreachable)
             return 1
+
+        fixture = os.path.join(work, "reparse-fixture")
+        real = os.path.join(fixture, "real")
+        alias = os.path.join(fixture, "alias")
+        os.makedirs(real)
+        made = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", alias, real],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        if made.returncode != 0:
+            print("PRECONDITION: could not create junction: %s" % made.stdout)
+            return 2
+        try:
+            listing = browse(port, fixture.replace("\\", "/"))
+            if not isinstance(listing.get("truncated"), bool):
+                print("RED: junction fixture browse has missing/non-boolean truncated: %s" %
+                      listing)
+                return 1
+            if "real" not in listing.get("dirs", []) or "alias" in listing.get("dirs", []):
+                print("RED: browse advertised a junction/reparse directory: %s" % listing)
+                return 1
+            try:
+                browse(port, alias.replace("\\", "/"))
+            except urllib.error.HTTPError as ex:
+                if ex.code != 400:
+                    print("RED: direct junction browse returned HTTP %d, expected 400" % ex.code)
+                    return 1
+            else:
+                print("RED: direct junction browse succeeded; reparse point was followed")
+                return 1
+        finally:
+            if os.path.isdir(alias):
+                os.rmdir(alias)
 
         print("\nGREEN: all %d fixed drive(s) advertised in roots and reachable "
               "from the UI picker." % len(drives))
