@@ -1703,10 +1703,17 @@ TEST(daemon_frontend_portable_condition_broadcasts_and_times_out) {
 
     bool first_joined = first_started && cbm_thread_join(&first) == 0;
     bool second_joined = second_started && cbm_thread_join(&second) == 0;
-    cbm_condition_wait_result_t timeout = CBM_CONDITION_ERROR;
+    cbm_condition_wait_result_t timeout = CBM_CONDITION_SIGNALED;
     if (initialized) {
+        uint64_t timeout_deadline = cbm_now_ms() + 20U;
+        uint64_t timeout_guard_deadline = timeout_deadline + 200U;
         cbm_mutex_lock(&fixture.mutex);
-        timeout = cbm_condition_timed_wait(&fixture.condition, &fixture.mutex, 20);
+        while (timeout == CBM_CONDITION_SIGNALED && cbm_now_ms() < timeout_guard_deadline) {
+            uint64_t now_ms = cbm_now_ms();
+            uint32_t remaining_ms =
+                now_ms < timeout_deadline ? (uint32_t)(timeout_deadline - now_ms) : 0U;
+            timeout = cbm_condition_timed_wait(&fixture.condition, &fixture.mutex, remaining_ms);
+        }
         cbm_mutex_unlock(&fixture.mutex);
     }
     unsigned int released = fixture.released;
