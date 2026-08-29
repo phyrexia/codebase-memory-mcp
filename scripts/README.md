@@ -6,7 +6,7 @@ dry run and the release all call the SAME files below — venues differ only in
 host specs, architecture and inputs, never in what a leg does. Platform
 differences (arm64 sanitizer flags, native Windows behavior, the Linux portable
 binary) live INSIDE these scripts, once, never per-venue.
-`tests/test_venue_parity_contract.sh` (run as Step 0j of every test leg) turns
+`tests/test_venue_parity_contract.sh` (run as Step 0k of every test leg) turns
 any violation — inline harness logic in a workflow, a bypassed wrapper, a
 missing `--help` — into a red build.
 

@@ -11,7 +11,7 @@
 # makes the drift itself the failure: every `run:` step in every VENUE workflow
 # is walked line by line, and each line must classify as provisioning, artifact
 # plumbing, or a call to a canonical leg entry — an unclassifiable line is a
-# red build naming the file, line and remedy. It runs as Step 0j of
+# red build naming the file, line and remedy. It runs as Step 0k of
 # scripts/test.sh, i.e. inside every venue it polices.
 #
 # Layers:

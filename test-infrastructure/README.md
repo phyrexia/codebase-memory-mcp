@@ -4,7 +4,7 @@ The local half of the 3-OS CI ladder. **Every leg here runs the SAME canonical
 scripts CI runs** (`scripts/test.sh`, `build.sh`, `smoke-local.sh`,
 `soak-legs.sh`, `vm-smoke.sh` — see `scripts/README.md`); this directory only
 provisions containers and the Windows VM. The venue-parity contract
-(`tests/test_venue_parity_contract.sh`, Step 0j of every test leg) fails the
+(`tests/test_venue_parity_contract.sh`, Step 0k of every test leg) fails the
 build if a venue grows its own harness logic — here or in the workflows.
 
 ## Entry points

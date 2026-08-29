@@ -14,7 +14,7 @@ Usage: scripts/test.sh [--suites LIST] [--arch ARCH] [VAR=VAL ...]
 
 The canonical test entry: identical in local CI, PR CI, dry run and release.
 DEFAULT (no --suites) is exactly what CI runs: static contract checks
-(Step 0a-0t), a CLEAN sanitizer build, every suite via the parallel harness,
+(Step 0a-0x), a CLEAN sanitizer build, every suite via the parallel harness,
 then the prod-binary regression guards (Steps 4-6).
 
 Modes:
@@ -218,55 +218,58 @@ bash "$ROOT/tests/test_windows_bundle_contract.sh"
 echo "=== Step 0f: tree-sitter runtime Makefile dependencies ==="
 bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 
-echo "=== Step 0g: security fuzz harness self-test ==="
+echo "=== Step 0g: Makefile analyzer tool preflight contract ==="
+bash "$ROOT/tests/test_makefile_tool_preflight_contract.sh"
+
+echo "=== Step 0h: security fuzz harness self-test ==="
 bash "$ROOT/tests/test_security_fuzz_harness.sh"
 
-echo "=== Step 0h: smoke release-fixture contract ==="
+echo "=== Step 0i: smoke release-fixture contract ==="
 bash "$ROOT/tests/test_smoke_fixture_contract.sh"
 
-echo "=== Step 0i: parallel suite scheduler contract ==="
+echo "=== Step 0j: parallel suite scheduler contract ==="
 bash "$ROOT/tests/test_parallel_harness_contract.sh"
 
-echo "=== Step 0j: venue parity contract (one harness, every venue) ==="
+echo "=== Step 0k: venue parity contract (one harness, every venue) ==="
 bash "$ROOT/tests/test_venue_parity_contract.sh"
 
-echo "=== Step 0k: spawn console-window contract (#1427) ==="
+echo "=== Step 0l: spawn console-window contract (#1427) ==="
 bash "$ROOT/tests/test_spawn_no_window_contract.sh"
 
-echo "=== Step 0l: release archive extractor contract ==="
+echo "=== Step 0m: release archive extractor contract ==="
 bash "$ROOT/tests/test_release_archive_extractor_contract.sh"
 
-echo "=== Step 0m: VirusTotal release-notes + evidence contract ==="
+echo "=== Step 0n: VirusTotal release-notes + evidence contract ==="
 bash "$ROOT/tests/test_vt_release_notes_contract.sh"
 
-echo "=== Step 0n: VirusTotal gate policy contract ==="
+echo "=== Step 0o: VirusTotal gate policy contract ==="
 bash "$ROOT/tests/test_vt_gate_policy_contract.sh"
 
-echo "=== Step 0o: MCPB bundle contract (#1246) ==="
+echo "=== Step 0p: MCPB bundle contract (#1246) ==="
 bash "$ROOT/tests/test_mcpb_bundle_contract.sh"
 
-echo "=== Step 0p: MCPB registry entries contract (#1246) ==="
+echo "=== Step 0q: MCPB registry entries contract (#1246) ==="
 bash "$ROOT/tests/test_mcpb_registry_entries_contract.sh"
 
-echo "=== Step 0q: release candidate derivation contract ==="
+echo "=== Step 0r: release candidate derivation contract ==="
 bash "$ROOT/tests/test_release_candidate_derivation_contract.sh"
 
-echo "=== Step 0r: VirusTotal candidate-selection contract ==="
+echo "=== Step 0s: VirusTotal candidate-selection contract ==="
 bash "$ROOT/tests/test_vt_candidate_selection_contract.sh"
 
-echo "=== Step 0s: release gate-chain ordering contract ==="
+echo "=== Step 0t: release gate-chain ordering contract ==="
 bash "$ROOT/tests/test_release_gate_chain_contract.sh"
 
-echo "=== Step 0t: test runtime isolation contract (#1691) ==="
+echo "=== Step 0u: test runtime isolation contract (#1691) ==="
 bash "$ROOT/tests/test_runtime_isolation_contract.sh"
 
-echo "=== Step 0u: shell line-ending contract ==="
+echo "=== Step 0v: shell line-ending contract ==="
 bash "$ROOT/tests/test_shell_line_endings.sh"
 
-echo "=== Step 0v: nomic blob generator contract ==="
+echo "=== Step 0w: nomic blob generator contract ==="
 bash "$ROOT/tests/test_nomic_blob_generator_contract.sh"
 
-echo "=== Step 0w: published language-count contract ==="
+echo "=== Step 0x: published language-count contract ==="
 bash "$ROOT/tests/test_language_count_contract.sh"
 
 # Verify compiler supports target arch

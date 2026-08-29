@@ -1213,7 +1213,13 @@ diag:
 LSAN_LLVM_BIN ?= $(shell brew --prefix llvm 2>/dev/null)/bin
 LSAN_SUITES ?=
 test-lsan:
-	@echo "=== macOS leak lane: $(shell $(LSAN_LLVM_BIN)/clang --version | head -1) ==="
+	@for compiler in "$(LSAN_LLVM_BIN)/clang" "$(LSAN_LLVM_BIN)/clang++"; do \
+		if [ ! -x "$$compiler" ]; then \
+			echo "ERROR: test-lsan requires executable $$compiler" >&2; \
+			exit 1; \
+		fi; \
+	done
+	@echo "=== macOS leak lane: $$("$(LSAN_LLVM_BIN)/clang" --version | head -1) ==="
 	$(MAKE) -f Makefile.cbm build/lsan/test-runner \
 		CC=$(LSAN_LLVM_BIN)/clang CXX=$(LSAN_LLVM_BIN)/clang++ BUILD_DIR=build/lsan
 	cd $(CURDIR) && ASAN_OPTIONS="detect_leaks=1:halt_on_error=1" \
@@ -1242,9 +1248,22 @@ lint-mem:
 # NOLINT is never honoured here.
 lint-mem-ci:
 	@echo "=== clang-analyzer memory gate ==="
-	@printf '%s\n' $(LINT_SRCS) | xargs -P 4 -I{} $(CLANG_TIDY) --quiet \
-		--checks='$(LINT_MEM_CHECKS)' {} -- $(CFLAGS_COMMON) $(SYSROOT_FLAG) 2>/dev/null \
-		| python3 scripts/lint-mem-gate.py
+	@tool='$(CLANG_TIDY)'; \
+	if [ ! -x "$$tool" ] && ! command -v "$$tool" >/dev/null 2>&1; then \
+		echo "ERROR: clang-tidy executable not found or not executable: $$tool" >&2; \
+		exit 1; \
+	fi
+	@output=$$(mktemp "$${TMPDIR:-/tmp}/cbm-lint-mem.XXXXXX") || exit 1; \
+	trap 'rm -f "$$output"' 0 1 2 3 15; \
+	printf '%s\n' $(LINT_SRCS) | xargs -P 4 -I{} $(CLANG_TIDY) --quiet \
+		--checks='$(LINT_MEM_CHECKS)' {} -- $(CFLAGS_COMMON) $(SYSROOT_FLAG) \
+		>"$$output" 2>/dev/null; \
+	analyzer_status=$$?; \
+	if [ "$$analyzer_status" -ne 0 ]; then \
+		echo "ERROR: clang-tidy execution failed (xargs exit $$analyzer_status); memory gate did not run" >&2; \
+		exit "$$analyzer_status"; \
+	fi; \
+	python3 scripts/lint-mem-gate.py <"$$output"
 
 # ── Security audit (6 layers) ────────────────────────────────────
 
