@@ -609,6 +609,7 @@ static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint
         cbm_log_error("daemon.runtime_config_open_failed", "reason", "config_db_unavailable");
         return false;
     }
+    size_t max_index_jobs = cbm_config_max_index_jobs(host->runtime_config);
     host->project_locks = cbm_project_lock_manager_new(endpoint);
     /* #335: watcher_enabled (default true) is the master switch for the
      * background watcher. When false the daemon never builds the watcher or the
@@ -628,6 +629,7 @@ static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint
     cbm_daemon_application_config_t application_config = {
         .watcher = host->watcher,
         .config = host->runtime_config,
+        .physical_job_limit = max_index_jobs,
         .aggregate_memory_budget_bytes = aggregate_memory_budget_bytes,
         .project_locks = host->project_locks,
         .ui_readiness_secret = host->ui_readiness_secret,

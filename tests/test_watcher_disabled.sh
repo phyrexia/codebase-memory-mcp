@@ -65,6 +65,10 @@ cat >"${repo}/sample.c" <<'EOF'
 int add(int a, int b) { return a + b; }
 int main(void) { return add(1, 2); }
 EOF
+for i in $(seq 0 63); do
+  printf 'int worker_%s(void) { return %s; }\n' "${i}" "${i}" >"${repo}/worker_${i}.c"
+done
+export CBM_WORKERS=4
 git -C "${repo}" init -q
 git -C "${repo}" -c user.email=t@example.com -c user.name=t add -A
 git -C "${repo}" -c user.email=t@example.com -c user.name=t commit -q -m init
@@ -185,17 +189,52 @@ run_session() {
 }
 
 # =============================================================================
+# Run 0 — CONFIGURED physical limit snapshot + restart semantics.
+#   Proves: each daemon generation reads the persisted limit once at startup;
+#   a changed value is observed by the next explicitly started generation.
+# =============================================================================
+CURRENT_RUN="run 0: configured physical limit snapshot"
+c_limit="${work}/cache-limit"
+CBM_CACHE_DIR="${c_limit}" "${BINARY}" config set watcher_enabled false >/dev/null
+CBM_CACHE_DIR="${c_limit}" "${BINARY}" config set max_index_jobs 7 >/dev/null
+run_session "${c_limit}" "${work}/limit.out"
+grep 'msg=daemon\.start' "${DAEMON_LOG}" | grep -q 'physical_job_limit=7' \
+  || fail "daemon did not capture configured max_index_jobs=7"
+
+CBM_CACHE_DIR="${c_limit}" "${BINARY}" config set max_index_jobs 16 >/dev/null
+run_session "${c_limit}" "${work}/limit-restarted.out" \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_projects","arguments":{"limit":1}}}'
+grep 'msg=daemon\.start' "${DAEMON_LOG}" | grep -q 'physical_job_limit=16' \
+  || fail "next daemon generation did not capture max_index_jobs=16"
+echo "ok: configured max_index_jobs snapshot advances only on daemon restart"
+
+# =============================================================================
 # Run 1 — DISABLED + manual index_repository (auto_index off, no contention).
-#   Proves: gate fires, watcher never starts, and the manual MCP tool still
-#   serves + indexes with the watcher off.
+#   Proves: the workstation rollout profile keeps the watcher disabled, uses
+#   two physical jobs and four workers per full-index job, while the manual MCP
+#   tool still serves + indexes with the watcher off.
 # =============================================================================
 CURRENT_RUN="run 1: disabled + manual index_repository"
 c_offm="${work}/cache-offm"
 CBM_CACHE_DIR="${c_offm}" "${BINARY}" config set watcher_enabled false >/dev/null
 CBM_CACHE_DIR="${c_offm}" "${BINARY}" config set auto_index false >/dev/null
-run_session "${c_offm}" "${work}/offm.out" \
-  "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"index_repository\",\"arguments\":{\"repo_path\":\"${repo}\",\"mode\":\"fast\"}}}"
+CBM_CACHE_DIR="${c_offm}" "${BINARY}" config set max_index_jobs 2 >/dev/null
+CBM_PROFILE=1 run_session "${c_offm}" "${work}/offm.out" \
+  "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"index_repository\",\"arguments\":{\"repo_path\":\"${repo}\",\"mode\":\"full\"}}}"
 
+grep 'msg=daemon\.start' "${DAEMON_LOG}" | grep -q 'physical_job_limit=2' \
+  || fail "rollout profile did not use max_index_jobs=2"
+log_has "${DAEMON_LOG}" 'msg=index\.supervisor\.profile_log .*log=' \
+  || fail "profiled index worker did not expose its retained log"
+WORKER_LOG=""
+for candidate in "${c_offm}"/logs/.worker-log-*; do
+  [[ -f "${candidate}" ]] || continue
+  WORKER_LOG="${candidate}"
+  break
+done
+[[ -n "${WORKER_LOG}" ]] || fail "profiled index worker log was not retained"
+grep 'msg=pipeline\.mode' "${WORKER_LOG}" | grep 'mode=parallel' | grep -q 'workers=4' \
+  || fail "CBM_WORKERS=4 did not drive the parallel full-index fixture"
 log_has "${DAEMON_LOG}" 'msg=watcher\.disabled( |$)' \
   || fail "watcher.disabled not emitted when disabled"
 log_has "${DAEMON_LOG}" 'msg=watcher\.disabled .*reason=config' \
