@@ -4,7 +4,7 @@
 
 **Goal:** Merge the pinned upstream history and pinned idle-frontend fix into the exact installed custom history while preserving request metrics, indexed-root UI behavior, worktree policy, and checkout freshness.
 
-**Architecture:** Build the integration as two reviewed merge commits on an isolated branch rooted at `81b02389598d6215e82939f29b5b2a6917f96910`. Add the missing preservation assertions first, rehearse an upstream-only conflict resolution to observe a RED failure, then resolve the seven approved conflicts by taking upstream as the structural base and reapplying only the additive custom contracts. Merge `7710f86e927c5221c395ecbdab9d0f3b75edcb71` separately and require its staged surface to remain exactly three files.
+**Architecture:** Build the integration as two reviewed merge commits on an isolated branch rooted at `81b02389598d6215e82939f29b5b2a6917f96910`. Add the missing preservation assertions first, rehearse an upstream-only conflict resolution to observe a RED failure, then resolve the six observed conflicts by taking upstream as the structural base and reapplying only the additive custom contracts. Merge `7710f86e927c5221c395ecbdab9d0f3b75edcb71` separately and require its staged surface to remain exactly three files.
 
 **Tech Stack:** Git merge commits, C11, SQLite, yyjson, the repository C test runner (`scripts/test.sh`), Vitest, TypeScript, and Vite.
 
@@ -33,7 +33,7 @@
 - Modify `tests/test_mcp.c`: make the existing issue-704 `list_projects` fixture assert that both default and paginated lean results retain `indexed_at` while omitting expensive details.
 - Modify `tests/test_httpd.c`: make the UI RPC allowlist test exercise `get_graph_schema`, and make `/api/indexed-roots` require one `indexed_at` value for each returned primary project.
 
-### Seven approved conflict paths
+### Six observed conflict paths
 
 - `README.md`: retain current upstream product counts, packaging, client surfaces, and release/security text; add only custom request-metrics and `ignore_worktrees` documentation that upstream lacks.
 - `docs/CONFIGURATION.md`: retain upstream runtime-dir and `watcher_enabled` documentation; add only the custom metrics storage description and `ignore_worktrees` key/behavior.
@@ -41,7 +41,10 @@
 - `src/cli/cli.h`: retain upstream declarations; add `cbm_metrics_entry_t`, `cbm_config_metrics_flush`, `cbm_config_metrics_prune`, and `CBM_CONFIG_IGNORE_WORKTREES`.
 - `src/main.c`: take upstream's file. Upstream moved `CBM_RUNTIME_DIR` handling into `cbm_daemon_bootstrap_endpoint_new`, so the old call-site implementation must not be restored.
 - `tests/test_cli.c`: retain the complete upstream suite and re-add only `cli_config_metrics_flush_and_prune`; keep exactly one upstream `cli_config_watcher_enabled_default_and_persist` definition and registration.
-- `tests/test_mcp.c`: hand-merge. Preserve upstream pagination tests plus all custom freshness/worktree tests and the new `indexed_at` assertions; never resolve this whole file with `--theirs`.
+
+Automatically merged preservation path:
+
+- `tests/test_mcp.c`: audit after the merge. Preserve upstream pagination tests plus all custom freshness/worktree tests and the new `indexed_at` assertions; never replace the automatically merged file wholesale.
 
 ### Interfaces that must remain available after resolution
 
@@ -166,7 +169,7 @@ Review boundary: a read-only reviewer checks the command transcript and confirms
 
 - [ ] **Step 1: Extend the MCP characterization at the exact pagination fixture**
 
-In `tests/test_mcp.c`, add these assertions to the existing issue-704 test. Put the first assertion beside the default-list name assertions and the second beside the paginated lean assertions so the later upstream merge has an intentional conflict in this file:
+In `tests/test_mcp.c`, add these assertions to the existing issue-704 test. Put the first assertion beside the default-list name assertions and the second beside the paginated lean assertions so the automatically merged result can be audited against both custom and upstream contracts:
 
 ```c
     ASSERT_NOT_NULL(strstr(list, "\\\"indexed_at\\\":"));
@@ -259,7 +262,7 @@ Review boundary: an independent reviewer confirms that each assertion fails if i
 
 **Files:**
 
-- Diagnostic resolution only: the seven approved conflict paths
+- Diagnostic resolution only: the six observed conflict paths
 - No retained file changes; this task ends with `git merge --abort`
 
 **Interfaces:**
@@ -273,9 +276,9 @@ Review boundary: an independent reviewer confirms that each assertion fails if i
 git merge --no-ff --no-commit 31b611a30e01aa8f306f9fcba32492cad0702f99
 ```
 
-Expected: exit non-zero because of content conflicts; Git reports no conflict outside the approved seven paths.
+Expected: exit non-zero because of content conflicts; Git reports no conflict outside the observed six paths.
 
-- [ ] **Step 2: Verify the conflict set is exactly seven**
+- [ ] **Step 2: Verify the conflict set is exactly six**
 
 ```zsh
 expected_conflicts='README.md
@@ -283,21 +286,20 @@ docs/CONFIGURATION.md
 src/cli/cli.c
 src/cli/cli.h
 src/main.c
-tests/test_cli.c
-tests/test_mcp.c'
+tests/test_cli.c'
 actual_conflicts="$(git diff --name-only --diff-filter=U | LC_ALL=C sort)"
 test "$actual_conflicts" = "$(printf '%s\n' "$expected_conflicts" | LC_ALL=C sort)"
 ```
 
-Expected: the assertion succeeds. `tests/test_mcp.c` is the seventh conflict created by the new assertion in the upstream-modified pagination fixture. Any extra or missing path is a stop condition: abort the merge and return to design/audit.
+Expected: the assertion succeeds. `tests/test_mcp.c` merges automatically and is audited separately in Task 4. Any extra or missing conflict path is a stop condition: abort the merge and return to design/audit.
 
-- [ ] **Step 3: Resolve all seven to upstream only for the RED rehearsal**
+- [ ] **Step 3: Resolve all six conflicts to upstream only for the RED rehearsal**
 
 ```zsh
 git checkout --theirs -- README.md docs/CONFIGURATION.md \
-  src/cli/cli.c src/cli/cli.h src/main.c tests/test_cli.c tests/test_mcp.c
+  src/cli/cli.c src/cli/cli.h src/main.c tests/test_cli.c
 git add README.md docs/CONFIGURATION.md \
-  src/cli/cli.c src/cli/cli.h src/main.c tests/test_cli.c tests/test_mcp.c
+  src/cli/cli.c src/cli/cli.h src/main.c tests/test_cli.c
 test -z "$(git diff --name-only --diff-filter=U)"
 ```
 
@@ -327,7 +329,7 @@ Review boundary: preserve the failing command and relevant compiler diagnostics 
 
 ---
 
-### Task 4: Merge Pinned Upstream and Resolve the Seven Conflicts
+### Task 4: Merge Pinned Upstream and Resolve the Six Conflicts
 
 **Files:**
 
@@ -337,7 +339,7 @@ Review boundary: preserve the failing command and relevant compiler diagnostics 
 - Resolve: `src/cli/cli.h`
 - Resolve: `src/main.c`
 - Resolve: `tests/test_cli.c`
-- Resolve: `tests/test_mcp.c`
+- Review only: automatically merged `tests/test_mcp.c`
 - Review only: all automatically merged files
 
 **Interfaces:**
@@ -354,13 +356,12 @@ docs/CONFIGURATION.md
 src/cli/cli.c
 src/cli/cli.h
 src/main.c
-tests/test_cli.c
-tests/test_mcp.c'
+tests/test_cli.c'
 actual_conflicts="$(git diff --name-only --diff-filter=U | LC_ALL=C sort)"
 test "$actual_conflicts" = "$(printf '%s\n' "$expected_conflicts" | LC_ALL=C sort)"
 ```
 
-Expected: the same seven paths conflict. Do not fetch or substitute a newer upstream reference.
+Expected: the same six paths conflict. Do not fetch or substitute a newer upstream reference.
 
 - [ ] **Step 2: Resolve `README.md` from upstream structure plus two custom additions**
 
@@ -481,9 +482,9 @@ test "$(rg -c 'RUN_TEST\(cli_config_watcher_enabled_default_and_persist\)' tests
 
 Expected: metrics and watcher tests each have one definition and one registration; all upstream tests remain present.
 
-- [ ] **Step 8: Hand-resolve `tests/test_mcp.c` without whole-file side selection**
+- [ ] **Step 8: Audit the automatically merged `tests/test_mcp.c`**
 
-Resolve only the marked conflict hunks with `apply_patch`. The resulting issue-704 test must contain upstream's `offset`, `limit`, `metadata_only`, `include_details`, `total`, `returned`, and `has_more` assertions plus Task 2's `indexed_at` and lean-field assertions.
+Do not check out either side and do not rewrite the file wholesale. The automatically merged issue-704 test must contain upstream's `offset`, `limit`, `metadata_only`, `include_details`, `total`, `returned`, and `has_more` assertions plus Task 2's `indexed_at` and lean-field assertions.
 
 Confirm that the automatically merged custom test families remain:
 
@@ -492,18 +493,18 @@ rg -n "indexed_at.*list_projects|tool_index_status_fails_closed_without_indexed_
 rg -n "offset.*limit|metadata_only|include_details|has_more|size_bytes" tests/test_mcp.c
 ```
 
-Expected: both upstream pagination and custom freshness/worktree/indexed-time contracts coexist. No conflict marker remains.
+Expected: both upstream pagination and custom freshness/worktree/indexed-time contracts coexist, and `tests/test_mcp.c` has no conflict marker.
 
-- [ ] **Step 9: Stage exactly the seven conflict resolutions**
+- [ ] **Step 9: Stage exactly the six manual conflict resolutions**
 
 ```zsh
 git add README.md docs/CONFIGURATION.md \
-  src/cli/cli.c src/cli/cli.h src/main.c tests/test_cli.c tests/test_mcp.c
+  src/cli/cli.c src/cli/cli.h src/main.c tests/test_cli.c
 test -z "$(git diff --name-only --diff-filter=U)"
 git diff --cached --check
 ```
 
-Expected: no unmerged path and no whitespace error. Do not use `git add -A`; the seven explicit paths are the only manual staging list. Git's already-staged automatic merge remains intact.
+Expected: no unmerged path and no whitespace error. Do not use `git add -A`; the six explicit paths are the only manual staging list. Git's already-staged automatic merge, including `tests/test_mcp.c`, remains intact.
 
 - [ ] **Step 10: Run the focused GREEN preservation suites before committing**
 
@@ -550,7 +551,7 @@ git show --no-patch --pretty=raw HEAD
 
 Expected: a two-parent merge commit; both the exact custom base and exact upstream target are ancestors.
 
-Review boundary: an independent reviewer checks the seven resolved files, the staged/committed diff against `31b611a3`, the preservation-suite transcript, and both-parent ancestry. Fixes require a new ordinary commit only if the merge commit has already been reviewed; do not amend reviewed history.
+Review boundary: an independent reviewer checks the six resolved files plus the automatically merged `tests/test_mcp.c`, the staged/committed diff against `31b611a3`, the preservation-suite transcript, and both-parent ancestry. Fixes require a new ordinary commit only if the merge commit has already been reviewed; do not amend reviewed history.
 
 ---
 

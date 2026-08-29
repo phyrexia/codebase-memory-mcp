@@ -31,9 +31,8 @@ Expected merge conflicts are limited to:
 - `src/cli/cli.h`
 - `src/main.c`
 - `tests/test_cli.c`
-- `tests/test_mcp.c`
 
-Any additional conflicted path is a stop condition for the merge task. After the main merge is reviewed and committed, merge `7710f86e`. Its expected changed surface is only `src/daemon/frontend.c`, `src/daemon/frontend.h`, and `tests/test_daemon_frontend.c`.
+`tests/test_mcp.c` is expected to merge automatically and remains an explicit preservation-audit path. Any conflict outside the six listed paths is a stop condition for the merge task. After the main merge is reviewed and committed, merge `7710f86e`. Its expected changed surface is only `src/daemon/frontend.c`, `src/daemon/frontend.h`, and `tests/test_daemon_frontend.c`.
 
 The original checkout remains on `feat/request-metrics`; the isolated branch will be `integration/main-custom-performance-20260828`. Use an isolated path under `/private/tmp` so the user's dirty `.gitignore` does not need a `.worktrees/` entry.
 
