@@ -28,6 +28,7 @@
 #include "ui/http_server.h"
 #include <store/store.h>
 #include <watcher/watcher.h>
+#include <yyjson/yyjson.h>
 
 #include <stdio.h>
 #include <stdatomic.h>
@@ -198,6 +199,38 @@ static int th_status(const char *resp) {
     if (strncmp(resp, "HTTP/1.1 ", 9) != 0)
         return -1;
     return atoi(resp + 9);
+}
+
+typedef struct {
+    const int64_t *values;
+    size_t count;
+    size_t index;
+} th_browse_clock_t;
+
+static int64_t th_browse_clock_now(void *context) {
+    th_browse_clock_t *clock = context;
+    if (!clock || clock->count == 0) {
+        return 0;
+    }
+    size_t index = clock->index < clock->count ? clock->index++ : clock->count - 1;
+    return clock->values[index];
+}
+
+static yyjson_doc *th_http_json(const char *response) {
+    const char *body = response ? strstr(response, "\r\n\r\n") : NULL;
+    return body ? yyjson_read(body + 4, strlen(body + 4), 0) : NULL;
+}
+
+static size_t th_json_dirs_count(yyjson_doc *doc) {
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *dirs = root ? yyjson_obj_get(root, "dirs") : NULL;
+    return yyjson_is_arr(dirs) ? yyjson_arr_size(dirs) : 0;
+}
+
+static bool th_json_truncated(yyjson_doc *doc) {
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *value = root ? yyjson_obj_get(root, "truncated") : NULL;
+    return yyjson_is_bool(value) && yyjson_get_bool(value);
 }
 
 /* ── Parser unit tests ────────────────────────────────────────── */
@@ -603,6 +636,20 @@ static int th_server_start(th_server_t *ts) {
     ts->srv = cbm_http_server_new(0);
     if (!ts->srv)
         return -1;
+    if (th_server_thread_start(&ts->tid, ts->srv) != 0) {
+        (void)cbm_http_server_free(ts->srv);
+        return -1;
+    }
+    return 0;
+}
+
+static int th_server_start_with_browse_clock(th_server_t *ts,
+                                              cbm_http_browse_now_ms_fn now_ms,
+                                              void *context) {
+    ts->srv = cbm_http_server_new(0);
+    if (!ts->srv)
+        return -1;
+    cbm_http_server_set_browse_clock_for_test(ts->srv, now_ms, context);
     if (th_server_thread_start(&ts->tid, ts->srv) != 0) {
         (void)cbm_http_server_free(ts->srv);
         return -1;
@@ -2270,7 +2317,11 @@ TEST(ui_server_browse_wide_dir_no_overflow) {
                  dir, port);
         char *resp = malloc(262144);
         int n = resp ? th_http(port, req, resp, 262144) : 0;
-        int ok = (n > 0 && strstr(resp, "HTTP/1.1 200") != NULL);
+        yyjson_doc *doc = resp ? th_http_json(resp) : NULL;
+        int ok = n > 0 && strstr(resp, "HTTP/1.1 200") != NULL && doc != NULL &&
+                 th_json_dirs_count(doc) <= 200 && th_json_truncated(doc);
+        if (doc)
+            yyjson_doc_free(doc);
         free(resp);
         th_server_stop(&ts);
         _exit(ok ? 0 : 3);
@@ -2451,7 +2502,120 @@ TEST(ui_server_index_status_long_paths_no_overflow) {
 
 /* ── Suite ────────────────────────────────────────────────────── */
 
+TEST(ui_server_browse_complete_listing_is_valid_json) {
+    char *dir = th_mktempdir("cbm_browse_complete");
+    ASSERT_NOT_NULL(dir);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(dir, "alpha")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(dir, "beta")), 0);
+
+    int64_t times[] = {0};
+    th_browse_clock_t clock = {.values = times, .count = 1};
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_browse_clock(&ts, th_browse_clock_now, &clock), 0);
+
+    char request[1024];
+    char response[65536];
+    snprintf(request, sizeof(request), "GET /api/browse?path=%s HTTP/1.1\r\n\r\n", dir);
+    ASSERT_GT(th_http(cbm_http_server_port(ts.srv), request, response, sizeof(response)), 0);
+    ASSERT_EQ(th_status(response), 200);
+    yyjson_doc *doc = th_http_json(response);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_EQ((int)th_json_dirs_count(doc), 2);
+    ASSERT_FALSE(th_json_truncated(doc));
+    yyjson_doc_free(doc);
+
+    th_server_stop(&ts);
+    ASSERT_EQ(th_rmtree(dir), 0);
+    PASS();
+}
+
+TEST(ui_server_browse_result_cap_is_200_and_valid_json) {
+    char *dir = th_mktempdir("cbm_browse_results");
+    ASSERT_NOT_NULL(dir);
+    for (int i = 0; i < 201; i++) {
+        char child[512];
+        snprintf(child, sizeof(child), "%s/dir-%03d", dir, i);
+        ASSERT_EQ(th_mkdir_p(child), 0);
+    }
+
+    int64_t times[] = {0};
+    th_browse_clock_t clock = {.values = times, .count = 1};
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_browse_clock(&ts, th_browse_clock_now, &clock), 0);
+
+    char request[1024];
+    char response[262144];
+    snprintf(request, sizeof(request), "GET /api/browse?path=%s HTTP/1.1\r\n\r\n", dir);
+    ASSERT_GT(th_http(cbm_http_server_port(ts.srv), request, response, sizeof(response)), 0);
+    yyjson_doc *doc = th_http_json(response);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_EQ((int)th_json_dirs_count(doc), 200);
+    ASSERT_TRUE(th_json_truncated(doc));
+    yyjson_doc_free(doc);
+
+    th_server_stop(&ts);
+    ASSERT_EQ(th_rmtree(dir), 0);
+    PASS();
+}
+
+TEST(ui_server_browse_scan_cap_is_4096_and_valid_json) {
+    char *dir = th_mktempdir("cbm_browse_scan");
+    ASSERT_NOT_NULL(dir);
+    for (int i = 0; i < 4097; i++) {
+        char child[512];
+        snprintf(child, sizeof(child), "%s/.entry-%04d", dir, i);
+        ASSERT_EQ(th_write_file(child, "x"), 0);
+    }
+
+    int64_t times[] = {0};
+    th_browse_clock_t clock = {.values = times, .count = 1};
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_browse_clock(&ts, th_browse_clock_now, &clock), 0);
+
+    char request[1024];
+    char response[65536];
+    snprintf(request, sizeof(request), "GET /api/browse?path=%s HTTP/1.1\r\n\r\n", dir);
+    ASSERT_GT(th_http(cbm_http_server_port(ts.srv), request, response, sizeof(response)), 0);
+    yyjson_doc *doc = th_http_json(response);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_EQ((int)th_json_dirs_count(doc), 0);
+    ASSERT_TRUE(th_json_truncated(doc));
+    yyjson_doc_free(doc);
+
+    th_server_stop(&ts);
+    ASSERT_EQ(th_rmtree(dir), 0);
+    PASS();
+}
+
+TEST(ui_server_browse_time_budget_is_100ms_and_valid_json) {
+    char *dir = th_mktempdir("cbm_browse_time");
+    ASSERT_NOT_NULL(dir);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(dir, "would-be-listed")), 0);
+    int64_t times[] = {1000, 1099, 1100};
+    th_browse_clock_t clock = {.values = times, .count = 3};
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_browse_clock(&ts, th_browse_clock_now, &clock), 0);
+
+    char request[1024];
+    char response[65536];
+    snprintf(request, sizeof(request), "GET /api/browse?path=%s HTTP/1.1\r\n\r\n", dir);
+    ASSERT_GT(th_http(cbm_http_server_port(ts.srv), request, response, sizeof(response)), 0);
+    yyjson_doc *doc = th_http_json(response);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_TRUE(th_json_truncated(doc));
+    ASSERT_TRUE(th_json_dirs_count(doc) <= 1);
+    yyjson_doc_free(doc);
+
+    th_server_stop(&ts);
+    ASSERT_EQ(th_rmtree(dir), 0);
+    PASS();
+}
+
 SUITE(httpd) {
+    RUN_TEST(ui_server_browse_complete_listing_is_valid_json);
+    RUN_TEST(ui_server_browse_result_cap_is_200_and_valid_json);
+    RUN_TEST(ui_server_browse_scan_cap_is_4096_and_valid_json);
+    RUN_TEST(ui_server_browse_time_budget_is_100ms_and_valid_json);
     RUN_TEST(ui_server_browse_wide_dir_no_overflow);
     RUN_TEST(ui_server_logs_escape_dense_no_overflow);
     RUN_TEST(ui_server_index_status_long_paths_no_overflow);

@@ -67,6 +67,13 @@ int cbm_http_server_port(const cbm_http_server_t *srv);
 /* Override the per-connection receive deadline (tests use short values). */
 void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms);
 
+/* Pre-run deterministic monotonic clock seam for browse budget tests.
+ * Set only before cbm_http_server_run; production uses CLOCK_MONOTONIC. */
+typedef int64_t (*cbm_http_browse_now_ms_fn)(void *context);
+void cbm_http_server_set_browse_clock_for_test(cbm_http_server_t *srv,
+                                               cbm_http_browse_now_ms_fn now_ms,
+                                               void *context);
+
 /* Set external watcher reference for UI project lifecycle actions. Not owned. */
 void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher);
 

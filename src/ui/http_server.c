@@ -43,6 +43,7 @@
 #include <yyjson/yyjson.h>
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -68,6 +69,9 @@
 
 /* Max JSON-RPC request body size (1 MB) — transport enforces the same cap. */
 #define MAX_BODY_SIZE CBM_HTTP_MAX_BODY
+#define BROWSE_RESULT_LIMIT 200
+#define BROWSE_SCAN_LIMIT 4096
+#define BROWSE_BUDGET_MS INT64_C(100)
 
 /* ── CORS: only allow localhost origins (blocks remote website attacks) ────── */
 
@@ -169,6 +173,15 @@ typedef struct {
     atomic_int completed;
 } index_job_t;
 
+static int64_t browse_monotonic_ms(void *context) {
+    (void)context;
+    struct timespec now;
+    if (cbm_clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (int64_t)now.tv_sec * INT64_C(1000) + now.tv_nsec / INT64_C(1000000);
+}
+
 struct cbm_http_server {
     cbm_httpd_t *listener;
     cbm_mcp_server_t *mcp;       /* own MCP server instance (read-only) */
@@ -180,6 +193,8 @@ struct cbm_http_server {
     void *mutation_context;
     cbm_http_metrics_sink_fn metrics_sink;
     void *metrics_sink_context;
+    cbm_http_browse_now_ms_fn browse_now_ms;
+    void *browse_clock_context;
     index_job_t index_jobs[MAX_INDEX_JOBS];
     atomic_int stop_flag;
     atomic_int run_state;
@@ -707,54 +722,36 @@ static void handle_processes(cbm_http_conn_t *c) {
 
 /* ── Directory browser ────────────────────────────────────────── */
 
-#include <dirent.h>
-
-static void append_roots_json(char *buf, size_t bufsz, int *pos) {
-    http_appendf(buf, bufsz, pos, ",\"roots\":[");
+static bool browse_add_roots(yyjson_mut_doc *doc, yyjson_mut_val *root) {
+    yyjson_mut_val *roots = yyjson_mut_arr(doc);
+    if (!roots)
+        return false;
 #ifdef _WIN32
     DWORD drives = GetLogicalDrives();
-    int count = 0;
     for (int i = 0; i < 26; i++) {
-        if (!(drives & (1u << i))) {
+        if (!(drives & (1u << i)))
             continue;
-        }
-        /* Advertise exactly what /api/browse will accept: a mounted letter
-         * without a readable medium (empty optical drive, unformatted or
-         * offline volume) fails the same cbm_is_dir gate browse applies, and
-         * a root the picker cannot open must not be offered. */
-        char root[4] = {(char)('A' + i), ':', '/', '\0'};
-        if (!cbm_is_dir(root)) {
+        char drive[4] = {(char)('A' + i), ':', '/', '\0'};
+        if (!cbm_is_dir(drive))
             continue;
-        }
-        if (count++ > 0) {
-            /* Once a wide listing saturates buf, http_appendf has already
-             * pinned *pos to bufsz, so this separator goes through it too. */
-            http_appendf(buf, bufsz, pos, ",");
-        }
-        http_appendf(buf, bufsz, pos, "\"%c:/\"", 'A' + i);
+        if (!yyjson_mut_arr_add_strcpy(doc, roots, drive))
+            return false;
     }
 #else
-    http_appendf(buf, bufsz, pos, "\"/\"");
+    if (!yyjson_mut_arr_add_strcpy(doc, roots, "/"))
+        return false;
 #endif
-    http_appendf(buf, bufsz, pos, "]");
+    return yyjson_mut_obj_add_val(doc, root, "roots", roots);
 }
 
 /* GET /api/browse?path=/some/dir — list subdirectories for file picker */
-static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+static void handle_browse(cbm_http_server_t *srv, cbm_http_conn_t *c,
+                          const cbm_http_req_t *req) {
     char path[1024] = {0};
     const char *home = cbm_get_home_dir();
     if (!cbm_http_query_param(req->query, "path", path, (int)sizeof(path)) || path[0] == '\0') {
-        /* Default to home directory */
-        if (home)
-            snprintf(path, sizeof(path), "%s", home);
-        else
-            snprintf(path, sizeof(path), "/");
+        snprintf(path, sizeof(path), "%s", home ? home : "/");
     }
-
-    /* The browser UI may send Windows backslash separators (e.g.
-     * "D:\projects\demo"). Normalize to forward slashes before the cbm_is_dir
-     * gate, exactly as the MCP repo_path handler and cbm_project_name_from_path
-     * already do — otherwise a real D:/ directory is rejected (#548). */
     cbm_normalize_path_sep(path);
 
     if (!cbm_is_dir(path)) {
@@ -762,73 +759,83 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
-    DIR *dir = opendir(path);
+    cbm_dir_t *dir = cbm_opendir(path);
     if (!dir) {
         cbm_http_replyf(c, 403, g_cors_json, "{\"error\":\"cannot open directory\"}");
         return;
     }
 
-    /* Build JSON response */
-    char buf[32768];
-    int pos = 0;
-    http_appendf(buf, sizeof(buf), &pos, "{\"path\":\"%s\",\"dirs\":[", path);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    yyjson_mut_val *dirs = doc ? yyjson_mut_arr(doc) : NULL;
+    bool encoded = doc && root && dirs;
+    if (encoded) {
+        yyjson_mut_doc_set_root(doc, root);
+        encoded = yyjson_mut_obj_add_strcpy(doc, root, "path", path) &&
+                  yyjson_mut_obj_add_val(doc, root, "dirs", dirs);
+    }
 
-    struct dirent *ent;
-    int count = 0;
-    while ((ent = readdir(dir)) != NULL) {
-        /* Skip hidden dirs and . / .. */
-        if (ent->d_name[0] == '.')
+    size_t scanned = 0;
+    size_t returned = 0;
+    bool truncated = false;
+    int64_t started_ms = srv->browse_now_ms(srv->browse_clock_context);
+
+    while (encoded) {
+        if (scanned >= BROWSE_SCAN_LIMIT || returned >= BROWSE_RESULT_LIMIT) {
+            truncated = true;
+            break;
+        }
+        int64_t now_ms = srv->browse_now_ms(srv->browse_clock_context);
+        if (now_ms >= started_ms && now_ms - started_ms >= BROWSE_BUDGET_MS) {
+            truncated = true;
+            break;
+        }
+
+        cbm_dirent_t *entry = cbm_readdir(dir);
+        if (!entry)
+            break;
+        scanned++;
+        if (entry->name[0] == '.')
             continue;
 
-        /* Check if it's actually a directory */
         char full[2048];
-        snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
+        int full_len = snprintf(full, sizeof(full), "%s/%s", path, entry->name);
+        if (full_len < 0 || (size_t)full_len >= sizeof(full)) {
+            truncated = true;
+            continue;
+        }
         if (!cbm_is_dir(full))
             continue;
-
-        if (count > 0)
-            buf[pos++] = ',';
-        /* Escape directory name to prevent XSS (e.g., names with quotes/angle brackets) */
-        {
-            char esc[512];
-            cbm_json_escape(esc, (int)sizeof(esc), ent->d_name);
-            http_appendf(buf, sizeof(buf), &pos, "\"%s\"", esc);
-        }
-        if (pos >= (int)sizeof(buf)) {
-            pos = (int)sizeof(buf) - 1;
-        }
-        count++;
-
-        if (count >= 200)
-            break; /* safety limit */
+        encoded = yyjson_mut_arr_add_strcpy(doc, dirs, entry->name);
+        if (encoded)
+            returned++;
     }
-    closedir(dir);
+    cbm_closedir(dir);
 
-    /* Parent path — escape to prevent injection */
     char parent[1024];
     snprintf(parent, sizeof(parent), "%s", path);
     char *last_slash = strrchr(parent, '/');
-    /* A Windows drive root "X:/" is its own parent (like POSIX "/"): truncating
-     * at the slash would yield the bare drive spec "X:", which the next browse
-     * resolves to the wrong directory and strands the user at the root (#548). */
     size_t parent_len = strlen(parent);
     bool is_drive_root = parent_len == 3 && parent[1] == ':' && parent[2] == '/';
-    if (is_drive_root) {
-        /* leave "X:/" unchanged */
-    } else if (last_slash && last_slash != parent) {
+    if (!is_drive_root && last_slash && last_slash != parent) {
         *last_slash = '\0';
-    } else {
+    } else if (!is_drive_root) {
         snprintf(parent, sizeof(parent), "/");
     }
 
-    {
-        char esc_parent[2048];
-        cbm_json_escape(esc_parent, (int)sizeof(esc_parent), parent);
-        http_appendf(buf, sizeof(buf), &pos, "],\"parent\":\"%s\"", esc_parent);
-        append_roots_json(buf, sizeof(buf), &pos);
-        http_appendf(buf, sizeof(buf), &pos, "}");
+    encoded = encoded && yyjson_mut_obj_add_strcpy(doc, root, "parent", parent) &&
+              browse_add_roots(doc, root) &&
+              yyjson_mut_obj_add_bool(doc, root, "truncated", truncated);
+    size_t json_len = 0;
+    char *json = encoded ? yyjson_mut_write(doc, YYJSON_WRITE_NOFLAG, &json_len) : NULL;
+    if (doc)
+        yyjson_mut_doc_free(doc);
+    if (!json) {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cannot build browse response\"}");
+        return;
     }
-    cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
+    cbm_http_reply_buf(c, 200, g_cors_json, json, json_len);
+    free(json);
 }
 
 /* GET /api/indexed-roots → every indexed project with its root_path and
@@ -2187,7 +2194,7 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
 
     /* GET /api/browse → directory browser for file picker */
     if (is_get && cbm_http_path_match(req->path, "/api/browse*")) {
-        handle_browse(c, req);
+        handle_browse(srv, c, req);
         return;
     }
 
@@ -2274,6 +2281,8 @@ cbm_http_server_t *cbm_http_server_new(int port) {
         return NULL;
 
     srv->port = port;
+    srv->browse_now_ms = browse_monotonic_ms;
+    srv->browse_clock_context = NULL;
     atomic_init(&srv->stop_flag, 0);
     atomic_init(&srv->run_state, HTTP_RUN_IDLE);
 
@@ -2426,6 +2435,16 @@ void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms) {
     if (srv && srv->listener_ok) {
         cbm_httpd_set_recv_deadline_ms(srv->listener, ms);
     }
+}
+
+void cbm_http_server_set_browse_clock_for_test(cbm_http_server_t *srv,
+                                               cbm_http_browse_now_ms_fn now_ms,
+                                               void *context) {
+    if (!srv || !now_ms) {
+        return;
+    }
+    srv->browse_now_ms = now_ms;
+    srv->browse_clock_context = context;
 }
 
 void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher) {
