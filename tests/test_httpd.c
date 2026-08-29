@@ -1086,19 +1086,30 @@ TEST(ui_server_mutations_require_json_content_type) {
 TEST(ui_server_rpc_allows_only_ui_read_tools) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
-    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
-                       "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}";
+    static const char *allowed_tools[] = {
+        "list_projects",
+        "get_code_snippet",
+        "get_graph_schema",
+    };
     char req[1024];
-    snprintf(req, sizeof(req),
-             "POST /rpc HTTP/1.1\r\n"
-             "Content-Type: application/json\r\n"
-             "Content-Length: %d\r\n\r\n%s",
-             (int)strlen(body), body);
     char resp[8192];
-    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
-    ASSERT_GT(n, 0);
-    ASSERT_EQ(th_status(resp), 200);
-    ASSERT_NOT_NULL(strstr(resp, "\"jsonrpc\""));
+    for (size_t i = 0; i < sizeof(allowed_tools) / sizeof(allowed_tools[0]); i++) {
+        char body[512];
+        snprintf(body, sizeof(body),
+                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"%s\",\"arguments\":{}}}",
+                 allowed_tools[i]);
+        snprintf(req, sizeof(req),
+                 "POST /rpc HTTP/1.1\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Content-Length: %zu\r\n\r\n%s",
+                 strlen(body), body);
+        int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+        ASSERT_GT(n, 0);
+        ASSERT_EQ(th_status(resp), 200);
+        ASSERT_NOT_NULL(strstr(resp, "\"jsonrpc\""));
+    }
+    int n = 0;
 
     static const char *blocked_tools[] = {"delete_project", "manage_adr", "ingest_traces",
                                           "index_repository"};
@@ -1950,6 +1961,13 @@ TEST(ui_server_indexed_roots_reports_projects_and_orphans) {
     ASSERT_NOT_NULL(strstr(resp, "\"root_exists\":true"));
     ASSERT_NOT_NULL(strstr(resp, "\"name\":\"roots-orphan\""));
     ASSERT_NOT_NULL(strstr(resp, "\"root_exists\":false"));
+    int indexed_at_count = 0;
+    const char *indexed_at_cursor = resp;
+    while ((indexed_at_cursor = strstr(indexed_at_cursor, "\"indexed_at\":\"")) != NULL) {
+        indexed_at_count++;
+        indexed_at_cursor += strlen("\"indexed_at\":\"");
+    }
+    ASSERT_EQ(indexed_at_count, 2);
     ASSERT_NULL(strstr(resp, "_config"));
 
     ui_delete_fixture_cleanup(&fx);

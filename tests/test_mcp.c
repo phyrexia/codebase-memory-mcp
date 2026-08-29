@@ -8684,6 +8684,7 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
     ASSERT_NOT_NULL(list);
     ASSERT_NOT_NULL(strstr(list, "alpha704")); /* control */
     ASSERT_NOT_NULL(strstr(list, "beta704"));  /* internal name of drifted db (RED before) */
+    ASSERT_NOT_NULL(strstr(list, "\\\"indexed_at\\\":"));
     ASSERT_NULL(strstr(list, "gamma704"));     /* filename must NOT be advertised (RED before) */
     ASSERT_NULL(strstr(list, "ghost704"));     /* 0-byte ghost filtered (RED before) */
     free(list);
@@ -8699,7 +8700,10 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
     ASSERT_NOT_NULL(strstr(page, "\\\"has_more\\\":true"));
     ASSERT_NOT_NULL(strstr(page, "alpha704"));
     ASSERT_NULL(strstr(page, "beta704"));
-    ASSERT_NULL(strstr(page, "\\\"nodes\\\"")); /* details are opt-in */
+    ASSERT_NOT_NULL(strstr(page, "\\\"indexed_at\\\":"));
+    ASSERT_NULL(strstr(page, "\\\"nodes\\\""));
+    ASSERT_NULL(strstr(page, "\\\"edges\\\""));
+    ASSERT_NULL(strstr(page, "\\\"size_bytes\\\""));
     free(page);
 
     char *next_page = cbm_mcp_server_handle(
