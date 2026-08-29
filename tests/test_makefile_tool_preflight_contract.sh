@@ -75,6 +75,51 @@ for source in fixture-a.c fixture-b.c; do
     esac
 done
 
+# The production CFLAGS include -Werror, but ordinary compiler warnings are
+# input for clang-tidy rather than a reason to bypass the Python findings gate.
+# A final -Wno-error must win without hiding a real analyzer process failure.
+warning_tidy="$FIXTURE/clang-tidy-warning"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'warnings_are_errors=0' \
+    'tidy_warnings_as_errors=1' \
+    'source_file=' \
+    'for arg do' \
+    "    case \"\$arg\" in" \
+    '        -Werror) warnings_are_errors=1 ;;' \
+    '        -Wno-error) warnings_are_errors=0 ;;' \
+    '        --warnings-as-errors=-*) tidy_warnings_as_errors=0 ;;' \
+    "        *.c) source_file=\$arg ;;" \
+    '    esac' \
+    'done' \
+    "[ \"\$warnings_are_errors\" -eq 0 ] || exit 42" \
+    "[ \"\$tidy_warnings_as_errors\" -eq 0 ] || exit 43" \
+    "[ -n \"\${source_file:-}\" ] || exit 64" \
+    "printf '%s\\n' \"\$source_file:3:5: warning: controlled compiler warning [clang-diagnostic-unused-parameter]\"" \
+    'exit 0' >"$warning_tidy"
+chmod +x "$warning_tidy"
+warning_log="$FIXTURE/lint-warning.log"
+run_make "$warning_log" lint-mem-ci \
+    "CLANG_TIDY=$warning_tidy" "LINT_SRCS=fixture-warning.c" "CFLAGS_COMMON=-Werror" ||
+    fail "lint-mem-ci promoted an ordinary compiler warning before the findings gate"
+assert_log_contains "$warning_log" "=== memory gate clean ==="
+
+compile_error_tidy="$FIXTURE/clang-tidy-compile-error"
+printf '%s\n' '#!/bin/sh' \
+    'source_file=' 'for arg do' \
+    "    case \"\$arg\" in *.c) source_file=\$arg; break ;; esac" \
+    'done' \
+    "[ -n \"\$source_file\" ] || exit 64" \
+    "printf '%s\\n' \"\$source_file:3:5: error: controlled compile error [clang-diagnostic-error]\"" \
+    'exit 1' >"$compile_error_tidy"
+chmod +x "$compile_error_tidy"
+compile_error_log="$FIXTURE/lint-compile-error.log"
+if run_make "$compile_error_log" lint-mem-ci \
+    "CLANG_TIDY=$compile_error_tidy" "LINT_SRCS=fixture-error.c" "CFLAGS_COMMON=-Werror"; then
+    fail "lint-mem-ci hid a clang-tidy compile error"
+fi
+assert_log_contains "$compile_error_log" "ERROR: clang-tidy execution failed"
+
 # A successful analyzer process can still report a real finding. Its stdout
 # must reach the Python gate, and the gate's nonzero status must reach make.
 finding_source="$FIXTURE/unwhitelisted-finding.c"
@@ -85,7 +130,11 @@ printf '%s\n' \
     '}' >"$finding_source"
 finding_tidy="$FIXTURE/clang-tidy-finding"
 printf '%s\n' '#!/bin/sh' \
-    "printf '%s\\n' \"\$3:3:5: warning: controlled unwhitelisted finding [clang-analyzer-unix.Malloc]\"" \
+    'source_file=' 'for arg do' \
+    "    case \"\$arg\" in *.c) source_file=\$arg; break ;; esac" \
+    'done' \
+    "[ -n \"\$source_file\" ] || exit 64" \
+    "printf '%s\\n' \"\$source_file:3:5: warning: controlled unwhitelisted finding [clang-analyzer-unix.Malloc]\"" \
     'exit 0' >"$finding_tidy"
 chmod +x "$finding_tidy"
 finding_log="$FIXTURE/lint-finding.log"

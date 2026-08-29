@@ -8245,6 +8245,14 @@ TEST(cli_uninstall_help_does_not_uninstall_issue1038) {
     PASS();
 }
 
+TEST(cli_uninstall_rejects_positive_argc_with_null_argv) {
+    int rc = cbm_cmd_uninstall(1, NULL);
+
+    if (rc == 0)
+        FAIL("uninstall must fail closed when argc is positive but argv is NULL");
+    PASS();
+}
+
 TEST(cli_opencode_config_dir_detects_without_retargeting_global_json) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-opencode-dir-XXXXXX");
@@ -13827,6 +13835,7 @@ TEST(cli_update_only_names_an_installer_that_exists_issue1632) {
 }
 
 SUITE(cli) {
+    RUN_TEST(cli_uninstall_rejects_positive_argc_with_null_argv);
     RUN_TEST(cli_update_only_names_an_installer_that_exists_issue1632);
     RUN_TEST(cli_progress_visibility_policy);
     RUN_TEST(cli_raw_mcp_result_preserves_tool_error_status);

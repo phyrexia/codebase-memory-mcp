@@ -227,7 +227,7 @@ bool cbm_condition_init(cbm_thread_condition_t *condition) {
 }
 
 cbm_condition_wait_result_t cbm_condition_wait(cbm_thread_condition_t *condition,
-                                                cbm_mutex_t *mutex) {
+                                               cbm_mutex_t *mutex) {
     return condition && mutex &&
                    SleepConditionVariableCS(&condition->condition, &mutex->cs, INFINITE)
                ? CBM_CONDITION_SIGNALED
@@ -235,7 +235,7 @@ cbm_condition_wait_result_t cbm_condition_wait(cbm_thread_condition_t *condition
 }
 
 cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_thread_condition_t *condition,
-                                                      cbm_mutex_t *mutex, uint32_t timeout_ms) {
+                                                     cbm_mutex_t *mutex, uint32_t timeout_ms) {
     if (timeout_ms == UINT32_MAX) {
         return cbm_condition_wait(condition, mutex);
     }
@@ -305,26 +305,24 @@ bool cbm_condition_init(cbm_thread_condition_t *condition) {
         return false;
     }
     int clock_result = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
-    int init_result = clock_result == 0
-                          ? pthread_cond_init(&condition->condition, &attributes)
-                          : clock_result;
+    int init_result =
+        clock_result == 0 ? pthread_cond_init(&condition->condition, &attributes) : clock_result;
     (void)pthread_condattr_destroy(&attributes);
     return init_result == 0;
 #endif
 }
 
 cbm_condition_wait_result_t cbm_condition_wait(cbm_thread_condition_t *condition,
-                                                cbm_mutex_t *mutex) {
+                                               cbm_mutex_t *mutex) {
     if (!condition || !mutex) {
         return CBM_CONDITION_ERROR;
     }
-    return pthread_cond_wait(&condition->condition, &mutex->mtx) == 0
-               ? CBM_CONDITION_SIGNALED
-               : CBM_CONDITION_ERROR;
+    return pthread_cond_wait(&condition->condition, &mutex->mtx) == 0 ? CBM_CONDITION_SIGNALED
+                                                                      : CBM_CONDITION_ERROR;
 }
 
 cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_thread_condition_t *condition,
-                                                      cbm_mutex_t *mutex, uint32_t timeout_ms) {
+                                                     cbm_mutex_t *mutex, uint32_t timeout_ms) {
     if (timeout_ms == UINT32_MAX) {
         return cbm_condition_wait(condition, mutex);
     }
@@ -336,8 +334,7 @@ cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_thread_condition_t *con
         .tv_sec = (time_t)(timeout_ms / 1000U),
         .tv_nsec = (long)(timeout_ms % 1000U) * 1000000L,
     };
-    int result =
-        pthread_cond_timedwait_relative_np(&condition->condition, &mutex->mtx, &relative);
+    int result = pthread_cond_timedwait_relative_np(&condition->condition, &mutex->mtx, &relative);
 #else
     struct timespec deadline;
     if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {

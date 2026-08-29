@@ -1255,8 +1255,8 @@ lint-mem-ci:
 	fi
 	@output=$$(mktemp "$${TMPDIR:-/tmp}/cbm-lint-mem.XXXXXX") || exit 1; \
 	trap 'rm -f "$$output"' 0 1 2 3 15; \
-	printf '%s\n' $(LINT_SRCS) | xargs -P 4 -I{} $(CLANG_TIDY) --quiet \
-		--checks='$(LINT_MEM_CHECKS)' {} -- $(CFLAGS_COMMON) $(SYSROOT_FLAG) \
+	printf '%s\n' $(LINT_SRCS) | xargs -P 4 -I{} $(CLANG_TIDY) --quiet --warnings-as-errors='-*' \
+		--checks='$(LINT_MEM_CHECKS)' {} -- $(CFLAGS_COMMON) $(SYSROOT_FLAG) -Wno-error \
 		>"$$output" 2>/dev/null; \
 	analyzer_status=$$?; \
 	if [ "$$analyzer_status" -ne 0 ]; then \

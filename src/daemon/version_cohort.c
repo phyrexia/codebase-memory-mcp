@@ -718,8 +718,7 @@ cbm_version_cohort_maintenance_presence_t cbm_version_cohort_maintenance_presenc
 cbm_version_cohort_maintenance_presence_t cbm_version_cohort_maintenance_presence_terminal(
     cbm_version_cohort_manager_t *manager) {
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-    atomic_fetch_add_explicit(&version_cohort_test_terminal_observations, 1,
-                              memory_order_release);
+    atomic_fetch_add_explicit(&version_cohort_test_terminal_observations, 1, memory_order_release);
 #endif
     return version_cohort_maintenance_presence_internal(manager, true);
 }

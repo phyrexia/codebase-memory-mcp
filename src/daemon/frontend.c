@@ -279,9 +279,8 @@ static void *frontend_join_watchdog(void *opaque) {
     cbm_mutex_lock(&state->mutex);
     while (!state->worker_done) {
         uint32_t remaining_ms = frontend_deadline_remaining_ms(deadline);
-        if (remaining_ms == 0 ||
-            cbm_condition_timed_wait(&state->changed, &state->mutex, remaining_ms) ==
-                CBM_CONDITION_ERROR) {
+        if (remaining_ms == 0 || cbm_condition_timed_wait(&state->changed, &state->mutex,
+                                                          remaining_ms) == CBM_CONDITION_ERROR) {
             cbm_mutex_unlock(&state->mutex);
             /* A thin frontend owns no durable state. If stdout is backpressured,
              * fclose/IPC cancellation cannot portably wake its worker on every

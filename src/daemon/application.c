@@ -1093,10 +1093,9 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
     uint64_t t0_ms = cbm_now_ms();
     application_attempt_status_t status =
         application_job_run_attempt_inner(job, marker_path, quarantine_path, attempt);
-    cbm_daemon_application_metrics_record(job->application, "index", "index_run",
-                                          job->project_key ? job->project_key : "",
-                                          (cbm_now_ms() - t0_ms) * 1000,
-                                          status == APPLICATION_ATTEMPT_START_FAILED);
+    cbm_daemon_application_metrics_record(
+        job->application, "index", "index_run", job->project_key ? job->project_key : "",
+        (cbm_now_ms() - t0_ms) * 1000, status == APPLICATION_ATTEMPT_START_FAILED);
     return status;
 }
 
@@ -2663,8 +2662,7 @@ static cbm_daemon_runtime_application_status_t application_request_dispatch(
         const char *hook_project = cbm_mcp_server_session_project(session->mcp);
         cbm_daemon_application_metrics_record(application, "hook", hook_metric_name,
                                               hook_project ? hook_project : "",
-                                              (cbm_now_ms() - hook_t0_ms) * 1000,
-                                              response == NULL);
+                                              (cbm_now_ms() - hook_t0_ms) * 1000, response == NULL);
         free(input);
         if (response) {
             size_t response_length = strlen(response);
@@ -3696,8 +3694,7 @@ void cbm_daemon_application_metrics_record(cbm_daemon_application_t *application
 }
 
 #ifdef CBM_ENABLE_TEST_SEAMS
-size_t cbm_daemon_application_metrics_slot_count_for_test(
-    cbm_daemon_application_t *application) {
+size_t cbm_daemon_application_metrics_slot_count_for_test(cbm_daemon_application_t *application) {
     if (!application) {
         return 0;
     }
@@ -3757,8 +3754,8 @@ void cbm_daemon_application_metrics_flush(cbm_daemon_application_t *application)
     metrics_bucket_now(bucket, sizeof(bucket));
     if (strncmp(bucket, application->metrics_last_prune_day,
                 sizeof(application->metrics_last_prune_day) - 1) != 0) {
-        snprintf(application->metrics_last_prune_day,
-                 sizeof(application->metrics_last_prune_day), "%.10s", bucket);
+        snprintf(application->metrics_last_prune_day, sizeof(application->metrics_last_prune_day),
+                 "%.10s", bucket);
         time_t cutoff = time(NULL) - (time_t)APPLICATION_METRICS_RETENTION_DAYS * 24 * 3600;
         struct tm tm;
         cbm_gmtime_r(&cutoff, &tm);

@@ -4640,9 +4640,9 @@ static void add_worktree_status_json(yyjson_mut_doc *doc, yyjson_mut_val *freshn
  *   - equal SHA + status available + no changes       → current
  * Report-only: it never triggers indexing. Verbose-only and read-only; the
  * live checkout is resolved fresh from the project root (never mutated). */
-static void add_index_freshness_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                     cbm_store_t *store, const char *project,
-                                     const char *root_path, const char *indexed_generation) {
+static void add_index_freshness_json(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store,
+                                     const char *project, const char *root_path,
+                                     const char *indexed_generation) {
     yyjson_mut_val *freshness = yyjson_mut_obj(doc);
     if (indexed_generation && indexed_generation[0]) {
         yyjson_mut_obj_add_strcpy(doc, freshness, "indexed_generation", indexed_generation);
@@ -7568,12 +7568,10 @@ static void add_parse_partial_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
  * runs that do not revisit a flagged file, and artifact bootstraps, do not
  * make existing gaps appear to have vanished. By-design exclusions have
  * their own response surface and are not failures. */
-static bool add_persisted_failure_summaries(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                            cbm_store_t *store, const char *project,
+static bool add_failure_summaries_from_rows(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                            const cbm_coverage_row_t *rows, int row_count,
                                             const char *logfile) {
-    cbm_coverage_row_t *rows = NULL;
-    int row_count = 0;
-    if (cbm_store_coverage_get(store, project, &rows, &row_count) != CBM_STORE_OK) {
+    if (row_count < 0 || (row_count > 0 && !rows)) {
         return false;
     }
 
@@ -7588,7 +7586,6 @@ static bool add_persisted_failure_summaries(yyjson_mut_doc *doc, yyjson_mut_val 
     cbm_file_error_t *failures =
         failure_count > 0 ? calloc((size_t)failure_count, sizeof(*failures)) : NULL;
     if (failure_count > 0 && !failures) {
-        cbm_store_free_coverage(rows, row_count);
         return false;
     }
 
@@ -7598,18 +7595,43 @@ static bool add_persisted_failure_summaries(yyjson_mut_doc *doc, yyjson_mut_val 
         if (strcmp(kind, "not_indexed_dir") == 0 || strcmp(kind, "not_indexed_file") == 0) {
             continue;
         }
+        if (!failures || n >= failure_count) {
+            free(failures);
+            return false;
+        }
         failures[n].path = (char *)rows[i].rel_path;
         failures[n].reason = (char *)rows[i].detail;
         failures[n].phase = (char *)rows[i].kind;
         n++;
     }
 
-    add_skipped_summary(doc, root, failures, failure_count, logfile);
-    add_parse_partial_summary(doc, root, failures, failure_count);
+    add_skipped_summary(doc, root, failures, n, logfile);
+    add_parse_partial_summary(doc, root, failures, n);
     free(failures);
-    cbm_store_free_coverage(rows, row_count);
     return true;
 }
+
+static bool add_persisted_failure_summaries(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                            cbm_store_t *store, const char *project,
+                                            const char *logfile) {
+    cbm_coverage_row_t *rows = NULL;
+    int row_count = 0;
+    if (cbm_store_coverage_get(store, project, &rows, &row_count) != CBM_STORE_OK) {
+        return false;
+    }
+
+    bool added = add_failure_summaries_from_rows(doc, root, rows, row_count, logfile);
+    cbm_store_free_coverage(rows, row_count);
+    return added;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+bool cbm_mcp_add_failure_summaries_for_testing(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                               const cbm_coverage_row_t *rows, int row_count,
+                                               const char *logfile) {
+    return add_failure_summaries_from_rows(doc, root, rows, row_count, logfile);
+}
+#endif
 
 /* Write the FULL (uncapped) skip list to a per-run logfile — ONLY when >=1 file
  * was skipped (no logfile on a clean run). Location:
@@ -12034,9 +12056,9 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         bool is_err = (result_json != NULL) && (strstr(result_json, "\"isError\":true") != NULL);
         cbm_diag_record_query(dur_us, is_err);
         if (srv->metrics_sink) {
-            const char *metrics_project =
-                srv->session_project[0] ? srv->session_project
-                                        : (srv->current_project ? srv->current_project : "");
+            const char *metrics_project = srv->session_project[0]
+                                              ? srv->session_project
+                                              : (srv->current_project ? srv->current_project : "");
             srv->metrics_sink(srv->metrics_sink_context,
                               srv->metrics_source[0] ? srv->metrics_source : "mcp", tool_name,
                               metrics_project, (uint64_t)dur_us, is_err);

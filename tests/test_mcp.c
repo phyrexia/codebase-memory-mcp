@@ -128,6 +128,10 @@ static void cleanup_project_db(const char *cache, const char *project) {
     cbm_unlink(path);
 }
 
+bool cbm_mcp_add_failure_summaries_for_testing(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                               const cbm_coverage_row_t *rows, int row_count,
+                                               const char *logfile);
+
 #define MCP_MUTATION_GUARD_MAX_EVENTS 16
 
 typedef struct {
@@ -2625,6 +2629,37 @@ TEST(tool_check_index_coverage_finds_path_beyond_status_cap) {
     free(rows);
     free(paths);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(mcp_persisted_failure_summaries_preserve_mixed_rows_and_bounds) {
+    cbm_coverage_row_t rows[] = {
+        {.rel_path = "ignored", .kind = "not_indexed_dir", .detail = "by design"},
+        {.rel_path = "src/skipped.c", .kind = "read", .detail = "permission denied"},
+        {.rel_path = "src/partial.c", .kind = "parse_partial", .detail = "7-9"},
+        {.rel_path = "ignored.txt", .kind = "not_indexed_file", .detail = "gitignore"},
+    };
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    ASSERT_NOT_NULL(doc);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    ASSERT_NOT_NULL(root);
+    yyjson_mut_doc_set_root(doc, root);
+
+    ASSERT_FALSE(cbm_mcp_add_failure_summaries_for_testing(doc, root, NULL, 1, NULL));
+    ASSERT_FALSE(cbm_mcp_add_failure_summaries_for_testing(doc, root, rows, -1, NULL));
+    ASSERT_TRUE(cbm_mcp_add_failure_summaries_for_testing(doc, root, rows, 4, "/tmp/coverage.log"));
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"skipped_count\":1"));
+    ASSERT_NOT_NULL(strstr(json, "\"parse_partial_count\":1"));
+    ASSERT_NOT_NULL(strstr(json, "src/skipped.c"));
+    ASSERT_NOT_NULL(strstr(json, "src/partial.c"));
+    ASSERT_NOT_NULL(strstr(json, "\"logfile\":\"/tmp/coverage.log\""));
+    ASSERT_NULL(strstr(json, "ignored.txt"));
+    ASSERT_NULL(strstr(json, "\"path\":\"ignored\""));
+
+    free(json);
+    yyjson_mut_doc_free(doc);
     PASS();
 }
 
@@ -12021,6 +12056,7 @@ TEST(index_repository_supervisor_uses_canonical_session_path) {
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(mcp) {
+    RUN_TEST(mcp_persisted_failure_summaries_preserve_mixed_rows_and_bounds);
     RUN_TEST(mcp_path_within_root_rejects_escape);
     RUN_TEST(detect_changes_rejects_option_like_base_branch);
     RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch);

@@ -414,8 +414,7 @@ bool cbm_daemon_runtime_client_close_finish(cbm_daemon_runtime_client_t *client,
 bool cbm_daemon_runtime_client_close(cbm_daemon_runtime_client_t *client, uint32_t timeout_ms);
 
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-void cbm_daemon_runtime_service_spurious_wake_for_testing(
-    cbm_daemon_runtime_service_t *service);
+void cbm_daemon_runtime_service_spurious_wake_for_testing(cbm_daemon_runtime_service_t *service);
 uint64_t cbm_daemon_runtime_service_condition_waits_for_testing(
     cbm_daemon_runtime_service_t *service);
 uint64_t cbm_daemon_runtime_service_stopping_wait_entries_for_testing(

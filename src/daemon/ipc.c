@@ -2604,9 +2604,8 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     cbm_mutex_init(&listener->wake_mutex);
     listener->wake_mutex_initialized = true;
     int wake_fds[2] = {-1, -1};
-    if (pipe(wake_fds) != 0 || !fd_set_cloexec(wake_fds[0]) ||
-        !fd_set_nonblocking(wake_fds[0]) || !fd_set_cloexec(wake_fds[1]) ||
-        !fd_set_nonblocking(wake_fds[1])) {
+    if (pipe(wake_fds) != 0 || !fd_set_cloexec(wake_fds[0]) || !fd_set_nonblocking(wake_fds[0]) ||
+        !fd_set_cloexec(wake_fds[1]) || !fd_set_nonblocking(wake_fds[1])) {
         cbm_log_error("daemon.ipc.listen_failed", "stage", "wake_pipe_creation");
         if (wake_fds[0] >= 0) {
             (void)close(wake_fds[0]);
@@ -2948,8 +2947,8 @@ bool cbm_daemon_ipc_listener_interrupt(cbm_daemon_ipc_listener_t *listener) {
     return interrupted;
 }
 
-static cbm_ipc_accept_wait_result_t posix_listener_accept_wait(
-    cbm_daemon_ipc_listener_t *listener, uint64_t deadline_ms) {
+static cbm_ipc_accept_wait_result_t posix_listener_accept_wait(cbm_daemon_ipc_listener_t *listener,
+                                                               uint64_t deadline_ms) {
     for (;;) {
         struct pollfd descriptors[2] = {
             {.fd = listener->wake_read_fd, .events = POLLIN, .revents = 0},
@@ -5806,8 +5805,8 @@ static bool win_pipe_client_is_current_user(HANDLE pipe) {
     return same_user;
 }
 
-static cbm_ipc_accept_wait_result_t win_listener_accept_wait(
-    cbm_daemon_ipc_listener_t *listener, DWORD timeout_ms) {
+static cbm_ipc_accept_wait_result_t win_listener_accept_wait(cbm_daemon_ipc_listener_t *listener,
+                                                             DWORD timeout_ms) {
     HANDLE events[2] = {listener->interrupt_event, listener->connect_event};
     ipc_accept_wait_observe();
     DWORD wait = WaitForMultipleObjects(2, events, FALSE, timeout_ms);

@@ -6704,18 +6704,17 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
 
     /* Create tables if not exists (additive-only: older binaries ignore
      * tables they don't know) */
-    const char *sql =
-        "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);"
-        "CREATE TABLE IF NOT EXISTS metrics_requests ("
-        " bucket_hour TEXT NOT NULL,"
-        " source TEXT NOT NULL,"
-        " name TEXT NOT NULL,"
-        " project TEXT NOT NULL DEFAULT '',"
-        " count INTEGER NOT NULL DEFAULT 0,"
-        " errors INTEGER NOT NULL DEFAULT 0,"
-        " dur_us_sum INTEGER NOT NULL DEFAULT 0,"
-        " dur_us_max INTEGER NOT NULL DEFAULT 0,"
-        " PRIMARY KEY (bucket_hour, source, name, project));";
+    const char *sql = "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);"
+                      "CREATE TABLE IF NOT EXISTS metrics_requests ("
+                      " bucket_hour TEXT NOT NULL,"
+                      " source TEXT NOT NULL,"
+                      " name TEXT NOT NULL,"
+                      " project TEXT NOT NULL DEFAULT '',"
+                      " count INTEGER NOT NULL DEFAULT 0,"
+                      " errors INTEGER NOT NULL DEFAULT 0,"
+                      " dur_us_sum INTEGER NOT NULL DEFAULT 0,"
+                      " dur_us_max INTEGER NOT NULL DEFAULT 0,"
+                      " PRIMARY KEY (bucket_hour, source, name, project));";
     char *err_msg = NULL;
     if (sqlite3_exec(db, sql, NULL, NULL, &err_msg) != SQLITE_OK) {
         sqlite3_free(err_msg);
@@ -6980,8 +6979,7 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_AUTO_INDEX, "false", "Enable auto-indexing on MCP session start"},
     {CBM_CONFIG_AUTO_INDEX_LIMIT, "50000", "Max files for auto-indexing new projects"},
     {CBM_CONFIG_AUTO_WATCH, "true", "Register background git watcher on session connect"},
-    {CBM_CONFIG_IGNORE_WORKTREES, "false",
-     "Skip linked git worktrees when indexing automatically"},
+    {CBM_CONFIG_IGNORE_WORKTREES, "false", "Skip linked git worktrees when indexing automatically"},
     {CBM_CONFIG_WATCHER_ENABLED, "true",
      "Run the background watcher thread (auto-reindex); false to disable"},
     {CBM_CONFIG_MAX_INDEX_JOBS, "2",
@@ -11981,6 +11979,11 @@ static int cli_uninstall_activate(void *opaque) {
 }
 
 int cbm_cmd_uninstall(int argc, char **argv) {
+    if (argc > 0 && !argv) {
+        (void)fprintf(stderr, "error: uninstall arguments are unavailable\n");
+        return CLI_TRUE;
+    }
+
     /* `uninstall --help` used to UNINSTALL.
      *
      * The top-level dispatcher matches the subcommand at argv[1] and hands the

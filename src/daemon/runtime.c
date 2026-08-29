@@ -2152,13 +2152,11 @@ static void *runtime_accept_loop(void *opaque) {
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
                 service->stopping_wait_entries_for_testing++;
 #endif
-                uint32_t remaining_ms =
-                    runtime_deadline_remaining_ms(service->stop_deadline_ms);
+                uint32_t remaining_ms = runtime_deadline_remaining_ms(service->stop_deadline_ms);
                 cbm_condition_wait_result_t waited =
-                    remaining_ms == 0
-                        ? cbm_condition_wait(&service->state_changed, &service->mutex)
-                        : cbm_condition_timed_wait(&service->state_changed, &service->mutex,
-                                                   remaining_ms);
+                    remaining_ms == 0 ? cbm_condition_wait(&service->state_changed, &service->mutex)
+                                      : cbm_condition_timed_wait(&service->state_changed,
+                                                                 &service->mutex, remaining_ms);
                 if (waited == CBM_CONDITION_ERROR) {
                     service->emergency_stop = true;
                     runtime_service_changed_locked(service);
@@ -2169,8 +2167,8 @@ static void *runtime_accept_loop(void *opaque) {
         }
 
         cbm_daemon_ipc_connection_t *connection = NULL;
-        int accepted = cbm_daemon_ipc_accept(service->listener, CBM_DAEMON_IPC_WAIT_FOREVER,
-                                             &connection);
+        int accepted =
+            cbm_daemon_ipc_accept(service->listener, CBM_DAEMON_IPC_WAIT_FOREVER, &connection);
         if (accepted == 1 && connection) {
             runtime_accept_connection(service, connection);
         } else if (accepted == 0) {
@@ -2570,8 +2568,7 @@ bool cbm_daemon_runtime_service_wait_exited(cbm_daemon_runtime_service_t *servic
 }
 
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-void cbm_daemon_runtime_service_spurious_wake_for_testing(
-    cbm_daemon_runtime_service_t *service) {
+void cbm_daemon_runtime_service_spurious_wake_for_testing(cbm_daemon_runtime_service_t *service) {
     if (!service) {
         return;
     }

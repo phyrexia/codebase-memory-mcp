@@ -327,8 +327,7 @@ static void host_http_config_load_default(void *context, cbm_ui_config_t *config
     cbm_ui_config_load(config_out);
 }
 
-static void host_http_metrics_sink(void *context, const char *path, uint64_t dur_us,
-                                   bool is_error);
+static void host_http_metrics_sink(void *context, const char *path, uint64_t dur_us, bool is_error);
 
 static cbm_http_server_t *host_http_server_new_default(void *context, int port) {
     (void)context;

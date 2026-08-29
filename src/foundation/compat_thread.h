@@ -81,9 +81,9 @@ void cbm_mutex_destroy(cbm_mutex_t *m);
 
 bool cbm_condition_init(cbm_thread_condition_t *condition);
 cbm_condition_wait_result_t cbm_condition_wait(cbm_thread_condition_t *condition,
-                                                cbm_mutex_t *mutex);
+                                               cbm_mutex_t *mutex);
 cbm_condition_wait_result_t cbm_condition_timed_wait(cbm_thread_condition_t *condition,
-                                                      cbm_mutex_t *mutex, uint32_t timeout_ms);
+                                                     cbm_mutex_t *mutex, uint32_t timeout_ms);
 void cbm_condition_signal(cbm_thread_condition_t *condition);
 void cbm_condition_broadcast(cbm_thread_condition_t *condition);
 void cbm_condition_destroy(cbm_thread_condition_t *condition);
