@@ -325,6 +325,24 @@ for relative, needles in guidance_contracts.items():
 
 # ── 5. Native Windows guard coverage of the replacement contract ─────────────
 windows_test_driver = read("scripts/test-windows.ps1")
+ui_drive_guard = read("tests/windows/test_ui_drive_listing.py")
+runtime_assignment = 'env["CBM_RUNTIME_DIR"] = os.path.join(work, "runtime")'
+runtime_creation = 'os.makedirs(env["CBM_RUNTIME_DIR"], exist_ok=True)'
+runtime_assignment_pos = ui_drive_guard.find(runtime_assignment)
+runtime_creation_pos = ui_drive_guard.find(runtime_creation)
+ui_popen_pos = ui_drive_guard.find("proc = subprocess.Popen(")
+ui_popen_end = ui_drive_guard.find("\n    try:", ui_popen_pos)
+ui_popen_block = (
+    ui_drive_guard[ui_popen_pos:ui_popen_end]
+    if ui_popen_pos >= 0 and ui_popen_end > ui_popen_pos
+    else ""
+)
+require(
+    0 <= runtime_assignment_pos < runtime_creation_pos < ui_popen_pos
+    and "env=env" in ui_popen_block,
+    "the Windows drive-listing guard must create and pass a private CBM_RUNTIME_DIR "
+    "before starting the released binary",
+)
 require(
     "tests\\windows\\test_windows_update_handoff.py" in windows_test_driver
     or "tests/windows/test_windows_update_handoff.py" in windows_test_driver,

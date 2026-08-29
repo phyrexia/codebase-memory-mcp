@@ -112,7 +112,9 @@ def main():
     port = int(sys.argv[2]) if len(sys.argv) > 2 else free_port()
     env = dict(os.environ)
     env["CBM_CACHE_DIR"] = os.path.join(work, "cache")
+    env["CBM_RUNTIME_DIR"] = os.path.join(work, "runtime")
     os.makedirs(env["CBM_CACHE_DIR"], exist_ok=True)
+    os.makedirs(env["CBM_RUNTIME_DIR"], exist_ok=True)
     proc = subprocess.Popen([binary, "--ui=true", "--port=%d" % port],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env)
