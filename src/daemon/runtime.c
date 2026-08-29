@@ -62,7 +62,6 @@ void cbm_daemon_runtime_force_peer_image_mismatch_for_testing(bool force) {
 
 enum {
     RUNTIME_MAX_CLIENTS_HARD = 64,
-    RUNTIME_ACCEPT_POLL_MS = 20,
     RUNTIME_WAIT_POLL_NS = 1000000,
     RUNTIME_WORKER_STACK_SIZE = 256 * 1024,
     /* Bounds the drain-before-close wait for a peer consuming its final
@@ -167,6 +166,11 @@ typedef struct {
 
 struct cbm_daemon_runtime_service {
     cbm_mutex_t mutex;
+    cbm_thread_condition_t state_changed;
+    bool state_changed_initialized;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    uint64_t condition_waits_for_testing;
+#endif
     cbm_daemon_ipc_listener_t *listener;
     cbm_daemon_coordinator_t *coordinator;
     cbm_daemon_runtime_worker_t *workers;
@@ -187,7 +191,7 @@ struct cbm_daemon_runtime_service {
     cbm_thread_t accept_thread;
     bool accept_thread_started;
     bool accept_thread_joined;
-    atomic_bool accept_thread_done;
+    bool accept_thread_done;
 
     cbm_daemon_runtime_service_state_t state;
     uint64_t stop_deadline_ms;
@@ -264,6 +268,15 @@ static uint64_t runtime_deadline_after(uint32_t timeout_ms) {
         return UINT64_MAX;
     }
     return now_ms + (uint64_t)timeout_ms;
+}
+
+static uint32_t runtime_deadline_remaining_ms(uint64_t deadline_ms) {
+    uint64_t now_ms = cbm_now_ms();
+    if (now_ms >= deadline_ms) {
+        return 0;
+    }
+    uint64_t remaining_ms = deadline_ms - now_ms;
+    return remaining_ms >= UINT32_MAX ? UINT32_MAX - 1U : (uint32_t)remaining_ms;
 }
 
 static void runtime_wait_tick(uint64_t deadline_ms) {
@@ -1097,12 +1110,24 @@ static void runtime_result_rejected(cbm_daemon_runtime_connect_result_t *result,
     (void)snprintf(result->message, sizeof(result->message), "%s", message);
 }
 
+static void runtime_service_changed_locked(cbm_daemon_runtime_service_t *service) {
+    cbm_condition_broadcast(&service->state_changed);
+}
+
+static void runtime_service_interrupt_accept_locked(cbm_daemon_runtime_service_t *service) {
+    if (service->listener) {
+        (void)cbm_daemon_ipc_listener_interrupt(service->listener);
+    }
+}
+
 static void runtime_service_begin_stopping_locked(cbm_daemon_runtime_service_t *service,
                                                   uint64_t deadline, bool emergency,
                                                   const char *reason) {
+    bool changed = false;
     if (service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING) {
         service->state = CBM_DAEMON_RUNTIME_SERVICE_STOPPING;
         service->stop_deadline_ms = deadline;
+        changed = true;
         /* The generation's fate is decided here by one of several owners
          * (last-client exit, coordinator stop, activation drain, external
          * stop). Sessions dropped by the losing side of a race are
@@ -1111,9 +1136,15 @@ static void runtime_service_begin_stopping_locked(cbm_daemon_runtime_service_t *
     } else if (service->state == CBM_DAEMON_RUNTIME_SERVICE_STOPPING &&
                (service->stop_deadline_ms == 0 || deadline < service->stop_deadline_ms)) {
         service->stop_deadline_ms = deadline;
+        changed = true;
     }
-    if (emergency) {
+    if (emergency && !service->emergency_stop) {
         service->emergency_stop = true;
+        changed = true;
+    }
+    if (changed) {
+        runtime_service_changed_locked(service);
+        runtime_service_interrupt_accept_locked(service);
     }
 }
 
@@ -1165,6 +1196,7 @@ static void runtime_worker_disconnect(cbm_daemon_runtime_worker_t *worker) {
         worker->admission_committed = false;
         if (service->committed_clients > 0) {
             service->committed_clients--;
+            runtime_service_changed_locked(service);
         }
         if (service->committed_clients == 0 && !service->permanent) {
             /* A HELLO whose application session is still opening is only a
@@ -1227,6 +1259,7 @@ static bool runtime_worker_commit_admission(cbm_daemon_runtime_worker_t *worker)
     if (committed) {
         worker->admission_committed = true;
         service->committed_clients++;
+        runtime_service_changed_locked(service);
     }
     cbm_mutex_unlock(&service->mutex);
     return committed;
@@ -1463,6 +1496,8 @@ static void runtime_worker_finish(cbm_daemon_runtime_worker_t *worker) {
         service->active_connections--;
     }
     atomic_store_explicit(&worker->done, true, memory_order_release);
+    runtime_service_changed_locked(service);
+    runtime_service_interrupt_accept_locked(service);
     cbm_mutex_unlock(&service->mutex);
 }
 
@@ -1623,9 +1658,11 @@ static void runtime_worker_handle_stop(cbm_daemon_runtime_worker_t *worker, cons
                                     response, (uint32_t)sizeof(response));
     if (accepted) {
         cbm_daemon_runtime_service_t *stop_service = worker->service;
-        runtime_worker_finish(worker);
         cbm_mutex_lock(&stop_service->mutex);
         worker->final_response_inflight = false;
+        cbm_mutex_unlock(&stop_service->mutex);
+        runtime_worker_finish(worker);
+        cbm_mutex_lock(&stop_service->mutex);
         stop_service->activation_response_inflight = false;
         cbm_mutex_unlock(&stop_service->mutex);
         runtime_service_interrupt_connections(stop_service);
@@ -1701,9 +1738,11 @@ static void runtime_worker_handle_activation_shutdown(cbm_daemon_runtime_worker_
     if (result.accepted) {
         /* Close this requester normally, then release the global ACK gate so
          * the accept loop can finish any stragglers. */
-        runtime_worker_finish(worker);
         cbm_mutex_lock(&service->mutex);
         worker->final_response_inflight = false;
+        cbm_mutex_unlock(&service->mutex);
+        runtime_worker_finish(worker);
+        cbm_mutex_lock(&service->mutex);
         service->activation_response_inflight = false;
         cbm_mutex_unlock(&service->mutex);
         runtime_service_interrupt_connections(service);
@@ -1987,6 +2026,7 @@ static void runtime_reap_completed_workers(cbm_daemon_runtime_service_t *service
         cbm_mutex_lock(&service->mutex);
         if (joined == 0) {
             runtime_worker_reset_after_join(worker);
+            runtime_service_changed_locked(service);
         } else {
             worker->joining = false;
         }
@@ -2047,6 +2087,7 @@ static void runtime_accept_connection(cbm_daemon_runtime_service_t *service,
         atomic_store_explicit(&worker->disconnecting, false, memory_order_release);
         atomic_store_explicit(&worker->application_thread_done, false, memory_order_release);
         service->active_connections++;
+        runtime_service_changed_locked(service);
         int created = cbm_thread_create(&worker->thread, RUNTIME_WORKER_STACK_SIZE,
                                         runtime_connection_worker, worker);
         if (created == 0) {
@@ -2055,6 +2096,7 @@ static void runtime_accept_connection(cbm_daemon_runtime_service_t *service,
             return;
         }
         service->active_connections--;
+        runtime_service_changed_locked(service);
         runtime_worker_reset_after_join(worker);
     }
     cbm_mutex_unlock(&service->mutex);
@@ -2066,9 +2108,9 @@ static void runtime_accept_connection(cbm_daemon_runtime_service_t *service,
     }
 }
 
-static bool runtime_service_can_exit(cbm_daemon_runtime_service_t *service, uint64_t now_ms) {
+static bool runtime_service_can_exit_locked(cbm_daemon_runtime_service_t *service,
+                                            uint64_t now_ms) {
     bool can_exit = false;
-    cbm_mutex_lock(&service->mutex);
     if (service->state == CBM_DAEMON_RUNTIME_SERVICE_STOPPING && service->active_connections == 0) {
         bool drained = cbm_daemon_should_exit(service->coordinator, now_ms);
         if (!drained && service->activation_shutdown_requested) {
@@ -2085,9 +2127,9 @@ static bool runtime_service_can_exit(cbm_daemon_runtime_service_t *service, uint
         can_exit = drained || deadline_reached || service->emergency_stop;
         if (can_exit) {
             service->state = CBM_DAEMON_RUNTIME_SERVICE_EXITED;
+            runtime_service_changed_locked(service);
         }
     }
-    cbm_mutex_unlock(&service->mutex);
     return can_exit;
 }
 
@@ -2103,28 +2145,50 @@ static void *runtime_accept_loop(void *opaque) {
         }
         if (state == CBM_DAEMON_RUNTIME_SERVICE_STOPPING) {
             runtime_service_interrupt_connections(service);
-            if (runtime_service_can_exit(service, cbm_now_ms())) {
-                break;
+            cbm_mutex_lock(&service->mutex);
+            while (service->state == CBM_DAEMON_RUNTIME_SERVICE_STOPPING &&
+                   !runtime_service_can_exit_locked(service, cbm_now_ms())) {
+                uint32_t remaining_ms =
+                    runtime_deadline_remaining_ms(service->stop_deadline_ms);
+                if (remaining_ms == 0) {
+                    (void)runtime_service_can_exit_locked(service, cbm_now_ms());
+                    break;
+                }
+                cbm_condition_wait_result_t waited =
+                    cbm_condition_timed_wait(&service->state_changed, &service->mutex, remaining_ms);
+                if (waited == CBM_CONDITION_ERROR) {
+                    service->emergency_stop = true;
+                    runtime_service_changed_locked(service);
+                }
             }
-            uint64_t tick_deadline = runtime_deadline_after(1);
-            runtime_wait_tick(tick_deadline);
+            cbm_mutex_unlock(&service->mutex);
             continue;
         }
 
         cbm_daemon_ipc_connection_t *connection = NULL;
-        int accepted =
-            cbm_daemon_ipc_accept(service->listener, RUNTIME_ACCEPT_POLL_MS, &connection);
+        int accepted = cbm_daemon_ipc_accept(service->listener, CBM_DAEMON_IPC_WAIT_FOREVER,
+                                             &connection);
         if (accepted == 1 && connection) {
             runtime_accept_connection(service, connection);
+        } else if (accepted == 0) {
+            continue;
         } else if (accepted < 0) {
             /* IPC intentionally combines invalid-peer and listener errors.
              * Retry while RUNNING so one hostile peer cannot stop the daemon. */
-            uint64_t tick_deadline = runtime_deadline_after(1);
-            runtime_wait_tick(tick_deadline);
+            cbm_mutex_lock(&service->mutex);
+            bool running = service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+            cbm_mutex_unlock(&service->mutex);
+            if (running) {
+                uint64_t tick_deadline = runtime_deadline_after(1);
+                runtime_wait_tick(tick_deadline);
+            }
         }
     }
     runtime_reap_completed_workers(service);
-    atomic_store_explicit(&service->accept_thread_done, true, memory_order_release);
+    cbm_mutex_lock(&service->mutex);
+    service->accept_thread_done = true;
+    runtime_service_changed_locked(service);
+    cbm_mutex_unlock(&service->mutex);
     return NULL;
 }
 
@@ -2207,6 +2271,9 @@ static void runtime_service_destroy_unstarted(cbm_daemon_runtime_service_t *serv
         cbm_mutex_destroy(&service->workers[i].send_mutex);
     }
     free(service->workers);
+    if (service->state_changed_initialized) {
+        cbm_condition_destroy(&service->state_changed);
+    }
     cbm_mutex_destroy(&service->mutex);
     free(service);
 }
@@ -2251,7 +2318,12 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     service->active_image = active_image;
     runtime_process_image_reference_init(&active_image);
     cbm_mutex_init(&service->mutex);
-    atomic_init(&service->accept_thread_done, false);
+    if (!cbm_condition_init(&service->state_changed)) {
+        cbm_log_error("daemon.runtime.start_failed", "stage", "state_condition");
+        runtime_service_destroy_unstarted(service);
+        return NULL;
+    }
+    service->state_changed_initialized = true;
     service->worker_capacity = config->max_clients;
     service->workers = calloc(service->worker_capacity, sizeof(*service->workers));
     service->coordinator = cbm_daemon_coordinator_new(config->lease_timeout_ms);
@@ -2304,11 +2376,17 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
         runtime_service_destroy_unstarted(service);
         return NULL;
     }
+    cbm_mutex_lock(&service->mutex);
     service->state = CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+    runtime_service_changed_locked(service);
+    cbm_mutex_unlock(&service->mutex);
     if (cbm_thread_create(&service->accept_thread, RUNTIME_WORKER_STACK_SIZE, runtime_accept_loop,
                           service) != 0) {
         cbm_log_error("daemon.runtime.start_failed", "stage", "accept_thread");
+        cbm_mutex_lock(&service->mutex);
         service->state = CBM_DAEMON_RUNTIME_SERVICE_EXITED;
+        runtime_service_changed_locked(service);
+        cbm_mutex_unlock(&service->mutex);
         runtime_service_destroy_unstarted(service);
         return NULL;
     }
@@ -2432,17 +2510,24 @@ static bool runtime_wait_for_count(cbm_daemon_runtime_service_t *service, size_t
         return false;
     }
     uint64_t deadline = runtime_deadline_after(timeout_ms);
-    for (;;) {
-        size_t actual = connections ? cbm_daemon_runtime_service_active_connections(service)
-                                    : cbm_daemon_runtime_service_active_clients(service);
-        if (actual == expected) {
-            return true;
-        }
-        if (cbm_now_ms() >= deadline) {
+    cbm_mutex_lock(&service->mutex);
+    while ((connections ? service->active_connections : service->committed_clients) != expected) {
+        uint32_t remaining_ms = runtime_deadline_remaining_ms(deadline);
+        if (remaining_ms == 0) {
+            cbm_mutex_unlock(&service->mutex);
             return false;
         }
-        runtime_wait_tick(deadline);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        service->condition_waits_for_testing++;
+#endif
+        if (cbm_condition_timed_wait(&service->state_changed, &service->mutex, remaining_ms) ==
+            CBM_CONDITION_ERROR) {
+            cbm_mutex_unlock(&service->mutex);
+            return false;
+        }
     }
+    cbm_mutex_unlock(&service->mutex);
+    return true;
 }
 
 bool cbm_daemon_runtime_service_wait_for_clients(cbm_daemon_runtime_service_t *service,
@@ -2461,17 +2546,48 @@ bool cbm_daemon_runtime_service_wait_exited(cbm_daemon_runtime_service_t *servic
         return false;
     }
     uint64_t deadline = runtime_deadline_after(timeout_ms);
-    for (;;) {
-        if (cbm_daemon_runtime_service_state(service) == CBM_DAEMON_RUNTIME_SERVICE_EXITED &&
-            atomic_load_explicit(&service->accept_thread_done, memory_order_acquire)) {
-            return true;
-        }
-        if (cbm_now_ms() >= deadline) {
+    cbm_mutex_lock(&service->mutex);
+    while (service->state != CBM_DAEMON_RUNTIME_SERVICE_EXITED || !service->accept_thread_done) {
+        uint32_t remaining_ms = runtime_deadline_remaining_ms(deadline);
+        if (remaining_ms == 0) {
+            cbm_mutex_unlock(&service->mutex);
             return false;
         }
-        runtime_wait_tick(deadline);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        service->condition_waits_for_testing++;
+#endif
+        if (cbm_condition_timed_wait(&service->state_changed, &service->mutex, remaining_ms) ==
+            CBM_CONDITION_ERROR) {
+            cbm_mutex_unlock(&service->mutex);
+            return false;
+        }
     }
+    cbm_mutex_unlock(&service->mutex);
+    return true;
 }
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+void cbm_daemon_runtime_service_spurious_wake_for_testing(
+    cbm_daemon_runtime_service_t *service) {
+    if (!service) {
+        return;
+    }
+    cbm_mutex_lock(&service->mutex);
+    runtime_service_changed_locked(service);
+    cbm_mutex_unlock(&service->mutex);
+}
+
+uint64_t cbm_daemon_runtime_service_condition_waits_for_testing(
+    cbm_daemon_runtime_service_t *service) {
+    if (!service) {
+        return 0;
+    }
+    cbm_mutex_lock(&service->mutex);
+    uint64_t waits = service->condition_waits_for_testing;
+    cbm_mutex_unlock(&service->mutex);
+    return waits;
+}
+#endif
 
 bool cbm_daemon_runtime_service_job_reaped(cbm_daemon_runtime_service_t *service,
                                            const char *project_key) {
@@ -2526,6 +2642,7 @@ bool cbm_daemon_runtime_service_free(cbm_daemon_runtime_service_t *service) {
         cbm_mutex_destroy(&service->workers[i].send_mutex);
     }
     free(service->workers);
+    cbm_condition_destroy(&service->state_changed);
     cbm_mutex_destroy(&service->mutex);
     free(service);
     return true;

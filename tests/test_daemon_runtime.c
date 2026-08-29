@@ -13,6 +13,7 @@
 #include "daemon/host.h"
 #include "daemon/host_internal.h"
 #include "daemon/ipc.h"
+#include "daemon/ipc_internal.h"
 #include "daemon/runtime.h"
 #include "daemon/service.h"
 #include "daemon/version_cohort.h"
@@ -125,6 +126,36 @@ typedef struct {
     cbm_daemon_ipc_endpoint_t *endpoint;
     cbm_daemon_runtime_service_t *service;
 } runtime_test_fixture_t;
+
+typedef enum {
+    RUNTIME_STATE_WAIT_CLIENTS,
+    RUNTIME_STATE_WAIT_CONNECTIONS,
+    RUNTIME_STATE_WAIT_EXITED,
+} runtime_state_wait_kind_t;
+
+typedef struct {
+    cbm_daemon_runtime_service_t *service;
+    runtime_state_wait_kind_t kind;
+    size_t expected;
+    uint32_t timeout_ms;
+    atomic_bool returned;
+    bool result;
+} runtime_state_wait_t;
+
+static void *runtime_state_waiter(void *opaque) {
+    runtime_state_wait_t *wait = opaque;
+    if (wait->kind == RUNTIME_STATE_WAIT_CLIENTS) {
+        wait->result = cbm_daemon_runtime_service_wait_for_clients(
+            wait->service, wait->expected, wait->timeout_ms);
+    } else if (wait->kind == RUNTIME_STATE_WAIT_CONNECTIONS) {
+        wait->result = cbm_daemon_runtime_service_wait_for_connections(
+            wait->service, wait->expected, wait->timeout_ms);
+    } else {
+        wait->result = cbm_daemon_runtime_service_wait_exited(wait->service, wait->timeout_ms);
+    }
+    atomic_store_explicit(&wait->returned, true, memory_order_release);
+    return NULL;
+}
 
 typedef struct {
     atomic_int opened;
@@ -1402,6 +1433,125 @@ static void runtime_test_fixture_finish(runtime_test_fixture_t *fixture) {
     (void)cbm_rmdir(fixture->runtime_dir);
     (void)cbm_rmdir(fixture->parent);
     memset(fixture, 0, sizeof(*fixture));
+}
+
+TEST(daemon_runtime_idle_accept_has_no_timeout_wakes) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    cbm_daemon_ipc_accept_observer_reset_for_testing();
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start(&fixture, "idle-accept", &identity);
+    uint64_t deadline = cbm_now_ms() + RUNTIME_TEST_TIMEOUT_MS;
+    while (started && cbm_daemon_ipc_accept_waits_for_testing() < 1 &&
+           cbm_now_ms() < deadline) {
+        cbm_usleep(1000);
+    }
+    uint64_t waits_before = cbm_daemon_ipc_accept_waits_for_testing();
+    cbm_usleep(100U * 1000U);
+    uint64_t waits_after = cbm_daemon_ipc_accept_waits_for_testing();
+    uint64_t timeouts = cbm_daemon_ipc_accept_timeouts_for_testing();
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_EQ(waits_before, 1);
+    ASSERT_EQ(waits_after, waits_before);
+    ASSERT_EQ(timeouts, 0);
+    PASS();
+}
+
+TEST(daemon_runtime_state_waiters_recheck_after_spurious_broadcast) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start(&fixture, "state-condition", &identity);
+    runtime_state_wait_t clients = {
+        .service = fixture.service,
+        .kind = RUNTIME_STATE_WAIT_CLIENTS,
+        .expected = 1,
+        .timeout_ms = RUNTIME_TEST_TIMEOUT_MS,
+    };
+    atomic_init(&clients.returned, false);
+    cbm_thread_t clients_thread;
+    bool clients_started =
+        started && cbm_thread_create(&clients_thread, 0, runtime_state_waiter, &clients) == 0;
+    uint64_t deadline = cbm_now_ms() + RUNTIME_TEST_TIMEOUT_MS;
+    while (clients_started &&
+           cbm_daemon_runtime_service_condition_waits_for_testing(fixture.service) < 1 &&
+           cbm_now_ms() < deadline) {
+        cbm_usleep(1000);
+    }
+    uint64_t before_clients_wake =
+        cbm_daemon_runtime_service_condition_waits_for_testing(fixture.service);
+    if (clients_started) {
+        cbm_daemon_runtime_service_spurious_wake_for_testing(fixture.service);
+    }
+    while (clients_started &&
+           cbm_daemon_runtime_service_condition_waits_for_testing(fixture.service) <=
+               before_clients_wake &&
+           cbm_now_ms() < deadline) {
+        cbm_usleep(1000);
+    }
+    bool clients_still_waiting =
+        !atomic_load_explicit(&clients.returned, memory_order_acquire);
+    cbm_daemon_runtime_connect_result_t connect_result = {0};
+    cbm_daemon_runtime_client_t *client =
+        clients_still_waiting
+            ? cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                RUNTIME_TEST_TIMEOUT_MS, &connect_result)
+            : NULL;
+    bool client_connected = client != NULL;
+    bool clients_joined = clients_started && cbm_thread_join(&clients_thread) == 0;
+
+    runtime_state_wait_t exited = {
+        .service = fixture.service,
+        .kind = RUNTIME_STATE_WAIT_EXITED,
+        .timeout_ms = RUNTIME_TEST_TIMEOUT_MS,
+    };
+    atomic_init(&exited.returned, false);
+    cbm_thread_t exited_thread;
+    bool exited_started =
+        client && cbm_thread_create(&exited_thread, 0, runtime_state_waiter, &exited) == 0;
+    deadline = cbm_now_ms() + RUNTIME_TEST_TIMEOUT_MS;
+    uint64_t before_exited_wait =
+        cbm_daemon_runtime_service_condition_waits_for_testing(fixture.service);
+    while (exited_started &&
+           cbm_daemon_runtime_service_condition_waits_for_testing(fixture.service) <=
+               before_exited_wait &&
+           cbm_now_ms() < deadline) {
+        cbm_usleep(1000);
+    }
+    uint64_t before_exited_wake =
+        cbm_daemon_runtime_service_condition_waits_for_testing(fixture.service);
+    if (exited_started) {
+        cbm_daemon_runtime_service_spurious_wake_for_testing(fixture.service);
+    }
+    while (exited_started &&
+           cbm_daemon_runtime_service_condition_waits_for_testing(fixture.service) <=
+               before_exited_wake &&
+           cbm_now_ms() < deadline) {
+        cbm_usleep(1000);
+    }
+    bool exited_still_waiting = !atomic_load_explicit(&exited.returned, memory_order_acquire);
+    bool client_closed =
+        client && cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
+    client = NULL;
+    bool exited_joined = exited_started && cbm_thread_join(&exited_thread) == 0;
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(clients_started);
+    ASSERT_TRUE(before_clients_wake >= 1);
+    ASSERT_TRUE(clients_still_waiting);
+    ASSERT_TRUE(client_connected);
+    ASSERT_TRUE(clients_joined);
+    ASSERT_TRUE(clients.result);
+    ASSERT_EQ(connect_result.status, CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED);
+    ASSERT_TRUE(exited_started);
+    ASSERT_TRUE(exited_still_waiting);
+    ASSERT_TRUE(client_closed);
+    ASSERT_TRUE(exited_joined);
+    ASSERT_TRUE(exited.result);
+    PASS();
 }
 
 static bool runtime_test_read_log(const char *path, char out[RUNTIME_TEST_LOG_CAP]) {
@@ -4728,6 +4878,8 @@ TEST(daemon_runtime_stop_refuses_while_committed_clients_exist) {
 }
 
 SUITE(daemon_runtime) {
+    RUN_TEST(daemon_runtime_idle_accept_has_no_timeout_wakes);
+    RUN_TEST(daemon_runtime_state_waiters_recheck_after_spurious_broadcast);
     RUN_TEST(daemon_runtime_permanent_service_survives_last_disconnect_until_stop);
     RUN_TEST(daemon_runtime_stop_refuses_while_committed_clients_exist);
     RUN_TEST(daemon_host_early_coordination_failure_is_durable);
