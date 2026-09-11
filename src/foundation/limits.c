@@ -67,7 +67,8 @@ int cbm_daemon_max_clients(void) {
     errno = 0;
     char *end = NULL;
     long requested = strtol(raw, &end, 10);
-    if (errno != 0 || end == raw || *end != '\0') {
+    int overflowed = errno == ERANGE;
+    if ((errno != 0 && !overflowed) || end == raw || *end != '\0') {
         /* Not a number at all — a typo, a unit suffix, stray whitespace. The
          * operator's intent is unknowable, so take the default and say which
          * text was rejected, rather than guessing a number out of it. */
@@ -75,7 +76,14 @@ int cbm_daemon_max_clients(void) {
         return CBM_DAEMON_MAX_CLIENTS_DEFAULT;
     }
 
-    long clamped = requested;
+    /* A syntactically valid number that overflowed `long` (fifty digits of
+     * 9s, say) is exactly as unambiguous a "give me as many as possible" (or
+     * "as few") request as an in-range 99999 — strtol's LONG_MAX/LONG_MIN
+     * saturation already says which direction. Treat it as that, not as
+     * unreadable text: folding it into the default-with-no-clamp path would
+     * silently hand back 128 for a request that was clearly for the ceiling. */
+    long clamped = overflowed ? (requested == LONG_MIN ? 1L : (long)CBM_DAEMON_MAX_CLIENTS_LIMIT)
+                               : requested;
     if (clamped < 1) {
         clamped = 1;
     } else if (clamped > CBM_DAEMON_MAX_CLIENTS_LIMIT) {
@@ -84,7 +92,12 @@ int cbm_daemon_max_clients(void) {
     if (clamped != requested) {
         char requested_text[32];
         char clamped_text[32];
-        (void)snprintf(requested_text, sizeof(requested_text), "%ld", requested);
+        if (overflowed) {
+            (void)snprintf(requested_text, sizeof(requested_text), "%s(overflow)",
+                           requested == LONG_MIN ? "-inf" : "+inf");
+        } else {
+            (void)snprintf(requested_text, sizeof(requested_text), "%ld", requested);
+        }
         (void)snprintf(clamped_text, sizeof(clamped_text), "%ld", clamped);
         cbm_log_warn("daemon.max_clients.env_clamped", "requested", requested_text, "using",
                      clamped_text);

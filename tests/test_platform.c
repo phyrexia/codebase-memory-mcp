@@ -475,6 +475,24 @@ TEST(platform_daemon_max_clients_clamps_instead_of_discarding) {
     PASS();
 }
 
+TEST(platform_daemon_max_clients_overflow_clamps_by_direction) {
+    /* A number so large it overflows `long` (strtol saturates to LONG_MAX and
+     * sets ERANGE) is exactly as unambiguous a "give me as many as you can"
+     * request as an in-range 99999 — it must clamp to the ceiling, not fall
+     * through to the "unreadable text" default. Fifty digits comfortably
+     * exceeds LONG_MAX even on a 64-bit long. */
+    cbm_setenv("CBM_MAX_CLIENTS", "999999999999999999999999999999999999999999999999", 1);
+    ASSERT_EQ(cbm_daemon_max_clients(), CBM_DAEMON_MAX_CLIENTS_LIMIT);
+
+    /* Same in the negative direction: an overflowing negative number clamps
+     * to the floor of 1, not to the default. */
+    cbm_setenv("CBM_MAX_CLIENTS", "-999999999999999999999999999999999999999999999999", 1);
+    ASSERT_EQ(cbm_daemon_max_clients(), 1);
+
+    cbm_unsetenv("CBM_MAX_CLIENTS");
+    PASS();
+}
+
 TEST(platform_daemon_max_clients_unreadable_falls_back) {
     /* Text that is not a number at all carries no intent to clamp toward, so
      * this one does take the default — including the shapes that atoi would
@@ -745,6 +763,7 @@ SUITE(platform) {
     RUN_TEST(platform_daemon_max_clients_default);
     RUN_TEST(platform_daemon_max_clients_env_override);
     RUN_TEST(platform_daemon_max_clients_clamps_instead_of_discarding);
+    RUN_TEST(platform_daemon_max_clients_overflow_clamps_by_direction);
     RUN_TEST(platform_daemon_max_clients_unreadable_falls_back);
     RUN_TEST(platform_open_file_limit_never_lowers);
     RUN_TEST(platform_open_file_limit_raises_toward_request);
