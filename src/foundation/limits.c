@@ -3,8 +3,11 @@
  */
 #include "foundation/limits.h"
 
+#include "foundation/log.h"
+
 #include <errno.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 long cbm_max_file_bytes(void) {
@@ -53,4 +56,38 @@ int cbm_mcp_max_depth(void) {
     /* 15 — ceiling for client-driven MCP graph traversals (trace_call_path,
      * detect_changes); the caller's `depth` is WARN-clamped to this. */
     return env_positive_int("CBM_MCP_MAX_DEPTH", 15);
+}
+
+int cbm_daemon_max_clients(void) {
+    const char *raw = getenv("CBM_MAX_CLIENTS");
+    if (!raw || !raw[0]) {
+        return CBM_DAEMON_MAX_CLIENTS_DEFAULT;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    long requested = strtol(raw, &end, 10);
+    if (errno != 0 || end == raw || *end != '\0') {
+        /* Not a number at all — a typo, a unit suffix, stray whitespace. The
+         * operator's intent is unknowable, so take the default and say which
+         * text was rejected, rather than guessing a number out of it. */
+        cbm_log_warn("daemon.max_clients.env_unreadable", "value", raw, "using", "default");
+        return CBM_DAEMON_MAX_CLIENTS_DEFAULT;
+    }
+
+    long clamped = requested;
+    if (clamped < 1) {
+        clamped = 1;
+    } else if (clamped > CBM_DAEMON_MAX_CLIENTS_LIMIT) {
+        clamped = CBM_DAEMON_MAX_CLIENTS_LIMIT;
+    }
+    if (clamped != requested) {
+        char requested_text[32];
+        char clamped_text[32];
+        (void)snprintf(requested_text, sizeof(requested_text), "%ld", requested);
+        (void)snprintf(clamped_text, sizeof(clamped_text), "%ld", clamped);
+        cbm_log_warn("daemon.max_clients.env_clamped", "requested", requested_text, "using",
+                     clamped_text);
+    }
+    return (int)clamped;
 }

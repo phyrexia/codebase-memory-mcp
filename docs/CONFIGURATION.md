@@ -150,8 +150,39 @@ These environment variables affect runtime behavior:
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. The daemon records the randomized paths in the `diagnostics.start` discovery record (a single JSON line) in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`; that one record is emitted even when `CBM_LOG_LEVEL` suppresses ordinary logging, so the paths always remain discoverable. |
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
 | `CBM_LOG_LEVEL` | role-aware | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and supervised index workers default to `info`. Physical workers retain INFO liveness records because their private logs drive the supervisor's no-progress timeout. Frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
+| `CBM_MAX_CLIENTS` | `128` | How many client connections the daemon admits at once, counting sockets accepted but not yet through HELLO. Clamped to `[1, 512]`: a value outside that range is clamped and logged, not discarded, while text that is not a number falls back to the default. Read once when the daemon starts — see below. |
 | `CBM_RUNTIME_DIR` | `%LOCALAPPDATA%` (Windows), `/private/tmp` (macOS), `/tmp` (other) | Parent directory for the daemon/CLI rendezvous directory, which CBM creates inside it as `cbm-daemon-<uid>` (`cbm-daemon-<key>` on Windows). Set it when the default ancestry cannot pass the private-directory check — see below. `CBM_CACHE_DIR` does **not** move the rendezvous. |
-| `CBM_WORKERS` | auto-detected | Override the indexing worker count. |
+| `CBM_WORKERS` | auto-detected | Override the indexing worker count. Governs the indexing pipeline only — it has no effect on how many clients the daemon accepts. Use `CBM_MAX_CLIENTS` for that. |
+
+### Connection capacity
+
+One daemon serves every MCP session, hook and CLI call on the machine, and each
+holds one connection for its whole life. Past the cap, a new client is not told
+"full" in any way it can act on: its bootstrap sees a live daemon that will not
+admit it and keeps retrying until the 30 s startup budget runs out, so a cap set
+too low surfaces as *"CBM daemon is active or starting but could not accept this
+client within 30000 ms"*. Raise `CBM_MAX_CLIENTS` if that appears while the
+daemon is otherwise healthy.
+
+Two things are worth knowing before raising it:
+
+- **The daemon reads it once, at startup.** Changing the variable does not
+  affect a running daemon; it has to be restarted, which drops every connection
+  it is currently serving. On a busy machine, pick the moment.
+- **Descriptors are raised to match.** At startup the daemon raises its own
+  `RLIMIT_NOFILE` to cover the configured cap, because the soft limit a service
+  manager hands it (256 under launchd) is exhausted well below 512 connections —
+  and that shortage shows up first as the daemon failing to open its *own* log
+  and index files, which looks nothing like "too many clients". If the limit
+  cannot be raised far enough, the daemon still starts and logs
+  `daemon.descriptor_limit.insufficient` with the numbers.
+
+The daemon's log carries the rest: `daemon.runtime.capacity` at startup with the
+cap in force, `daemon.runtime.connections_peak` whenever the high-water mark of
+concurrent connections moves, and `daemon.runtime.capacity_rejected` for every
+client actually turned away. The peak line is the one to read when deciding
+whether the cap is right — sampling the live count almost always catches a
+trough.
 
 ### Relocating the daemon rendezvous directory
 

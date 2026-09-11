@@ -68,4 +68,35 @@ bool cbm_daemon_host_http_reconcile_free_refusal_for_test(
  * the failure, the adapter must cancel so the final free succeeds. */
 bool cbm_daemon_host_http_thread_create_failure_lifecycle_for_test(void);
 
+/* ── Descriptor budget for the connection cap ────────────────────
+ *
+ * Split out from the startup path because the decision is the whole point and
+ * the syscall is not: raising the real RLIMIT_NOFILE inside a test process
+ * changes a process-wide limit that every other test shares. These two are
+ * pure, so the production warning and the tests reason about the same rule. */
+
+typedef enum {
+    /* No per-process cap to manage, or it could not be read. */
+    CBM_DAEMON_HOST_FD_UNKNOWN = 0,
+    /* The soft cap covers the full budget asked for. */
+    CBM_DAEMON_HOST_FD_SUFFICIENT,
+    /* Short of the budget, but still above what the connection cap needs to be
+     * reachable — headroom is thinner than wanted, nothing is broken. */
+    CBM_DAEMON_HOST_FD_PARTIAL,
+    /* Below what the configured connection cap needs. The daemon will fail its
+     * own open()/accept() calls with EMFILE before the cap is ever reached. */
+    CBM_DAEMON_HOST_FD_INSUFFICIENT,
+} cbm_daemon_host_fd_verdict_t;
+
+/* Descriptors the given connection cap asks for: a per-connection allowance
+ * over a fixed base for the daemon's own files, never below a floor that
+ * clears the 256 launchd hands an unconfigured daemon. */
+unsigned long cbm_daemon_host_descriptor_budget(uint32_t max_clients);
+
+/* Classify an in-force soft cap against the budget for `max_clients`.
+ * `effective` is what cbm_raise_open_file_limit reported (0 for unknown). */
+cbm_daemon_host_fd_verdict_t cbm_daemon_host_classify_descriptor_limit(uint32_t max_clients,
+                                                                       unsigned long desired,
+                                                                       unsigned long effective);
+
 #endif /* CBM_DAEMON_HOST_INTERNAL_H */
