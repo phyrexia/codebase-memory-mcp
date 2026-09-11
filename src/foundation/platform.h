@@ -114,12 +114,44 @@ cbm_system_info_t cbm_system_info(void);
  * initial=false: max(1, perf_cores-1) (leave headroom for user apps) */
 int cbm_default_worker_count(bool initial);
 
+/* ── Process resource limits ────────────────────────────────────── */
+
+/* Raise this process's soft cap on open file descriptors toward `desired`,
+ * never above the hard cap the OS allows, and never lower it.
+ *
+ * A long-lived server has to do this for itself. Under launchd a daemon
+ * inherits a soft cap of 256 descriptors, which a few hundred concurrent
+ * connections exhaust — and the failure does not land on the connection that
+ * crossed the line: the process starts failing its own open() calls (log,
+ * index files) with EMFILE, so a descriptor shortage reads as unrelated file
+ * corruption rather than as "too many clients".
+ *
+ * Returns the soft cap in force when it returns — already-sufficient, raised,
+ * partially raised, or unchanged if the OS refused. Returns `desired` when the
+ * OS reports no cap at all. Returns 0 when there is nothing to manage on this
+ * platform or the limit could not be read; callers read 0 as "unknown", never
+ * as "zero descriptors". Never fails the caller: a process that cannot raise
+ * its limit should still run with whatever it has. */
+unsigned long cbm_raise_open_file_limit(unsigned long desired);
+
 /* ── Environment variables ──────────────────────────────────────── */
 
 /* Thread-safe getenv: copies the value into a caller-provided buffer.
  * Returns buf on success, or fallback if the variable is unset.
  * Returns NULL when the variable is unset and fallback is NULL. */
 const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback);
+
+/* Read an environment variable as a whole number.
+ *
+ * Answers true only when the variable is set, is not empty, and reads cleanly
+ * from its first character to its last. Anything else — a typo, a trailing
+ * unit such as "30s", a leading or trailing space, or a number too large for a
+ * long — answers false and leaves *out untouched, so the caller picks its own
+ * fallback and can say that it did.
+ *
+ * This exists because atoi and atol answer 0 for text they cannot read, and 0
+ * is a real setting at every call site in this project. */
+bool cbm_env_long(const char *name, long *out);
 
 /* ── Home directory ─────────────────────────────────────────────── */
 

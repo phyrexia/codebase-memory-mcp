@@ -223,13 +223,11 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
 }
 
 /* #1085: count CALLS edges whose target node has `name`, indexing via the
- * PARALLEL path (et_index_parallel pads to >50 files). The parallel resolver
- * used to drop the edge whenever the LSP resolved a callee but its target QN
- * wasn't a gbuf node (JSX component imported through a tsconfig `paths` alias:
- * the TS LSP resolves the element ref to an alias-path QN that never matches a
- * def node) — sequential kept the edge via the registry import_map fallback,
- * so the two pipelines disagreed and ~21% of a Next.js call graph vanished on
- * the default (parallel) path. Needs >50 files to reproduce. */
+ * PARALLEL path (et_index_parallel pads to >50 files). The per-file TS resolver
+ * used to treat a raw tsconfig alias as a confident target. That false row made
+ * the parallel driver skip cross-file resolution, then failed graph target
+ * materialization; the guarded JSX carrier correctly refused name-only
+ * fallback, so the relationship vanished. Needs >50 files to reproduce. */
 static int et_calls_to_name_parallel(const EtFile *meaningful, int n_mean, const char *name) {
     EtProj lp;
     cbm_store_t *store = et_index_parallel(&lp, meaningful, n_mean);
@@ -267,15 +265,16 @@ TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085) {
         {"src/app/dashboard-b.tsx",
          "import { KpiCard } from \"@/components/ui/kpi-card\";\n"
          "export function DashboardB() {\n  return <KpiCard label=\"b\" />;\n}\n"}};
-    /* RED before the fix: 0 (parallel drops alias-JSX). GREEN: both renders
-     * resolve, exactly as the sequential path already does. */
+    /* RED before the fix: 0 (parallel drops alias-JSX). GREEN: exactly one
+     * deduplicated edge from each dashboard render. */
     int hits = et_calls_to_name_parallel(f, 4, "KpiCard");
-    if (hits < 2) {
-        fprintf(stderr, "  [1085] FAIL CALLS->KpiCard on parallel path = %d (expected >= 2); "
-                        "alias-imported JSX component edges dropped\n",
+    if (hits != 2) {
+        fprintf(stderr,
+                "  [1085] FAIL CALLS->KpiCard on parallel path = %d (expected 2); "
+                "alias-imported JSX component edges dropped\n",
                 hits);
     }
-    ASSERT_TRUE(hits >= 2);
+    ASSERT_EQ(hits, 2);
     PASS();
 }
 
@@ -413,6 +412,30 @@ TEST(handles_spring_java) {
          "    public String getOrder(int id) {\n"
          "        return \"order:\" + id;\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* Spring (Java) — the path attribute may sit anywhere in the annotation.
+ * Java puts no order on annotation attributes, so `path` after `name`,
+ * `produces` and `consumes` is ordinary source. The argument scan stopped
+ * after the third attribute, so the path was never read and no Route node
+ * formed. A HANDLES count alone cannot catch that, because the class-level
+ * @RequestMapping still produces one route on its own. */
+TEST(handles_spring_java_path_attribute_fourth) {
+    static const char *routes[] = {"/api/orders", NULL};
+    static const EtFile f[] = {
+        {"OrderController.java",
+         "package com.example;\n\n"
+         "import org.springframework.web.bind.annotation.RequestMapping;\n"
+         "import org.springframework.web.bind.annotation.GetMapping;\n\n"
+         "@RequestMapping(\"/api\")\npublic class OrderController {\n"
+         "    @GetMapping(name = \"listOrders\",\n"
+         "                produces = \"application/json\",\n"
+         "                consumes = \"application/json\",\n"
+         "                path = \"/orders\")\n"
+         "    public String listOrders() {\n"
+         "        return \"orders\";\n    }\n}\n"}};
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
@@ -1579,6 +1602,7 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_fastify_js);
     RUN_TEST(handles_gin_go);
     RUN_TEST(handles_spring_java);
+    RUN_TEST(handles_spring_java_path_attribute_fourth);
     RUN_TEST(handles_spring_kotlin);
     RUN_TEST(handles_jaxrs_java);
     RUN_TEST(handles_aspnet_csharp);

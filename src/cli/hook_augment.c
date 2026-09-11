@@ -13,19 +13,21 @@
  *
  * The underlying query is `search_graph` (pure SQLite, shell-free) — chosen
  * over `search_code` (which shells out to grep|xargs) so the hook stays cheap
- * enough to run before every Grep/Glob.
+ * enough to run before every Grep/Glob/Bash call.
  */
 
 #include "cli/cli.h"
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/mem.h"
+#include "foundation/platform.h"
 #include "mcp/mcp.h"
 #include "pipeline/pipeline.h"
 #include "yyjson/yyjson.h"
 
 #include <ctype.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,6 +46,7 @@
 #define HA_MIN_TOKEN 4            /* skip short/noisy patterns before any work */
 #define HA_MAX_TOKEN 96
 #define HA_RESULT_LIMIT 5
+#define HA_LIST_PAGE_LIMIT 500
 #define HA_METADATA_CAP 192
 #define HA_MAX_WALKUP 8    /* cwd may be a subdir of the indexed root  */
 #define HA_DEADLINE_MS 300 /* hard in-process budget (see also: the    */
@@ -70,18 +73,21 @@
  * hook "timeout" remains the outer backstop (and alone governs Windows,
  * where this whole in-process deadline block is compiled out). */
 static int ha_deadline_ms(void) {
-    const char *env = getenv("CBM_HOOK_DEADLINE_MS");
-    if (!env || !env[0]) {
+    /* A value this reader cannot read gets the DEFAULT, never the floor. atoi
+     * used to answer 0 for a typo, 0 is below the minimum, and the clamp then
+     * handed back the shortest deadline the setting allows — the opposite of
+     * what somebody raising CBM_HOOK_DEADLINE_MS is asking for. */
+    long v = 0;
+    if (!cbm_env_long("CBM_HOOK_DEADLINE_MS", &v)) {
         return HA_DEADLINE_DEFAULT_MS;
     }
-    int v = atoi(env);
     if (v < HA_DEADLINE_MIN_MS) {
         return HA_DEADLINE_MIN_MS;
     }
     if (v > HA_DEADLINE_MAX_MS) {
         return HA_DEADLINE_MAX_MS;
     }
-    return v;
+    return (int)v;
 }
 
 static int g_ha_crumb_fd = -1;
@@ -123,7 +129,11 @@ static void ha_open_crumb_log(int deadline_ms) {
     g_ha_crumb_len = (n > 0 && n < (int)sizeof(g_ha_crumb_msg)) ? (size_t)n : 0;
 }
 
-static void ha_arm_deadline(void) {
+int cbm_hook_augment_deadline_ms_for_testing(void) {
+    return ha_deadline_ms();
+}
+
+void cbm_hook_augment_arm_deadline(void) {
     int ms = ha_deadline_ms();
     ha_open_crumb_log(ms);
 
@@ -145,7 +155,7 @@ static VOID CALLBACK ha_deadline_exit_windows(PVOID context, BOOLEAN fired) {
     ExitProcess(0U);
 }
 
-static void ha_arm_deadline(void) {
+void cbm_hook_augment_arm_deadline(void) {
     HANDLE timer = NULL;
     (void)CreateTimerQueueTimer(&timer, NULL, ha_deadline_exit_windows, NULL, HA_DEADLINE_MS, 0U,
                                 WT_EXECUTEONLYONCE);
@@ -154,7 +164,22 @@ static void ha_arm_deadline(void) {
 
 /* ── stdin ────────────────────────────────────────────────────────── */
 
-static char *ha_read_stdin(void) {
+/* main() reads stdin EARLY on the hook-client path so the no-op gate can run
+ * before executable-identity hashing; the consumed bytes are handed back here
+ * so every downstream reader sees them exactly once. */
+static char *g_ha_prefetched_stdin = NULL;
+
+void cbm_hook_augment_prefetch_stdin(char *owned) {
+    free(g_ha_prefetched_stdin);
+    g_ha_prefetched_stdin = owned;
+}
+
+char *cbm_hook_augment_read_stdin(void) {
+    if (g_ha_prefetched_stdin) {
+        char *out = g_ha_prefetched_stdin;
+        g_ha_prefetched_stdin = NULL;
+        return out;
+    }
     char *buf = malloc(HA_STDIN_CAP + 1);
     if (!buf) {
         return NULL;
@@ -368,9 +393,23 @@ static char *ha_format_context(const char *envelope, const char *token, bool *is
         yyjson_doc_free(edoc);
         return NULL;
     }
+    /* json-tree shape: {total, cols, groups:[{qn_prefix, file,
+     * rows:[[name,label,lines,in,out],...]}]}. The full qualified name is
+     * qn_prefix + "." + row[0]; label is row[1]; file lives on the group. */
     yyjson_val *iroot = yyjson_doc_get_root(idoc);
-    yyjson_val *results = yyjson_obj_get(iroot, "results");
-    size_t nres = (results && yyjson_is_arr(results)) ? yyjson_arr_size(results) : 0;
+    yyjson_val *groups = yyjson_obj_get(iroot, "groups");
+    size_t nres = 0;
+    size_t gidx;
+    size_t gmax;
+    yyjson_val *g;
+    if (groups && yyjson_is_arr(groups)) {
+        yyjson_arr_foreach(groups, gidx, gmax, g) {
+            yyjson_val *rows = yyjson_obj_get(g, "rows");
+            if (rows && yyjson_is_arr(rows)) {
+                nres += yyjson_arr_size(rows);
+            }
+        }
+    }
     if (nres == 0) {
         yyjson_doc_free(idoc);
         yyjson_doc_free(edoc);
@@ -389,26 +428,37 @@ static char *ha_format_context(const char *envelope, const char *token, bool *is
                        "(structured context; your search results below are "
                        "unaffected):",
                        nres, token);
-    size_t idx;
-    size_t maxn;
-    yyjson_val *r;
-    yyjson_arr_foreach(results, idx, maxn, r) {
-        if (off < 0 || off >= 3900) {
-            break;
+    yyjson_arr_foreach(groups, gidx, gmax, g) {
+        const char *prefix = ha_obj_str(g, "qn_prefix");
+        const char *fp = ha_obj_str(g, "file");
+        yyjson_val *rows = yyjson_obj_get(g, "rows");
+        if (!rows || !yyjson_is_arr(rows)) {
+            continue;
         }
-        const char *qn = ha_obj_str(r, "qualified_name");
-        const char *nm = ha_obj_str(r, "name");
-        const char *fp = ha_obj_str(r, "file_path");
-        const char *lb = ha_obj_str(r, "label");
-        const char *disp = (qn && qn[0]) ? qn : (nm ? nm : "");
-        char safe_disp[HA_METADATA_CAP];
-        char safe_path[HA_METADATA_CAP];
-        char safe_label[HA_METADATA_CAP];
-        ha_sanitize_metadata(disp, safe_disp, sizeof(safe_disp));
-        ha_sanitize_metadata(fp, safe_path, sizeof(safe_path));
-        ha_sanitize_metadata(lb, safe_label, sizeof(safe_label));
-        off += snprintf(text + off, (size_t)(4096 - off), "\n- %s  %s%s%s", safe_disp, safe_path,
-                        safe_label[0] ? "  " : "", safe_label);
+        size_t ridx;
+        size_t rmax;
+        yyjson_val *row;
+        yyjson_arr_foreach(rows, ridx, rmax, row) {
+            if (off < 0 || off >= 3900) {
+                break;
+            }
+            const char *nm = yyjson_get_str(yyjson_arr_get(row, 0));
+            const char *lb = yyjson_get_str(yyjson_arr_get(row, 1));
+            char disp[HA_METADATA_CAP];
+            if (prefix && prefix[0] && nm && nm[0]) {
+                snprintf(disp, sizeof(disp), "%s.%s", prefix, nm);
+            } else {
+                snprintf(disp, sizeof(disp), "%s", nm ? nm : "");
+            }
+            char safe_disp[HA_METADATA_CAP];
+            char safe_path[HA_METADATA_CAP];
+            char safe_label[HA_METADATA_CAP];
+            ha_sanitize_metadata(disp, safe_disp, sizeof(safe_disp));
+            ha_sanitize_metadata(fp, safe_path, sizeof(safe_path));
+            ha_sanitize_metadata(lb, safe_label, sizeof(safe_label));
+            off += snprintf(text + off, (size_t)(4096 - off), "\n- %s  %s%s%s", safe_disp,
+                            safe_path, safe_label[0] ? "  " : "", safe_label);
+        }
     }
 
     yyjson_doc_free(idoc);
@@ -463,11 +513,45 @@ static char *ha_coverage_context(const char *envelope, const char *rel, bool *is
         strcmp(status, "invalid_path") != 0) {
         const char *kind = NULL;
         const char *detail = NULL;
+        char *range_detail = NULL;
         yyjson_val *coverage = yyjson_obj_get(item, "coverage");
         yyjson_val *row = coverage && yyjson_is_arr(coverage) ? yyjson_arr_get(coverage, 0) : NULL;
         if (row) {
             kind = ha_obj_str(row, "kind");
             detail = ha_obj_str(row, "detail");
+            yyjson_val *ranges = yyjson_obj_get(row, "ranges");
+            size_t range_count = ranges && yyjson_is_arr(ranges) ? yyjson_arr_size(ranges) : 0;
+            if ((!detail || !detail[0]) && range_count > 0 && range_count <= SIZE_MAX / 48U) {
+                range_detail = calloc(range_count * 48U + 1U, 1U);
+                if (range_detail) {
+                    size_t used = 0;
+                    size_t index;
+                    size_t maximum;
+                    yyjson_val *range;
+                    yyjson_arr_foreach(ranges, index, maximum, range) {
+                        yyjson_val *start_value = yyjson_obj_get(range, "start");
+                        yyjson_val *end_value = yyjson_obj_get(range, "end");
+                        if (!yyjson_is_int(start_value) || !yyjson_is_int(end_value)) {
+                            continue;
+                        }
+                        long long start = (long long)yyjson_get_sint(start_value);
+                        long long end = (long long)yyjson_get_sint(end_value);
+                        int written =
+                            start == end
+                                ? snprintf(range_detail + used, range_count * 48U + 1U - used,
+                                           "%s%lld", used ? "," : "", start)
+                                : snprintf(range_detail + used, range_count * 48U + 1U - used,
+                                           "%s%lld-%lld", used ? "," : "", start, end);
+                        if (written < 0 || (size_t)written >= range_count * 48U + 1U - used) {
+                            free(range_detail);
+                            range_detail = NULL;
+                            break;
+                        }
+                        used += (size_t)written;
+                    }
+                    detail = range_detail;
+                }
+            }
         }
         text = malloc(1536);
         if (text) {
@@ -494,6 +578,7 @@ static char *ha_coverage_context(const char *envelope, const char *rel, bool *is
                          status, freshness ? freshness : "unavailable");
             }
         }
+        free(range_detail);
     }
     yyjson_doc_free(idoc);
     yyjson_doc_free(edoc);
@@ -563,6 +648,7 @@ static char *ha_resolve_coverage(cbm_mcp_server_t *srv, const char *file_path) {
     yyjson_mut_obj_add_str(adoc, aroot, "project", project);
     yyjson_mut_arr_add_strcpy(adoc, paths, rel);
     yyjson_mut_obj_add_val(adoc, aroot, "paths", paths);
+    yyjson_mut_obj_add_str(adoc, aroot, "format", "json");
     char *args = yyjson_mut_write(adoc, 0, NULL);
     yyjson_mut_doc_free(adoc);
     free(project);
@@ -644,15 +730,6 @@ static char *ha_build_cline_json(const char *text) {
     char *json = yyjson_mut_write(doc, 0, NULL);
     yyjson_mut_doc_free(doc);
     return json;
-}
-
-/* Emit one context-only hook response. Never add decisions or tool rewrites. */
-static void ha_emit(const char *event, const char *text) {
-    char *json = event && text ? ha_build_event_json(event, text) : NULL;
-    if (json) {
-        fputs(json, stdout);
-        free(json);
-    }
 }
 
 /* True for an absolute path we can walk up: POSIX "/..." or a Windows drive
@@ -772,53 +849,108 @@ static char *ha_registry_project_for_path(cbm_mcp_server_t *srv, const char *cwd
     if (!ha_canonical_path(cwd, canonical_cwd, sizeof(canonical_cwd))) {
         return NULL;
     }
-    char *envelope = cbm_mcp_handle_tool(srv, "list_projects", "{\"metadata_only\":true}");
-    yyjson_doc *doc = envelope ? yyjson_read(envelope, strlen(envelope), 0) : NULL;
-    free(envelope);
-    if (!doc) {
-        return NULL;
-    }
-    yyjson_val *outer = yyjson_doc_get_root(doc);
-    yyjson_val *error = yyjson_obj_get(outer, "isError");
-    yyjson_val *structured = yyjson_obj_get(outer, "structuredContent");
-    yyjson_val *projects = structured ? yyjson_obj_get(structured, "projects") : NULL;
-    if ((error && yyjson_is_true(error)) || !projects || !yyjson_is_arr(projects)) {
-        yyjson_doc_free(doc);
-        return NULL;
-    }
-
-    const char *best_name = NULL;
+    char *best_name = NULL;
     char best_root[4096] = {0};
     size_t best_length = 0U;
-    size_t index;
-    size_t maximum;
-    yyjson_val *project;
-    yyjson_arr_foreach(projects, index, maximum, project) {
-        const char *name = ha_obj_str(project, "name");
-        const char *root = ha_obj_str(project, "root_path");
-        char canonical_root[4096];
-        if (!name || !name[0] || !root || !root[0] ||
-            !ha_canonical_path(root, canonical_root, sizeof(canonical_root)) ||
-            !ha_path_contains(canonical_root, canonical_cwd)) {
-            continue;
+    int64_t offset = 0;
+    bool complete = false;
+
+    for (;;) {
+        char args[160];
+        int written = snprintf(args, sizeof(args),
+                               "{\"metadata_only\":true,\"format\":\"json\",\"limit\":%d,"
+                               "\"offset\":%lld}",
+                               HA_LIST_PAGE_LIMIT, (long long)offset);
+        if (written < 0 || (size_t)written >= sizeof(args)) {
+            break;
         }
-        size_t length = strlen(canonical_root);
-        if (length > best_length) {
-            best_name = name;
-            best_length = length;
-            snprintf(best_root, sizeof(best_root), "%s", canonical_root);
+        char *envelope = cbm_mcp_handle_tool(srv, "list_projects", args);
+        yyjson_doc *edoc = envelope ? yyjson_read(envelope, strlen(envelope), 0) : NULL;
+        free(envelope);
+        if (!edoc) {
+            break;
         }
+        yyjson_val *outer = yyjson_doc_get_root(edoc);
+        yyjson_val *error = yyjson_obj_get(outer, "isError");
+        yyjson_val *content = yyjson_obj_get(outer, "content");
+        yyjson_val *item0 = content && yyjson_is_arr(content) ? yyjson_arr_get(content, 0) : NULL;
+        const char *inner = ha_obj_str(item0, "text");
+        yyjson_doc *idoc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+        if ((error && yyjson_is_true(error)) || !idoc) {
+            if (idoc) {
+                yyjson_doc_free(idoc);
+            }
+            yyjson_doc_free(edoc);
+            break;
+        }
+        yyjson_val *root = yyjson_doc_get_root(idoc);
+        yyjson_val *projects = yyjson_obj_get(root, "projects");
+        if (!projects || !yyjson_is_arr(projects)) {
+            yyjson_doc_free(idoc);
+            yyjson_doc_free(edoc);
+            break;
+        }
+
+        size_t index;
+        size_t maximum;
+        yyjson_val *project;
+        yyjson_arr_foreach(projects, index, maximum, project) {
+            const char *name = ha_obj_str(project, "name");
+            const char *project_root = ha_obj_str(project, "root_path");
+            char canonical_root[4096];
+            if (!name || !name[0] || !project_root || !project_root[0] ||
+                !ha_canonical_path(project_root, canonical_root, sizeof(canonical_root)) ||
+                !ha_path_contains(canonical_root, canonical_cwd)) {
+                continue;
+            }
+            size_t length = strlen(canonical_root);
+            if (length > best_length) {
+                char *candidate = strdup(name);
+                if (!candidate) {
+                    continue;
+                }
+                free(best_name);
+                best_name = candidate;
+                best_length = length;
+                snprintf(best_root, sizeof(best_root), "%s", canonical_root);
+            }
+        }
+
+        yyjson_val *has_more = yyjson_obj_get(root, "has_more");
+        if (!has_more || !yyjson_is_bool(has_more)) {
+            yyjson_doc_free(idoc);
+            yyjson_doc_free(edoc);
+            break;
+        }
+        bool more = yyjson_is_true(has_more);
+        if (!more) {
+            complete = true;
+            yyjson_doc_free(idoc);
+            yyjson_doc_free(edoc);
+            break;
+        }
+        yyjson_val *next = yyjson_obj_get(root, "next_offset");
+        int64_t next_offset = next && yyjson_is_int(next) ? yyjson_get_int(next) : -1;
+        yyjson_doc_free(idoc);
+        yyjson_doc_free(edoc);
+        if (next_offset <= offset) {
+            break;
+        }
+        offset = next_offset;
     }
-    char *result = best_name ? strdup(best_name) : NULL;
-    if (result && root_out && root_out_size > 0U) {
+
+    if (!complete) {
+        free(best_name);
+        return NULL;
+    }
+    if (best_name && root_out && root_out_size > 0U) {
         int written = snprintf(root_out, root_out_size, "%s", best_root);
         if (written < 0 || (size_t)written >= root_out_size) {
-            free(result);
-            result = NULL;
+            free(best_name);
+            best_name = NULL;
         }
     }
-    yyjson_doc_free(doc);
-    return result;
+    return best_name;
 }
 
 /* Return the nearest indexed graph project for cwd. Probe derived names first
@@ -839,6 +971,7 @@ static char *ha_resolve_indexed_project_with_root(cbm_mcp_server_t *srv, const c
             if (doc && root) {
                 yyjson_mut_doc_set_root(doc, root);
                 yyjson_mut_obj_add_str(doc, root, "project", project);
+                yyjson_mut_obj_add_str(doc, root, "format", "json");
                 char *args = yyjson_mut_write(doc, 0, NULL);
                 yyjson_mut_doc_free(doc);
                 if (args) {
@@ -876,7 +1009,8 @@ static const char *ha_hook_event_name(yyjson_val *root) {
     return event ? event : ha_obj_str(root, "hookEventName");
 }
 
-static const char *ha_normalized_cwd(yyjson_val *root, char *buffer, size_t buffer_size) {
+static const char *ha_normalized_cwd_with_server(yyjson_val *root, cbm_mcp_server_t *srv,
+                                                 char *buffer, size_t buffer_size) {
     const char *cwd = ha_obj_str(root, "cwd");
     if (!cwd) {
         yyjson_val *roots = root ? yyjson_obj_get(root, "workspace_roots") : NULL;
@@ -897,11 +1031,27 @@ static const char *ha_normalized_cwd(yyjson_val *root, char *buffer, size_t buff
             return buffer;
         }
     }
+    const char *session_root = srv ? cbm_mcp_server_session_root(srv) : NULL;
+    if (session_root && strlen(session_root) < buffer_size) {
+        snprintf(buffer, buffer_size, "%s", session_root);
+        for (char *cursor = buffer; *cursor; cursor++) {
+            if (*cursor == '\\') {
+                *cursor = '/';
+            }
+        }
+        if (cbm_hook_path_is_abs(buffer)) {
+            return buffer;
+        }
+    }
 #ifndef _WIN32
     return getcwd(buffer, buffer_size) && cbm_hook_path_is_abs(buffer) ? buffer : NULL;
 #else
     return _getcwd(buffer, (int)buffer_size) && cbm_hook_path_is_abs(buffer) ? buffer : NULL;
 #endif
+}
+
+static const char *ha_normalized_cwd(yyjson_val *root, char *buffer, size_t buffer_size) {
+    return ha_normalized_cwd_with_server(root, NULL, buffer, buffer_size);
 }
 
 static bool ha_lifecycle_event_supported(const char *event) {
@@ -982,6 +1132,206 @@ static bool ha_dialect_event_supported(ha_lifecycle_dialect_t dialect, const cha
     return ha_lifecycle_event_supported(event);
 }
 
+/* ── Bash search-command pattern extractor ────────────────────────────────
+ * Tokenises and walks a Bash tool command to extract a search pattern for
+ * graph augmentation.  Returns true and fills out when one clear pattern is
+ * found; false on unrecognised binary, -f pattern-file, multiple -e, or any
+ * other ambiguity.  Never executes or rewrites the command. */
+
+#define HA_BASH_TOK_MAX 32
+#define HA_BASH_TOK_SZ 256
+
+static int ha_tokenize(const char *cmd, char toks[][HA_BASH_TOK_SZ], int max) {
+    int n = 0;
+    const char *p = cmd;
+    while (*p && n < max) {
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        if (!*p)
+            break;
+        char *d = toks[n];
+        int dlen = 0;
+        while (*p && !isspace((unsigned char)*p)) {
+            if (*p == '\'') {
+                for (p++; *p && *p != '\''; p++)
+                    if (dlen < HA_BASH_TOK_SZ - 1)
+                        d[dlen++] = *p;
+                if (*p == '\'')
+                    p++;
+            } else if (*p == '"') {
+                for (p++; *p && *p != '"'; p++) {
+                    if (*p == '\\' && p[1] && strchr("\\\"$`", p[1]))
+                        p++;
+                    if (dlen < HA_BASH_TOK_SZ - 1)
+                        d[dlen++] = *p;
+                }
+                if (*p == '"')
+                    p++;
+            } else if (*p == '\\' && p[1]) {
+                p++;
+                if (dlen < HA_BASH_TOK_SZ - 1)
+                    d[dlen++] = *p++;
+            } else {
+                if (dlen < HA_BASH_TOK_SZ - 1)
+                    d[dlen++] = *p++;
+            }
+        }
+        d[dlen] = '\0';
+        if (dlen > 0)
+            n++;
+    }
+    return n;
+}
+
+static bool ha_is_env_assign(const char *t) {
+    if (!t || !t[0])
+        return false;
+    if (!isalpha((unsigned char)t[0]) && t[0] != '_')
+        return false;
+    const char *p = t + 1;
+    while (isalnum((unsigned char)*p) || *p == '_')
+        p++;
+    return *p == '=';
+}
+
+typedef enum { HA_BIN_GREP, HA_BIN_RG, HA_BIN_AG, HA_BIN_ACK, HA_BIN_UGREP } ha_bin_t;
+
+static const char *ha_search_bin_val_flags(ha_bin_t bin) {
+    switch (bin) {
+    case HA_BIN_RG:
+        return "ABCmtTgMP";
+    case HA_BIN_AG:
+        return "ABCmpG";
+    default:
+        return "ABCmdD";
+    }
+}
+
+static bool ha_parse_bash_search_pattern(const char *cmd, char *out, size_t out_sz) {
+    if (!cmd || !out || out_sz == 0)
+        return false;
+    char toks[HA_BASH_TOK_MAX][HA_BASH_TOK_SZ];
+    int n = ha_tokenize(cmd, toks, HA_BASH_TOK_MAX);
+    if (n == 0)
+        return false;
+
+    int i = 0;
+    while (i < n && ha_is_env_assign(toks[i]))
+        i++;
+    if (i >= n)
+        return false;
+
+    bool rtk = false;
+    for (;;) {
+        const char *t = toks[i];
+        if (strcmp(t, "env") == 0 || strcmp(t, "nice") == 0 || strcmp(t, "time") == 0 ||
+            strcmp(t, "command") == 0) {
+            i++;
+        } else if (strcmp(t, "rtk") == 0) {
+            rtk = true;
+            i++;
+        } else if (strcmp(t, "tokf") == 0 && i + 1 < n && strcmp(toks[i + 1], "run") == 0) {
+            i += 2;
+        } else {
+            break;
+        }
+        while (i < n && ha_is_env_assign(toks[i]))
+            i++;
+        if (i >= n)
+            return false;
+    }
+
+    const char *bin_tok = toks[i++];
+    ha_bin_t bin;
+
+    if (strcmp(bin_tok, "grep") == 0 || strcmp(bin_tok, "egrep") == 0 ||
+        strcmp(bin_tok, "fgrep") == 0) {
+        bin = HA_BIN_GREP;
+    } else if (strcmp(bin_tok, "rg") == 0) {
+        bin = HA_BIN_RG;
+    } else if (strcmp(bin_tok, "ag") == 0) {
+        bin = HA_BIN_AG;
+    } else if (strcmp(bin_tok, "ack") == 0) {
+        bin = HA_BIN_ACK;
+    } else if (strcmp(bin_tok, "ugrep") == 0 || strcmp(bin_tok, "ug") == 0) {
+        bin = HA_BIN_UGREP;
+    } else if (strcmp(bin_tok, "git") == 0) {
+        if (i >= n || strcmp(toks[i], "grep") != 0)
+            return false;
+        i++;
+        bin = HA_BIN_GREP;
+    } else {
+        return false;
+    }
+
+    const char *val_flags = ha_search_bin_val_flags(bin);
+    const char *pattern = NULL;
+    int e_count = 0;
+    bool end_of_flags = false;
+
+    for (; i < n; i++) {
+        const char *t = toks[i];
+
+        if (end_of_flags || t[0] != '-' || t[1] == '\0') {
+            if (!pattern)
+                pattern = t;
+            else
+                break;
+            continue;
+        }
+
+        if (t[1] == '-') {
+            if (t[2] == '\0') {
+                end_of_flags = true;
+                continue;
+            }
+            const char *name = t + 2;
+            const char *eq = strchr(name, '=');
+            size_t nlen = eq ? (size_t)(eq - name) : strlen(name);
+            if ((nlen == 6 && strncmp(name, "regexp", 6) == 0) ||
+                (nlen == 7 && strncmp(name, "pattern", 7) == 0)) {
+                pattern = eq ? eq + 1 : (i + 1 < n ? toks[++i] : NULL);
+                e_count++;
+            } else if (nlen == 4 && strncmp(name, "file", 4) == 0) {
+                return false;
+            }
+            continue;
+        }
+
+        const char *f = t + 1;
+        bool consumed_next = false;
+        while (*f) {
+            char flag = *f++;
+            if (flag == 'e') {
+                if (*f) {
+                    pattern = f;
+                    f += strlen(f);
+                } else if (!consumed_next && i + 1 < n) {
+                    pattern = toks[++i];
+                    consumed_next = true;
+                }
+                e_count++;
+            } else if (flag == 'f') {
+                return false;
+            } else if (rtk && bin == HA_BIN_GREP && flag == 'l') {
+                return false;
+            } else if (strchr(val_flags, flag)) {
+                if (*f) {
+                    f += strlen(f);
+                } else if (!consumed_next && i + 1 < n) {
+                    i++;
+                    consumed_next = true;
+                }
+            }
+        }
+    }
+
+    if (e_count > 1 || !pattern || !pattern[0])
+        return false;
+    int w = snprintf(out, out_sz, "%s", pattern);
+    return w > 0 && (size_t)w < out_sz;
+}
+
 static bool ha_tool_event_supported(ha_lifecycle_dialect_t dialect, const char *event,
                                     const char *tool, bool *coverage) {
     if (coverage) {
@@ -992,7 +1342,7 @@ static bool ha_tool_event_supported(ha_lifecycle_dialect_t dialect, const char *
     }
     if (dialect == HA_DIALECT_EVENT) {
         if (strcmp(event, "PreToolUse") == 0 &&
-            (strcmp(tool, "Grep") == 0 || strcmp(tool, "Glob") == 0)) {
+            (strcmp(tool, "Grep") == 0 || strcmp(tool, "Glob") == 0 || strcmp(tool, "Bash") == 0)) {
             return true;
         }
         if (strcmp(event, "PostToolUse") == 0 && strcmp(tool, "Read") == 0) {
@@ -1104,8 +1454,8 @@ static bool ha_invocation_supported(ha_lifecycle_dialect_t dialect, const char *
     return !forced_event || ha_dialect_event_supported(dialect, forced_event);
 }
 
-static char *ha_lifecycle_json_from_root(yyjson_val *root, const char *forced_event,
-                                         ha_lifecycle_dialect_t dialect) {
+static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root,
+                                         const char *forced_event, ha_lifecycle_dialect_t dialect) {
     if (!root || !yyjson_is_obj(root)) {
         return NULL;
     }
@@ -1115,12 +1465,14 @@ static char *ha_lifecycle_json_from_root(yyjson_val *root, const char *forced_ev
     }
 
     char cwd_buffer[4096];
-    const char *cwd = ha_normalized_cwd(root, cwd_buffer, sizeof(cwd_buffer));
-    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
-    char *project = server && cwd ? ha_resolve_indexed_project(server, cwd) : NULL;
-    if (server) {
-        cbm_mcp_server_free(server);
+    cbm_mcp_server_t *owned_server = NULL;
+    if (!srv) {
+        owned_server = cbm_mcp_server_new(NULL);
+        srv = owned_server;
     }
+    const char *cwd = ha_normalized_cwd_with_server(root, srv, cwd_buffer, sizeof(cwd_buffer));
+    char *project = srv && cwd ? ha_resolve_indexed_project(srv, cwd) : NULL;
+    cbm_mcp_server_free(owned_server);
 
     char context[2048];
     const char *scope = "Session";
@@ -1198,7 +1550,7 @@ char *cbm_hook_augment_lifecycle_json_for(const char *input, const char *forced_
         return NULL;
     }
     ha_lifecycle_dialect_t dialect = copilot_dialect ? HA_DIALECT_COPILOT : HA_DIALECT_EVENT;
-    char *json = ha_lifecycle_json_from_root(yyjson_doc_get_root(doc), forced_event, dialect);
+    char *json = ha_lifecycle_json_from_root(NULL, yyjson_doc_get_root(doc), forced_event, dialect);
     yyjson_doc_free(doc);
     return json;
 }
@@ -1217,9 +1569,18 @@ char *cbm_hook_augment_lifecycle_json_for_dialect(const char *input, const char 
     if (!doc) {
         return NULL;
     }
-    char *json = ha_lifecycle_json_from_root(yyjson_doc_get_root(doc), forced_event, dialect);
+    char *json = ha_lifecycle_json_from_root(NULL, yyjson_doc_get_root(doc), forced_event, dialect);
     yyjson_doc_free(doc);
     return json;
+}
+
+/* Test seam: run the real envelope->additionalContext formatter. Couples the
+ * test suite to the ACTUAL search_graph response shape — a format change that
+ * breaks this parser breaks a test locally, not just the Windows CI guard. */
+char *cbm_hook_augment_format_context_for_testing(const char *envelope, const char *token,
+                                                  bool *is_error) {
+    bool dummy = false;
+    return ha_format_context(envelope, token, is_error ? is_error : &dummy);
 }
 
 char *cbm_hook_augment_tool_json_for_testing(const char *input, const char *dialect_name,
@@ -1266,10 +1627,149 @@ bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event) {
     return ha_no_project_index_guidance(event);
 }
+
+bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out, size_t out_sz) {
+    return ha_parse_bash_search_pattern(cmd, out, out_sz);
+}
 #endif
 
+static char *ha_process(cbm_mcp_server_t *srv, const char *input_json, const char *forced_event,
+                        ha_lifecycle_dialect_t dialect) {
+    if (!srv || !input_json) {
+        return NULL;
+    }
+    if (strlen(input_json) > HA_STDIN_CAP) {
+        return NULL;
+    }
+    yyjson_doc *doc = yyjson_read(input_json, strlen(input_json), 0);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+
+    char *lifecycle = ha_lifecycle_json_from_root(srv, root, forced_event, dialect);
+    if (lifecycle) {
+        yyjson_doc_free(doc);
+        return lifecycle;
+    }
+    const char *event = ha_hook_event_name(root);
+    const char *tool = ha_obj_str(root, "tool_name");
+    bool coverage = false;
+    if (!ha_tool_event_supported(dialect, event, tool, &coverage)) {
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+
+    yyjson_val *tin = yyjson_obj_get(root, "tool_input");
+
+    /* Post-read coverage adapters warn only when the exact path is not fully
+     * represented. They never block or rewrite the completed tool call. */
+    if (coverage) {
+        char fpbuf[4096];
+        if (ha_normalized_tool_path(root, tin, fpbuf, sizeof(fpbuf))) {
+            char *note = ha_resolve_coverage(srv, fpbuf);
+            if (note) {
+                char *output = ha_build_event_json(event, note);
+                free(note);
+                yyjson_doc_free(doc);
+                return output;
+            }
+        }
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+
+    char bash_pattern[HA_BASH_TOK_SZ];
+    const char *pattern;
+    if (strcmp(tool, "Bash") == 0) {
+        const char *cmd = ha_obj_str(tin, "command");
+        if (!ha_parse_bash_search_pattern(cmd, bash_pattern, sizeof(bash_pattern))) {
+            yyjson_doc_free(doc);
+            return NULL;
+        }
+        pattern = bash_pattern;
+    } else {
+        pattern = ha_obj_str(tin, "pattern");
+    }
+    char token[HA_MAX_TOKEN + 1];
+    if (!ha_extract_token(pattern, token, sizeof(token))) {
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+
+    char cwdbuf[4096];
+    const char *cwd = ha_normalized_cwd_with_server(root, srv, cwdbuf, sizeof(cwdbuf));
+    if (!cwd) {
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+
+    char *ctx = ha_resolve_and_query(srv, cwd, token);
+    char *output = ctx ? ha_build_event_json(event, ctx) : NULL;
+    free(ctx);
+    yyjson_doc_free(doc);
+    return output;
+}
+
+char *cbm_hook_augment_process(cbm_mcp_server_t *srv, const char *input_json) {
+    return cbm_hook_augment_process_for(srv, input_json, NULL, NULL);
+}
+
+bool cbm_hook_augment_invocation_supported(const char *forced_event, const char *dialect_name) {
+    ha_lifecycle_dialect_t dialect = HA_DIALECT_EVENT;
+    if (dialect_name && dialect_name[0] && !ha_dialect_from_name(dialect_name, &dialect)) {
+        return false;
+    }
+    return ha_invocation_supported(dialect, forced_event);
+}
+
+char *cbm_hook_augment_process_for(cbm_mcp_server_t *srv, const char *input_json,
+                                   const char *forced_event, const char *dialect_name) {
+    ha_lifecycle_dialect_t dialect = HA_DIALECT_EVENT;
+    if (!srv || !input_json ||
+        (dialect_name && dialect_name[0] && !ha_dialect_from_name(dialect_name, &dialect)) ||
+        !ha_invocation_supported(dialect, forced_event)) {
+        return NULL;
+    }
+    return ha_process(srv, input_json, forced_event, dialect);
+}
+
+/* TRUE iff `input` is an un-forced PreToolUse Bash event whose command can
+ * never produce augmentation output: not a recognised search, or no queryable
+ * token. Pure string work — safe to run BEFORE executable-identity hashing,
+ * cohort admission, or any daemon contact, which is the point: agents issue
+ * far more Bash calls than Grep/Glob and nearly all are not searches, while
+ * the identity hash alone costs ~1.1 s of user CPU per invocation on a
+ * production binary (measured 2026-08-28). Uses the exact parser pair
+ * ha_process uses, so the gate and the augmenter cannot disagree about what
+ * counts as a search. Anything uncertain returns false and pays full fare:
+ * lifecycle events, other tools, coverage adapters, oversized stdin. */
+bool cbm_hook_augment_input_is_noop_bash(const char *input) {
+    if (!input || strlen(input) > HA_STDIN_CAP) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(input, strlen(input), 0);
+    if (!doc) {
+        return false;
+    }
+    bool noop = false;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    const char *event = ha_hook_event_name(root);
+    const char *tool = ha_obj_str(root, "tool_name");
+    if (event && tool && strcmp(event, "PreToolUse") == 0 && strcmp(tool, "Bash") == 0) {
+        yyjson_val *tin = yyjson_obj_get(root, "tool_input");
+        const char *cmd = ha_obj_str(tin, "command");
+        char pat[HA_BASH_TOK_SZ];
+        char tok[HA_MAX_TOKEN + 1];
+        noop = !ha_parse_bash_search_pattern(cmd, pat, sizeof(pat)) ||
+               !ha_extract_token(pat, tok, sizeof(tok));
+    }
+    yyjson_doc_free(doc);
+    return noop;
+}
+
 int cbm_cmd_hook_augment(int argc, char **argv) {
-    ha_arm_deadline();
+    cbm_hook_augment_arm_deadline();
 
     const char *forced_event = NULL;
     ha_lifecycle_dialect_t dialect = HA_DIALECT_EVENT;
@@ -1289,111 +1789,42 @@ int cbm_cmd_hook_augment(int argc, char **argv) {
         return 0;
     }
 
-    char *input = ha_read_stdin();
+    char *input = cbm_hook_augment_read_stdin();
     if (!input) {
         return 0;
     }
-    yyjson_doc *doc = yyjson_read(input, strlen(input), 0);
-    if (!doc) {
+    if (!forced_event && cbm_hook_augment_input_is_noop_bash(input)) {
         free(input);
         return 0;
     }
-    yyjson_val *root = yyjson_doc_get_root(doc);
-
-    char *lifecycle = ha_lifecycle_json_from_root(root, forced_event, dialect);
-    if (lifecycle) {
-        fputs(lifecycle, stdout);
-        free(lifecycle);
-        yyjson_doc_free(doc);
-        free(input);
-        return 0;
-    }
-    const char *event = ha_hook_event_name(root);
-    const char *tool = ha_obj_str(root, "tool_name");
-    bool coverage = false;
-    if (!ha_tool_event_supported(dialect, event, tool, &coverage)) {
-        yyjson_doc_free(doc);
-        free(input);
-        return 0;
-    }
-
-    yyjson_val *tin = yyjson_obj_get(root, "tool_input");
-
-    /* Post-read coverage adapters warn only when the exact path is not fully
-     * represented. They never block or rewrite the completed tool call. */
-    if (coverage) {
-        char fpbuf[4096];
-        if (ha_normalized_tool_path(root, tin, fpbuf, sizeof(fpbuf))) {
-            cbm_mcp_server_t *rsrv = cbm_mcp_server_new(NULL);
-            if (rsrv) {
-                char *note = ha_resolve_coverage(rsrv, fpbuf);
-                if (note) {
-                    ha_emit(event, note);
-                    free(note);
-                }
-                cbm_mcp_server_free(rsrv);
-            }
-        }
-        yyjson_doc_free(doc);
-        free(input);
-        return 0;
-    }
-
-    const char *pattern = ha_obj_str(tin, "pattern");
-    char token[HA_MAX_TOKEN + 1];
-    if (!ha_extract_token(pattern, token, sizeof(token))) {
-        yyjson_doc_free(doc);
-        free(input);
-        return 0;
-    }
-
-    const char *cwd = ha_obj_str(root, "cwd");
-    char cwdbuf[4096];
-#ifndef _WIN32
-    if (!cwd || !cbm_hook_path_is_abs(cwd)) {
-        if (!getcwd(cwdbuf, sizeof(cwdbuf))) {
-            yyjson_doc_free(doc);
-            free(input);
-            return 0;
-        }
-        cwd = cwdbuf;
-    }
-#else
-    /* Windows: Claude Code passes an absolute drive-letter cwd in the hook
-     * payload (e.g. C:\repo). Normalize '\\' -> '/' and require an absolute
-     * path; the walk-up loop handles POSIX and "X:/..." roots alike. Without
-     * a usable cwd there is nothing to augment — fail open cleanly. */
-    if (cwd) {
-        snprintf(cwdbuf, sizeof(cwdbuf), "%s", cwd);
-        for (char *p = cwdbuf; *p; p++) {
-            if (*p == '\\') {
-                *p = '/';
-            }
-        }
-        cwd = cwdbuf;
-    }
-    if (!cwd || !cbm_hook_path_is_abs(cwd)) {
-        yyjson_doc_free(doc);
-        free(input);
-        return 0;
-    }
-#endif
-
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    if (!srv) {
-        yyjson_doc_free(doc);
-        free(input);
-        return 0;
+    char *output = srv ? ha_process(srv, input, forced_event, dialect) : NULL;
+    if (output) {
+        fputs(output, stdout);
     }
-
-    char *ctx = ha_resolve_and_query(srv, cwd, token);
-    if (ctx) {
-        ha_emit(event, ctx);
-        free(ctx);
-    }
-
+    free(output);
     cbm_mcp_server_free(srv);
-    yyjson_doc_free(doc);
     free(input);
     return 0;
+}
+
+const char *cbm_hook_admission_notice(cbm_hook_admission_t reason, const char *hook_dialect) {
+    /* Only Claude Code (the NULL dialect) consumes a bare stdout JSON object;
+     * emitting it into another dialect's channel would corrupt that protocol. */
+    if (hook_dialect) {
+        return NULL;
+    }
+    switch (reason) {
+    case CBM_HOOK_ADMISSION_DAEMON_ABSENT:
+        return "{\"systemMessage\":\"codebase-memory-mcp: no CBM daemon is running, so graph "
+               "augmentation is currently skipped. Run `codebase-memory-mcp daemon start` (or "
+               "open an MCP session) to enable it.\"}";
+    case CBM_HOOK_ADMISSION_BUILD_CONFLICT:
+        return "{\"systemMessage\":\"codebase-memory-mcp: graph augmentation is skipped: the "
+               "active CBM daemon runs a different build than this binary (usually an update was "
+               "installed while the old daemon kept running). Run `codebase-memory-mcp daemon "
+               "stop`, then retry - the next command starts a matching daemon.\"}";
+    default:
+        return NULL;
+    }
 }

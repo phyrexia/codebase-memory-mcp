@@ -100,11 +100,11 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"perl", "Function:2,Module:1"},
     {"dart", "Class:1,Function:1,Module:1"},
     {"swift", "Class:1,Function:1,Module:1"},
-    {"scala", "Class:1,Function:1,Method:1,Module:1"},
+    {"scala", "Class:1,Method:1,Module:1"},
     {"gdscript", "Function:1,Module:1"},
     {"groovy", "Class:1,Method:1,Module:1"},
     {"zig", "Function:2,Module:1"},
-    {"solidity", "Class:1,Function:1,Method:1,Module:1"},
+    {"solidity", "Class:1,Method:1,Module:1"},
     {"tcl", "Function:2,Module:1"},
     {"powershell", "Function:2,Module:1"},
     {"r", "Function:2,Module:1"},
@@ -141,6 +141,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"racket", "Function:2,Module:1"},
     {"rescript", "Function:2,Module:1"},
     {"scheme", "Function:2,Module:1"},
+    {"chialisp", "Constant:1,Function:1,Macro:1,Module:2"},
     {"slang", "Function:2,Module:1"},
     {"squirrel", "Function:2,Module:1"},
     {"starlark", "Function:2,Module:1"},
@@ -152,6 +153,8 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"lean", "Function:2,Module:1"},
     {"move", "Function:1,Module:1"},
     {"mojo", "Class:1,Function:1,Method:1,Module:1"},
+    {"arkts", "Field:1,Function:1,Method:1,Module:1,Struct:1"},
+    {"plsql", "Class:1,Function:1,Module:1"},
     {"smali", "Class:1,Function:1,Module:1"},
     {"systemverilog", "Class:1,Function:1,Module:1"},
     {"verilog", "Class:1,Module:1"},
@@ -186,7 +189,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"toml", "Class:1,Module:1,Variable:1"},
     {"ini", "Class:1,Module:1,Variable:1"},
     {"csv", "Module:1"},
-    {"sql", "Module:1,Variable:1"},
+    {"sql", "Module:1,Table:1"},
     {"xml", "Class:2,Module:1"},
     {"html", "Module:1"},
     {"css", "Module:1"},
@@ -200,7 +203,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"gn", "Module:1"},
     {"just", "Function:1,Module:1"},
     {"hcl", "Class:1,Module:1"},
-    {"nix", "Module:1"},
+    {"nix", "Module:1,Variable:2"},
     {"gomod", "Module:1"},
     {"gotemplate", "Module:1"},
     {"graphql", "Class:1,Field:1,Module:1"},
@@ -233,8 +236,10 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"liquid", "Module:1"},
     {"blade", "Module:1"},
     {"vue", "Module:1"},
-    {"svelte", "Module:1"},
-    {"astro", "Module:1"},
+    /* Svelte's <script> and Astro's frontmatter fence extract structure like a
+     * standalone script, so each fixture's one declaration is a Variable. */
+    {"svelte", "Module:1,Variable:1"},
+    {"astro", "Module:1,Variable:1"},
     {"templ", "Class:1,Module:1"},
     {"typst", "Module:1"},
     {"mermaid", "Module:1"},
@@ -310,7 +315,7 @@ static int non_module_defs(CBMFileResult *r) {
 static const char *MUST_EXTRACT_DEFS[] = {
     "agda",   "pony",          "move",     "cobol",    "janet",    "pine",  "smali",  "verilog",
     "vhdl",   "systemverilog", "protobuf", "graphql",  "thrift",   "capnp", "smithy", "wit",
-    "prisma", "cmake",         "puppet",   "tablegen", "assembly", "nasm",  NULL};
+    "prisma", "cmake",         "puppet",   "tablegen", "assembly", "nasm",  "plsql",  NULL};
 
 TEST(grammar_code_extracts_defs) {
     int failures = 0;

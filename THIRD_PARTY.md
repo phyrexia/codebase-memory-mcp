@@ -37,7 +37,7 @@ The core runtime headers in `internal/cbm/vendored/common/tree_sitter/`
 
 ## Tree-sitter Grammars
 
-159 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
+160 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
 (generated `parser.c` plus `scanner.c` where applicable, compiled statically).
 Each grammar is the work of its upstream authors and each grammar directory
 contains the upstream `LICENSE` file.
@@ -52,12 +52,38 @@ License summary:
 - `clojure` ([sogaiu/tree-sitter-clojure](https://github.com/sogaiu/tree-sitter-clojure)) is **CC0-1.0**;
   `fennel` is **CC0-1.0**; `jinja2` and `just` are **Apache-2.0**;
   `pine` is **ISC** (declared by its upstream).
-- The grammars authored in-house for this project (`cobol`, `form`, `janet`,
-  `magma`, `protobuf`, `wolfram`) are **MIT** under the project's own license,
-  (c) DeusData. Six further grammars (`assembly`, `cfml`, `cfscript`,
-  `dotenv`, `pine`, `qml`) are self-maintained forks that retain their
-  original upstream authors' licenses — see the manifest for per-grammar
-  provenance.
+- The grammars authored in-house for this project (`chialisp`, `cobol`, `form`,
+  `janet`, `magma`, `protobuf`, `wolfram`) are **MIT** under the project's own
+  license, (c) DeusData. Each ships the repository's own LICENSE, byte-identical
+  to the root copy; they carry no third-party copyright because there is no
+  third party. `chialisp` is a generic s-expression grammar for the Chia
+  smart-coin language, written for this project because no usable public
+  grammar exists; its source and corpus tests live in
+  `tools/tree-sitter-chialisp/`.
+- Seven further grammars (`arkts`, `assembly`, `cfml`,
+  `cfscript`, `dotenv`, `pine`, `qml`) are self-maintained forks that retain
+  their original upstream authors' licenses — see the manifest for per-grammar
+  provenance. `arkts` is a first-party derivative of
+  [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)
+  (MIT, (c) 2017 Max Brunsfeld; on the
+  [tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript)
+  base, MIT, (c) 2014 Max Brunsfeld) with (c) 2026 DeusData ArkTS additions;
+  its grammar source lives in `tools/tree-sitter-arkts/`.
+
+### tree-sitter-plsql
+
+- **Project:** [AndreasMaierDe/tree-sitter-plsql](https://github.com/AndreasMaierDe/tree-sitter-plsql)
+- **License:** MIT
+- **Copyright:** (c) 2022 AndreasMaierDe
+- **Vendored at:** `internal/cbm/vendored/grammars/plsql/`
+- **Pinned commit:** `28aebef209be`
+- **Notes:** Community-maintained grammar for Oracle PL/SQL; not in the
+  nvim-treesitter or Helix registries (`community-niche` in the manifest). No
+  external scanner. One local patch: `parser.c`'s
+  `#include <tree_sitter/parser.h>` is changed to the quoted form used by every
+  other vendored grammar, as documented in
+  `internal/cbm/vendored/grammars/MANIFEST.md`. PL/SQL support was originally
+  contributed in PR #1033 by Oğuz (@ouzsrcm).
 
 ### tree-sitter-objectscript (UDL + routine)
 
@@ -66,7 +92,7 @@ License summary:
 - **Copyright:** (c) 2025 InterSystems Corporation
 - **Vendored at:** `internal/cbm/vendored/grammars/objectscript_udl/`, `internal/cbm/vendored/grammars/objectscript_routine/`
 - **Pinned commit:** `a7ffcdf`
-- **Notes:** InterSystems-maintained grammar for the ObjectScript language (InterSystems IRIS / Caché). Vendor-maintained; not in nvim-treesitter or Helix registries. Each `scanner.c`'s upstream `#include "../../common/scanner.h"` is repointed to a per-directory `objectscript_common.h` (verbatim copy of upstream `common/scanner.h`).
+- **Notes:** InterSystems-maintained grammar for the ObjectScript language (InterSystems IRIS / Caché). Vendor-maintained; not in nvim-treesitter or Helix registries. Each `scanner.c`'s upstream `#include "../../common/scanner.h"` is repointed to a per-directory `objectscript_common.h` copied from upstream `common/scanner.h`; two loop counters in that copy are widened from `uint8_t` to `int` as documented in `internal/cbm/vendored/grammars/MANIFEST.md`.
 
 ## Vendored C/C++ Libraries
 
@@ -82,6 +108,12 @@ License summary:
 | simplecpp | `internal/cbm/vendored/simplecpp/` | 0BSD | [danmar/simplecpp](https://github.com/danmar/simplecpp) |
 | Verstable | `internal/cbm/vendored/verstable/` | MIT | [JacksonAllan/Verstable](https://github.com/JacksonAllan/Verstable) |
 | wyhash | `internal/cbm/vendored/wyhash/` | Unlicense (public domain) | [wangyi-fudan/wyhash](https://github.com/wangyi-fudan/wyhash) |
+
+Local modifications to these libraries are documented next to the
+vendored sources (currently only SQLite: `vendored/sqlite3/PATCHES.md`,
+raising the Unix VFS `MAX_PATHNAME` ceiling from 512 to 4096 to match
+CBM's 4 KiB path support). Patches must be reapplied on every upstream
+refresh and are covered by `scripts/vendored-checksums.txt`.
 
 The graph-UI HTTP server is a first-party implementation
 (`src/ui/httpd.c` + `src/ui/http_server.c`) — no third-party HTTP library

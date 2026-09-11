@@ -62,7 +62,46 @@ TSNode cbm_resolve_c_declarator_name_node(TSNode func_node);
 // C++ conversion-operator's `operator_cast` node (which spans the full
 // "operator bool() const") down to "operator bool". Shared by the defs and
 // unified extractors so the def name and call-scope QN agree.
-char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source);
+// Also strips the surrounding quotes from a Nix quoted attrpath segment, so
+// `"kebab-case" = a: a;` is named kebab-case rather than "kebab-case". Takes the
+// language for that reason; every caller must pass ctx->language.
+char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source, CBMLanguage lang);
+
+// ── Nix attrpath helpers ──
+// A Nix binding's name is a PATH (`a.b.c = …`) whose segments may be quoted or
+// interpolated. Shared by the defs and unified (call-scope) extractors so both
+// derive the same name and the same scope prefix — divergence makes a CALLS edge
+// name a source node that does not exist, and it is dropped at write.
+
+// Strip one matching pair of surrounding double quotes, in place.
+void cbm_nix_strip_attr_quotes(char *text);
+
+// True when an attrpath segment contains a `${...}` interpolation and therefore
+// has no statically knowable name.
+bool cbm_nix_attr_is_interpolated(TSNode attr);
+
+// The leaf segment of an attrpath — the name. Null node for an empty attrpath.
+TSNode cbm_nix_attrpath_last_attr(TSNode attrpath);
+
+// The scope prefix of an attrpath: all segments but the leaf, quote-stripped and
+// dot-joined, so `a.b.fn = …` qualifies identically to `a = { b = { fn = …; }; }`.
+// NULL for a single-segment path, or when a leading segment is interpolated.
+const char *cbm_nix_attrpath_scope(CBMArena *a, TSNode attrpath, const char *source);
+
+// True when a Nix `binding`'s value is an attribute set — the binding names a
+// scope rather than defining a value. Excludes let-bindings and lambda values.
+bool cbm_nix_binding_is_attrset_scope(TSNode node);
+
+// The scope QN contributed by a Nix `binding` whose value is an attribute set.
+// Called by BOTH extract_defs.c and extract_unified.c, which carry separate
+// compute_class_qn implementations — sharing this makes a def/call-scope QN
+// mismatch (which silently drops the CALLS edge) structurally impossible.
+const char *cbm_nix_binding_scope_qn(CBMExtractCtx *ctx, TSNode node, const char *saved_enclosing);
+
+// The QN-relative name of a Nix binding — its attrpath scope joined to `name`.
+// Callers prepend the enclosing attrset scope (or the module QN), so a dotted
+// attrpath and an enclosing attrset compose into one qualified name.
+const char *cbm_nix_qn_name(CBMArena *a, TSNode func_node, const char *source, const char *name);
 
 // Resolve a function/method definition node's NAME node across all ~130 grammars
 // (generic `name` field, arrow→declarator, C/C++ declarator chain, plus the many
@@ -83,8 +122,43 @@ char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *sou
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 
+/* --- Lisp-family shared gates ---------------------------------------------
+ * The defs, calls and unified extractors each walk the same generic `list`
+ * node and must agree on what it means. The predicates below therefore live
+ * here rather than being copied per translation unit: a private copy in each
+ * drifts, and the drift is silent — defs and call-scope simply stop describing
+ * the same tree.
+ */
+
+/* True when any ancestor list of `node` is headed by a quote symbol
+ * (`q` / `quote` / `qq`) — its contents are DATA, not code, so no def and no
+ * call may be minted from them. Bounded ancestor walk; the arena is used only
+ * for the head-text reads. */
+bool cbm_lisp_node_in_quote(CBMArena *a, TSNode node, const char *source);
+
+/* The `want`-th named child of `node`, skipping `comment` nodes. Comments are
+ * named in the s-expression grammars and so occupy named-child indices: a
+ * comment between a def head and its name shifts every later index by one.
+ * Definition extraction and call-scope attribution MUST use this same skipping
+ * rule or they desynchronise on exactly the files that carry doc comments. */
+TSNode cbm_lisp_named_child_skip_comments(TSNode node, uint32_t want);
+
+/* True for a Chialisp definition-form head. Deliberately separate from the
+ * Clojure/Scheme def-head set: Chialisp shares the generic `list` kind, and
+ * treating `mod`/`defconstant` as defs must not leak into the other lisps (in
+ * Scheme `(mod x y)` is a call). Excludes the expression-local binding forms
+ * (`let`, `assign`, `lambda`), which would fragment call attribution, and
+ * excludes `export`/`namespace`, which NAME an already-defined function rather
+ * than defining one. */
+bool cbm_chialisp_is_def_head(const char *t);
+
 // Check if node kind matches a set of types (NULL-terminated array of strings).
 bool cbm_kind_in_set(TSNode node, const char **types);
+
+/* Namespace/module declarations that extend a qualified-name scope without
+ * turning their children into class methods. Shared by definition and unified
+ * walks so TS/TSX scope attribution cannot drift. */
+bool cbm_is_namespace_scope_kind(CBMLanguage lang, const char *kind);
 
 // Free the calling thread's cbm_kind_in_set bitset cache (call at thread/process
 // teardown so the thread-local cache is not reported as a leak).
@@ -148,5 +222,11 @@ char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *
 
 // Folder QN: project.dir_parts
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir);
+
+/* Flatten a JS/TS `template_string` node into plain text: string fragments are
+ * kept verbatim and each ${...} substitution becomes the "{}" placeholder, so
+ * client-side URLs built from template literals share the canonical parameter
+ * shape that server-side route paths already use. NULL when empty/oversized. */
+const char *cbm_template_string_text(CBMArena *a, TSNode node, const char *source);
 
 #endif // CBM_HELPERS_H

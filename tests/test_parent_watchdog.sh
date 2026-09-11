@@ -11,7 +11,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BINARY="${ROOT}/build/c/codebase-memory-mcp"
+BINARY="${CBM_TEST_BINARY:-${ROOT}/build/c/codebase-memory-mcp}"
 
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
@@ -25,7 +25,10 @@ if [[ ! -x "${BINARY}" ]]; then
   exit 2
 fi
 
-tmpdir="$(mktemp -d)"
+# shellcheck source=../scripts/test-runtime.sh
+source "${ROOT}/scripts/test-runtime.sh"
+cbm_test_runtime_init
+tmpdir="${CBM_TEST_RUNTIME_ROOT}"
 wrapper_pid=""
 cleanup() {
   if [[ -s "${tmpdir}/child.pid" ]]; then
@@ -34,7 +37,7 @@ cleanup() {
     [[ -n "${child_pid}" ]] && kill "${child_pid}" 2>/dev/null || true
   fi
   [[ -n "${wrapper_pid}" ]] && kill "${wrapper_pid}" 2>/dev/null || true
-  rm -rf "${tmpdir}"
+  cbm_test_runtime_cleanup "${BINARY}"
 }
 trap cleanup EXIT
 
@@ -44,7 +47,7 @@ cat >"${tmpdir}/wrapper.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 exec 3<>"${FIFO}"
-"${CBM_BINARY}" <&3 >/dev/null 2>"${TMPDIR_PATH}/child.err" &
+"${CBM_BINARY}" <&3 >"${TMPDIR_PATH}/child.out" 2>"${TMPDIR_PATH}/child.err" &
 echo "$!" >"${TMPDIR_PATH}/child.pid"
 wait
 SH
@@ -73,19 +76,24 @@ if ! kill -0 "${child_pid}" 2>/dev/null; then
   exit 3
 fi
 
-# Wait until the child has reached startup far enough to have installed the
-# parent watchdog. The PID file is written immediately after fork; killing the
-# wrapper before the child runs main() is an untestable early-reparent race where
-# the child never observed the original parent PID.
-for _ in {1..50}; do
-  if [[ -s "${tmpdir}/child.err" ]] && grep -q "mem.init" "${tmpdir}/child.err"; then
+# Complete one MCP request before killing the parent. A response proves that
+# the frontend reached its stdio loop after installing the parent watchdog.
+# The old mem.init log sync point belonged to the pre-daemon architecture: the
+# shared daemon now owns memory initialization, so a frontend need not emit it.
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"parent-watchdog-test","version":"1.0"}}}' \
+  >"${tmpdir}/stdin"
+for _ in {1..150}; do
+  if [[ -s "${tmpdir}/child.out" ]] &&
+    grep -Eq '"id"[[:space:]]*:[[:space:]]*1' "${tmpdir}/child.out"; then
     break
   fi
   sleep 0.1
 done
-if ! grep -q "mem.init" "${tmpdir}/child.err" 2>/dev/null; then
+if ! grep -Eq '"id"[[:space:]]*:[[:space:]]*1' "${tmpdir}/child.out" 2>/dev/null; then
   echo "child did not reach watchdog-ready startup point" >&2
   [[ -s "${tmpdir}/child.err" ]] && cat "${tmpdir}/child.err" >&2
+  [[ -s "${tmpdir}/child.out" ]] && cat "${tmpdir}/child.out" >&2
   exit 3
 fi
 

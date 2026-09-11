@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Layer 4: Install output audit — verifies install --dry-run writes only to expected paths.
+# Layer 4: Install output audit — runs a sandboxed real install and audits its writes.
 #
 # Checks:
 #   1. All output file paths are in the expected set
@@ -19,8 +19,11 @@ fi
 
 echo "=== Layer 4: Install Output Audit ==="
 
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+# shellcheck source=test-runtime.sh
+source "$(dirname "${BASH_SOURCE[0]}")/test-runtime.sh"
+cbm_test_runtime_init
+TMPDIR="$CBM_TEST_RUNTIME_ROOT"
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
 
 # Set HOME to tmpdir so install writes there instead of real home
 export HOME="$TMPDIR/home"
@@ -49,6 +52,7 @@ find "$HOME" -type f > "$TMPDIR/created_files.txt" 2>/dev/null || true
 # Expected path patterns (relative to HOME):
 #   .config/*/mcp.json (or .mcp.json variants)
 #   .claude/skills/*
+#   .agents/skills/*
 #   .claude/settings.json
 #   .continue/config.yaml
 #   .codeium/config.json
@@ -56,6 +60,7 @@ find "$HOME" -type f > "$TMPDIR/created_files.txt" 2>/dev/null || true
 #   Various agent config dirs
 
 EXPECTED_PATTERNS=(
+    ".agents/"
     ".claude/"
     ".cursor/"
     ".config/"
@@ -121,10 +126,18 @@ fi
 echo ""
 echo "--- Auditing skill file content ---"
 
-SKILLS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
-if [[ -d "$SKILLS_DIR" ]]; then
-    SKILL_ISSUES=0
+SKILL_DIRS=(
+    "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
+    "$HOME/.agents/skills"
+)
+SKILL_ISSUES=0
+SKILL_DIRS_FOUND=0
 
+for SKILLS_DIR in "${SKILL_DIRS[@]}"; do
+    if [[ ! -d "$SKILLS_DIR" ]]; then
+        continue
+    fi
+    SKILL_DIRS_FOUND=1
     while IFS= read -r skill_file; do
         basename=$(basename "$skill_file")
 
@@ -138,11 +151,11 @@ if [[ -d "$SKILLS_DIR" ]]; then
         done
 
         # Check for unexpected URLs
-        if grep -oE 'https?://[^\s"'"'"']+' "$skill_file" 2>/dev/null | grep -v 'github.com/DeusData' | grep -v 'localhost' | grep -v '127.0.0.1' > /tmp/sec_skill_urls 2>/dev/null; then
+        if grep -oE 'https?://[^\s"'"'"']+' "$skill_file" 2>/dev/null | grep -v 'github.com/DeusData' | grep -v 'localhost' | grep -v '127.0.0.1' > "$TMPDIR/sec_skill_urls" 2>/dev/null; then
             while IFS= read -r url; do
                 echo "REVIEW: Skill '$basename' contains URL: $url"
-            done < /tmp/sec_skill_urls
-            rm -f /tmp/sec_skill_urls
+            done < "$TMPDIR/sec_skill_urls"
+            rm -f "$TMPDIR/sec_skill_urls"
         fi
 
         # Check for encoded strings (base64-like blocks > 50 chars)
@@ -150,12 +163,14 @@ if [[ -d "$SKILLS_DIR" ]]; then
             echo "REVIEW: Skill '$basename' contains potential encoded content"
         fi
     done < <(find "$SKILLS_DIR" -type f -name '*.md')
+done
 
+if [[ $SKILL_DIRS_FOUND -eq 0 ]]; then
+    echo "SKIP: No skills directory created."
+else
     if [[ $SKILL_ISSUES -eq 0 ]]; then
         echo "OK: Skill files contain no dangerous patterns."
     fi
-else
-    echo "SKIP: No skills directory created."
 fi
 
 # ── Summary ──────────────────────────────────────────────────────

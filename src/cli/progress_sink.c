@@ -1,12 +1,16 @@
 /*
- * progress_sink.c — Human-readable progress for --progress CLI flag.
+ * progress_sink.c — Human-readable progress for one-shot CLI commands.
  *
  * Maps structured log events (msg=pass.timing, msg=pipeline.done, etc.)
- * to phase labels on stderr. When installed, replaces default log output.
+ * to phase labels on stderr. Interactive terminals enable it automatically;
+ * --progress forces it for redirected stderr. When installed, it replaces
+ * default log output.
  *
- * Thread-safe: fprintf has per-FILE* locking on POSIX.
+ * Thread-safe: one sink mutex serializes shared summary state and each complete
+ * output update, not merely the individual stdio calls.
  */
 #include "progress_sink.h"
+#include "foundation/compat_thread.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
 
@@ -15,14 +19,205 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { PERCENT = 100, NOT_SET = -1 };
+enum {
+    PERCENT = 100,
+    NOT_SET = -1,
+    LOCK_UNINITIALIZED = 0,
+    LOCK_INITIALIZING = 1,
+    LOCK_READY = 2,
+};
 
 static FILE *s_out;
 static atomic_int s_needs_newline;
 static int s_gbuf_nodes = NOT_SET;
 static int s_gbuf_edges = NOT_SET;
+static CBMLogLevel s_previous_log_level = CBM_LOG_WARN;
+static bool s_raised_log_level;
+static bool s_preserve_details;
+static cbm_mutex_t s_sink_mutex;
+static atomic_int s_sink_mutex_state = ATOMIC_VAR_INIT(LOCK_UNINITIALIZED);
 
-/* Extract value of "key=VALUE" from a structured log line. */
+/* The CLI may install the sink more than once in one process (notably tests),
+ * so keep one process-lifetime mutex rather than destroying it at fini. */
+static void progress_sink_mutex_ensure(void) {
+    int expected = LOCK_UNINITIALIZED;
+    if (atomic_compare_exchange_strong_explicit(&s_sink_mutex_state, &expected, LOCK_INITIALIZING,
+                                                memory_order_acq_rel, memory_order_acquire)) {
+        cbm_mutex_init(&s_sink_mutex);
+        atomic_store_explicit(&s_sink_mutex_state, LOCK_READY, memory_order_release);
+        return;
+    }
+    while (atomic_load_explicit(&s_sink_mutex_state, memory_order_acquire) != LOCK_READY) {}
+}
+
+bool cbm_cli_output_flags_parse(int *argc, char **argv, cbm_cli_output_flags_t *flags, char *error,
+                                size_t error_size) {
+    if (!argc || !argv || !flags) {
+        return false;
+    }
+    memset(flags, 0, sizeof(*flags));
+    if (error && error_size > 0) {
+        error[0] = '\0';
+    }
+
+    /* --quiet and --progress are reserved process controls wherever they
+     * appear, matching the existing --progress behavior. --verbose remains
+     * outer-only because tools such as index_status own a verbose input. */
+    bool before_tool = true;
+    int output_index = 0;
+    for (int input_index = 0; input_index < *argc; input_index++) {
+        char *arg = argv[input_index];
+        bool quiet = arg && strcmp(arg, "--quiet") == 0;
+        bool progress = arg && strcmp(arg, "--progress") == 0;
+        bool verbose = before_tool && arg && strcmp(arg, "--verbose") == 0;
+        if (quiet) {
+            flags->quiet_requested = true;
+        } else if (progress) {
+            flags->progress_requested = true;
+        } else if (verbose) {
+            flags->verbose_requested = true;
+        } else {
+            argv[output_index++] = arg;
+            if (before_tool && arg && arg[0] != '-') {
+                before_tool = false;
+            }
+        }
+    }
+    *argc = output_index;
+
+    if (flags->quiet_requested && (flags->progress_requested || flags->verbose_requested)) {
+        if (error && error_size > 0) {
+            (void)snprintf(error, error_size,
+                           "--quiet cannot be combined with --progress or outer --verbose; "
+                           "use --quiet for errors-only stderr, --progress for lifecycle "
+                           "feedback, or --verbose for informational diagnostics");
+        }
+        return false;
+    }
+    return true;
+}
+
+void cbm_cli_diagnostics_configure(bool quiet_requested, bool verbose_requested) {
+    if (quiet_requested) {
+        /* Keep ERROR records visible while suppressing DEBUG/INFO/WARN. An
+         * explicit CBM_LOG_LEVEL=none remains stronger than --quiet. */
+        if (cbm_log_get_level() < CBM_LOG_ERROR) {
+            cbm_log_set_level(CBM_LOG_ERROR);
+        }
+        return;
+    }
+    if (verbose_requested && cbm_log_get_level() > CBM_LOG_INFO) {
+        cbm_log_set_level(CBM_LOG_INFO);
+    }
+}
+
+bool cbm_cli_progress_enabled(bool explicitly_requested, bool quiet_requested, bool stderr_is_tty) {
+    return !quiet_requested && (explicitly_requested || stderr_is_tty);
+}
+
+static void progress_tool_name(const char *tool_name, char out[CBM_SZ_64]) {
+    size_t offset = 0;
+    if (tool_name) {
+        for (; tool_name[offset] && offset + 1 < CBM_SZ_64; offset++) {
+            unsigned char ch = (unsigned char)tool_name[offset];
+            bool safe = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                        (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+            if (!safe) {
+                offset = 0;
+                break;
+            }
+            out[offset] = (char)ch;
+        }
+    }
+    if (offset == 0) {
+        (void)snprintf(out, CBM_SZ_64, "%s", "tool");
+    } else {
+        out[offset] = '\0';
+    }
+}
+
+void cbm_cli_progress_start(FILE *out, const char *tool_name) {
+    FILE *stream = out ? out : stderr;
+    char safe_name[CBM_SZ_64] = {0};
+    progress_tool_name(tool_name, safe_name);
+    (void)fprintf(stream, "Running %s locally...\n", safe_name);
+    (void)fflush(stream);
+}
+
+void cbm_cli_progress_finish(FILE *out, const char *tool_name, bool success, uint64_t elapsed_ms) {
+    FILE *stream = out ? out : stderr;
+    char safe_name[CBM_SZ_64] = {0};
+    progress_tool_name(tool_name, safe_name);
+    (void)fprintf(stream, "%s %s (%llu ms)\n", success ? "Completed" : "Failed", safe_name,
+                  (unsigned long long)elapsed_ms);
+    (void)fflush(stream);
+}
+
+/* Extract one string field from the logger's compact JSON format. Keys are
+ * accepted only at object boundaries so worker-controlled values cannot spoof
+ * a progress event by merely containing a key-shaped substring. */
+static const char *extract_json_field(const char *line, const char *key, char *buf, int buf_len) {
+    char needle[CBM_SZ_64];
+    int needle_len = snprintf(needle, sizeof(needle), "\"%s\":", key);
+    if (needle_len <= 0 || needle_len >= (int)sizeof(needle)) {
+        return NULL;
+    }
+    const char *candidate = line;
+    while ((candidate = strstr(candidate, needle)) != NULL) {
+        const char *before = candidate;
+        while (before > line && (before[-1] == ' ' || before[-1] == '\t')) {
+            before--;
+        }
+        if (before == line || (before[-1] != '{' && before[-1] != ',')) {
+            candidate += needle_len;
+            continue;
+        }
+        const char *value = candidate + needle_len;
+        while (*value == ' ' || *value == '\t') {
+            value++;
+        }
+        if (*value++ != '\"') {
+            return NULL;
+        }
+        int offset = 0;
+        bool escaped = false;
+        while (*value && offset < buf_len - 1) {
+            if (!escaped && *value == '\"') {
+                buf[offset] = '\0';
+                return buf;
+            }
+            if (!escaped && *value == '\\') {
+                escaped = true;
+                value++;
+                continue;
+            }
+            if (escaped) {
+                switch (*value) {
+                case 'n':
+                    buf[offset++] = '\n';
+                    break;
+                case 'r':
+                    buf[offset++] = '\r';
+                    break;
+                case 't':
+                    buf[offset++] = '\t';
+                    break;
+                default:
+                    buf[offset++] = *value;
+                    break;
+                }
+                escaped = false;
+            } else {
+                buf[offset++] = *value;
+            }
+            value++;
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
+/* Extract a field from either structured text or JSON worker logs. */
 static const char *extract_kv(const char *line, const char *key, char *buf, int buf_len) {
     if (!line || !key || !buf || buf_len <= 0) {
         return NULL;
@@ -42,24 +237,44 @@ static const char *extract_kv(const char *line, const char *key, char *buf, int 
         }
         p++;
     }
-    return NULL;
+    const char *json_key = strcmp(key, "msg") == 0 ? "event" : key;
+    return extract_json_field(line, json_key, buf, buf_len);
 }
 
 void cbm_progress_sink_init(FILE *out) {
+    progress_sink_mutex_ensure();
+    cbm_mutex_lock(&s_sink_mutex);
     s_out = out ? out : stderr;
     atomic_store(&s_needs_newline, 0);
     s_gbuf_nodes = NOT_SET;
     s_gbuf_edges = NOT_SET;
+    s_previous_log_level = cbm_log_get_level();
+    s_preserve_details = s_previous_log_level <= CBM_LOG_INFO;
+    s_raised_log_level = s_previous_log_level > CBM_LOG_INFO;
+    if (s_raised_log_level) {
+        /* Progress is an explicit INFO opt-in. The replacement sink below
+         * keeps only recognized lifecycle events plus warnings/errors. */
+        cbm_log_set_level(CBM_LOG_INFO);
+    }
     cbm_log_set_sink(cbm_progress_sink_fn);
+    cbm_mutex_unlock(&s_sink_mutex);
 }
 
 void cbm_progress_sink_fini(void) {
+    progress_sink_mutex_ensure();
+    cbm_mutex_lock(&s_sink_mutex);
+    cbm_log_set_sink(NULL);
     if (atomic_load(&s_needs_newline) && s_out) {
         (void)fprintf(s_out, "\n");
         (void)fflush(s_out);
     }
-    cbm_log_set_sink(NULL);
     s_out = NULL;
+    if (s_raised_log_level) {
+        cbm_log_set_level(s_previous_log_level);
+        s_raised_log_level = false;
+    }
+    s_preserve_details = false;
+    cbm_mutex_unlock(&s_sink_mutex);
 }
 
 /* Phase label table: maps pass names to display labels. */
@@ -200,18 +415,63 @@ static const event_handler_t handlers[] = {
 
 enum { HANDLER_COUNT = sizeof(handlers) / sizeof(handlers[0]) };
 
+/* The progress sink replaces normal logger output. Preserve actionable
+ * failures verbatim and, when INFO/DEBUG was already selected before progress
+ * initialization, preserve unrecognized diagnostic lines as well. Logger
+ * callbacks do not include a trailing newline. */
+static void passthrough_line(const char *line) {
+    flush_carriage();
+    (void)fputs(line, s_out);
+    size_t line_len = strlen(line);
+    if (line_len == 0 || line[line_len - 1] != '\n') {
+        (void)fputc('\n', s_out);
+    }
+    (void)fflush(s_out);
+}
+
 void cbm_progress_sink_fn(const char *line) {
+    progress_sink_mutex_ensure();
+    cbm_mutex_lock(&s_sink_mutex);
     if (!line || !s_out) {
+        cbm_mutex_unlock(&s_sink_mutex);
         return;
     }
+    char level[CBM_SZ_32] = {0};
+    if (!extract_kv(line, "level", level, (int)sizeof(level))) {
+        cbm_mutex_unlock(&s_sink_mutex);
+        return;
+    }
+    if (strcmp(level, "warn") == 0 || strcmp(level, "error") == 0) {
+        passthrough_line(line);
+        cbm_mutex_unlock(&s_sink_mutex);
+        return;
+    }
+    if (strcmp(level, "debug") == 0) {
+        if (s_preserve_details) {
+            passthrough_line(line);
+        }
+        cbm_mutex_unlock(&s_sink_mutex);
+        return;
+    }
+    if (strcmp(level, "info") != 0) {
+        cbm_mutex_unlock(&s_sink_mutex);
+        return;
+    }
+
     char msg[CBM_SZ_64] = {0};
     if (!extract_kv(line, "msg", msg, (int)sizeof(msg))) {
+        cbm_mutex_unlock(&s_sink_mutex);
         return;
     }
     for (int i = 0; i < HANDLER_COUNT; i++) {
         if (strcmp(msg, handlers[i].msg) == 0) {
             handlers[i].handler(line);
+            cbm_mutex_unlock(&s_sink_mutex);
             return;
         }
     }
+    if (s_preserve_details) {
+        passthrough_line(line);
+    }
+    cbm_mutex_unlock(&s_sink_mutex);
 }

@@ -1,3 +1,7 @@
+/* Full declaration set for the same CBMArena, and it must precede cbm.h:
+ * internal/cbm/arena.h declares a subset and the two share the CBM_ARENA_H
+ * guard, so whichever is included first is the one this file sees. */
+#include "foundation/arena.h" // cbm_arena_init_sized
 #include "cbm.h"
 #include "arena.h" // CBMArena, cbm_arena_init/alloc/strdup/destroy
 #include "helpers.h"
@@ -262,14 +266,21 @@ static TSParser *get_thread_parser(const TSLanguage *ts_lang, CBMLanguage lang) 
  * (sqlite requires 8-byte-aligned roundup, and mimalloc honors that alignment).
  * Field order matches struct sqlite3_mem_methods exactly:
  * xMalloc, xFree, xRealloc, xSize, xRoundup, xInit, xShutdown, pAppData. */
+/* Profiled: these bindings bypass the malloc interposer entirely, so without a
+ * hook here the biggest per-request allocations in the process — SQLite's page
+ * cache and its query working set — are invisible to the attribution profile
+ * (#581). */
 static void *cbm_sqlite_malloc(int n) {
-    return mi_malloc((size_t)n);
+    void *block = mi_malloc((size_t)n);
+    return block;
 }
 static void cbm_sqlite_free(void *p) {
     mi_free(p);
 }
 static void *cbm_sqlite_realloc(void *p, int n) {
-    return mi_realloc(p, (size_t)n);
+    if (p) {}
+    void *grown = mi_realloc(p, (size_t)n);
+    return grown;
 }
 static int cbm_sqlite_size(void *p) {
     return (int)mi_usable_size(p);
@@ -277,6 +288,25 @@ static int cbm_sqlite_size(void *p) {
 static int cbm_sqlite_roundup(int n) {
     return (n + 7) & ~7; /* round up to 8-byte boundary */
 }
+/* Same reasoning as the sqlite bindings: tree-sitter allocates its parse trees
+ * through these, and they too skip the interposer. */
+static void *cbm_ts_malloc(size_t n) {
+    void *block = mi_malloc(n);
+    return block;
+}
+static void *cbm_ts_calloc(size_t count, size_t size) {
+    void *block = mi_calloc(count, size);
+    return block;
+}
+static void *cbm_ts_realloc(void *p, size_t n) {
+    if (p) {}
+    void *grown = mi_realloc(p, n);
+    return grown;
+}
+static void cbm_ts_free(void *p) {
+    mi_free(p);
+}
+
 static int cbm_sqlite_meminit(void *appdata) {
     (void)appdata;
     return SQLITE_OK;
@@ -295,7 +325,7 @@ void cbm_alloc_init(void) {
     alloc_bound = 1;
 
     /* tree-sitter runtime (was previously bound in cbm_init; consolidated here). */
-    ts_set_allocator(mi_malloc, mi_calloc, mi_realloc, mi_free);
+    ts_set_allocator(cbm_ts_malloc, cbm_ts_calloc, cbm_ts_realloc, cbm_ts_free);
 
     /* sqlite3. SQLITE_CONFIG_MALLOC MUST run before sqlite3_initialize / the
      * first sqlite3_open* — otherwise sqlite3_config returns SQLITE_MISUSE
@@ -627,10 +657,23 @@ static void cbm_quarantine_load(void) {
          * never freed: the set lives for the whole (short-lived worker) process.
          * The value stores the phase so cbm_index_quarantine_phase() can report
          * "crash" vs "hang"; membership (cbm_index_is_quarantined) is value != NULL. */
-        char *key = cbm_strdup(line);
         char *pval = cbm_strdup(phase);
-        if (key && pval) {
-            cbm_ht_set(set, key, (void *)pval);
+        if (!pval) {
+            continue;
+        }
+        if (cbm_ht_has(set, line)) {
+            /* Duplicate path line: reuse the stored key (the table borrows key
+             * pointers, so a fresh copy would leak on replace) and free the
+             * value it displaces. */
+            free(cbm_ht_set(set, line, (void *)pval));
+        } else {
+            char *key = cbm_strdup(line);
+            if (key) {
+                cbm_ht_set(set, key, (void *)pval);
+            } else {
+                /* Partial failure: don't leak the value copy. */
+                free(pval);
+            }
         }
     }
     (void)fclose(f);
@@ -668,6 +711,10 @@ const char *cbm_index_quarantine_phase(const char *rel_path) {
     return (const char *)cbm_ht_get(g_quarantine_set, rel_path);
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Deterministic supervisor fault injection belongs only in explicitly
+ * seam-enabled test artifacts. Ordinary release binaries must never expose a
+ * filename-selected abort or infinite loop through environment variables. */
 static void cbm_test_fault_inject(const char *rel_path) {
     if (!rel_path || !rel_path[0]) {
         return;
@@ -682,7 +729,12 @@ static void cbm_test_fault_inject(const char *rel_path) {
             /* Busy-spin: the supervisor's quiet-timeout kills + reports us. */
         }
     }
+    const char *exit_on = getenv("CBM_TEST_EXIT_ON");
+    if (exit_on && exit_on[0] && strstr(rel_path, exit_on)) {
+        exit(1); /* Nonzero exit code → CBM_PROC_EXIT_NONZERO → classified as "error" */
+    }
 }
+#endif
 
 /* Pre-parse nesting guard for pathologically nested input. tree-sitter's GLR
  * parser recurses once per nesting level inside stack_node_add_link
@@ -726,16 +778,24 @@ static bool cbm_source_nesting_exceeds(const char *source, int source_len, int c
  * nodes (does not descend into an error subtree — one range per failed region).
  * Bounded by CBM_MAX_ERROR_REGIONS so pathological input can't blow up the
  * output. The ranges mark where constructs were dropped; they are a detection
- * aid, never a completeness proof. */
-#define CBM_MAX_ERROR_REGIONS 64
+ * aid, never a completeness proof.
+ *
+ * `dropped` counts the ranges the cap threw away. It exists so a clipped list
+ * cannot read as a complete one: cbm_error_ranges_str turns a non-zero count
+ * into a trailing "+<N>" marker. Phase 2 split one whole-file range into many
+ * small ones, which pushed real files straight into a cap that used to be
+ * unreachable, so the clip is live behaviour and not a theoretical limit. */
+#define CBM_MAX_ERROR_REGIONS 256
 typedef struct {
     uint32_t starts[CBM_MAX_ERROR_REGIONS];
     uint32_t ends[CBM_MAX_ERROR_REGIONS];
     int count;
+    int dropped;
 } cbm_error_regions_t;
 
 static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
     if (acc->count >= CBM_MAX_ERROR_REGIONS) {
+        acc->dropped++;
         return;
     }
     acc->starts[acc->count] = ts_node_start_point(n).row + 1;
@@ -743,17 +803,202 @@ static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
     acc->count++;
 }
 
-static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc) {
-    if (acc->count >= CBM_MAX_ERROR_REGIONS) {
-        return;
+/* #1610: a file that does not end with a newline leaves the grammar's
+ * mandatory line terminator MISSING. That node is ZERO-WIDTH and sits at EOF.
+ *
+ * It is not a miss. The parser consumed no source for it — start_byte ==
+ * end_byte — so by construction nothing was dropped: no construct can live in
+ * a zero-byte span, and every real instruction above it parsed normally. This
+ * is a property of the grammar's terminator rule, not of the file.
+ *
+ * Flagging it made the verdict arbitrary. Grammars whose terminator token is
+ * VISIBLE (dockerfile, tcl, fish, gomod, hyprlang) reported parse_partial for
+ * a missing final newline; grammars whose terminator is HIDDEN (ini, fsharp,
+ * beancount, requirements, gitignore, sshconfig, kconfig) reported nothing for
+ * exactly the same omission, because a hidden node is invisible to
+ * ts_node_child(). Whether a user was told their file was partially parsed
+ * depended on a grammar-authoring accident.
+ *
+ * The cost was not cosmetic: a phantom parse_partial writes a
+ * "<project>::missed" shadow row, and until #1609 that row made the project
+ * fail cross-repo validation as both source and target.
+ *
+ * Deliberately narrow — ZERO-WIDTH AT EOF ONLY. A MISSING or ERROR node with
+ * WIDTH still counts even at EOF (a Makefile whose last recipe line is
+ * unterminated really does lose the recipe), and anything before EOF is
+ * untouched.
+ *
+ * #1746: the Dockerfile grammar places that zero-width missing newline before
+ * trailing whitespace rather than at raw EOF. Preserve the broad exact-EOF
+ * rule above; only extend it past blanks when the missing token is specifically
+ * a newline. */
+static bool cbm_is_blank_not_newline(char c) {
+    return c == ' ' || c == '\t' || c == '\v' || c == '\f' || c == '\r';
+}
+
+static bool cbm_is_eof_terminator_miss(TSNode n, const char *source, int source_len) {
+    if (!ts_node_is_missing(n) || source_len < 0) {
+        return false;
     }
+    uint32_t start = ts_node_start_byte(n);
+    uint32_t end = ts_node_end_byte(n);
+    if (start != end || end > (uint32_t)source_len) {
+        return false;
+    }
+    if (end == (uint32_t)source_len) {
+        return true;
+    }
+    if (!source || strcmp(ts_node_type(n), "\n") != 0) {
+        return false;
+    }
+    for (uint32_t i = end; i < (uint32_t)source_len; i++) {
+        if (!cbm_is_blank_not_newline(source[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Walks to the end even after the cap is full, so `dropped` is the real number
+ * of ranges lost rather than a lower bound. This costs little: the walk never
+ * descends into an ERROR subtree — it records the top-most node and moves on —
+ * so it only visits the spine of nodes that contain an error, plus one level. */
+static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, const char *source,
+                                      int source_len) {
     uint32_t k = ts_node_child_count(n);
-    for (uint32_t i = 0; i < k && acc->count < CBM_MAX_ERROR_REGIONS; i++) {
+    for (uint32_t i = 0; i < k; i++) {
         TSNode c = ts_node_child(n, i);
         if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
+            if (cbm_is_eof_terminator_miss(c, source, source_len)) {
+                continue; /* absent final newline only — nothing was dropped */
+            }
             cbm_error_regions_push(acc, c); /* top-most region; do not descend */
         } else if (ts_node_has_error(c)) {
-            cbm_collect_error_regions(c, acc);
+            cbm_collect_error_regions(c, acc, source, source_len);
+        }
+    }
+}
+
+/* ── Phase 2 line map: what the preprocessed parse already explained ───────
+ *
+ * The raw parse is preprocessor-blind. When an #ifdef splits a brace it sees
+ * both branches at once, the braces do not balance, and the ERROR node
+ * swallows the whole construct — at file scope it swallows the whole FILE.
+ * The second parse, on preprocessed source, does not have that problem: the
+ * preprocessor already picked one branch, so that parse is clean.
+ *
+ * So we build one byte per ORIGINAL line and use it to cut the raw ranges
+ * down to the lines the second parse cannot vouch for. Lines in the branch
+ * the preprocessor threw away never appear in the second parse at all, so
+ * they stay flagged — which is right, because they really are missing from
+ * the graph.
+ *
+ * CBM_LINE_PP_PARSED — the preprocessed parse covered this original line and
+ *                      found no error on it. Nothing here was dropped.
+ * CBM_LINE_NO_CODE   — the line is empty, is only a comment, or is a
+ *                      preprocessor directive. A reported range must never
+ *                      begin or end on one.
+ *
+ *                      Directives are in this set because the preprocessor
+ *                      CONSUMES them: no directive line ever survives into
+ *                      the expanded text, so the second parse can never
+ *                      vouch for one, and treating that silence as a miss
+ *                      would flag every #include block in the file. The
+ *                      known cost is a #define that the raw parse really did
+ *                      drop: it no longer shows up on its own. That trade is
+ *                      deliberate — it removes far more noise than signal. */
+enum { CBM_LINE_PP_PARSED = 1u, CBM_LINE_NO_CODE = 2u };
+
+/* True when the line's first non-blank character starts a preprocessor
+ * directive. */
+static bool cbm_is_directive_line(const char *line, int len) {
+    int i = 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    return i < len && line[i] == '#';
+}
+
+/* True when the line ends with a backslash, so the directive carries on to
+ * the next line. */
+static bool cbm_line_continues(const char *line, int len) {
+    int end = len;
+    while (end > 0 && (line[end - 1] == ' ' || line[end - 1] == '\t' || line[end - 1] == '\r')) {
+        end--;
+    }
+    return end > 0 && line[end - 1] == '\\';
+}
+
+/* Set CBM_LINE_NO_CODE on every line of `src` that holds no construct.
+ * One pass over the file. Carries block-comment state across lines so a line
+ * in the middle of a comment counts as no-code too. */
+static void cbm_mark_no_code_lines(const char *src, int src_len, uint8_t *map,
+                                   uint32_t line_count) {
+    bool in_block = false;
+    bool in_directive = false;
+    uint32_t line = 1;
+    int i = 0;
+    while (i <= src_len && line <= line_count) {
+        int end = i;
+        while (end < src_len && src[end] != '\n') {
+            end++;
+        }
+        bool has_code = false;
+        bool line_starts_in_block = in_block;
+        for (int j = i; j < end; j++) {
+            if (in_block) {
+                if (src[j] == '*' && j + 1 < end && src[j + 1] == '/') {
+                    in_block = false;
+                    j++;
+                }
+                continue;
+            }
+            if (src[j] == '/' && j + 1 < end && src[j + 1] == '*') {
+                in_block = true;
+                j++;
+                continue;
+            }
+            if (src[j] == '/' && j + 1 < end && src[j + 1] == '/') {
+                break; /* rest of the line is a comment */
+            }
+            if (src[j] != ' ' && src[j] != '\t' && src[j] != '\r') {
+                has_code = true;
+            }
+        }
+        bool directive =
+            !line_starts_in_block && (in_directive || cbm_is_directive_line(src + i, end - i));
+        if (!has_code || directive) {
+            map[line] |= CBM_LINE_NO_CODE;
+        }
+        in_directive = directive && cbm_line_continues(src + i, end - i);
+        line++;
+        i = end + 1;
+    }
+}
+
+/* Paint CBM_LINE_PP_PARSED for every original line the preprocessed parse
+ * covered without an error on it.
+ *
+ * Step 1 marks the EXPANDED rows that sit under an ERROR/MISSING node.
+ * Step 2 walks the expanded lines and, for each one that is unmarked, belongs
+ * to the file itself (not an included header) and maps back to a real
+ * original line, records that original line as parsed. */
+static void cbm_mark_pp_error_rows(TSNode n, uint8_t *rows, uint32_t row_count, const char *src,
+                                   int src_len) {
+    uint32_t k = ts_node_child_count(n);
+    for (uint32_t i = 0; i < k; i++) {
+        TSNode c = ts_node_child(n, i);
+        if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
+            if (cbm_is_eof_terminator_miss(c, src, src_len)) {
+                continue; /* absent final newline only — nothing was dropped */
+            }
+            uint32_t s = ts_node_start_point(c).row + 1;
+            uint32_t e = ts_node_end_point(c).row + 1;
+            for (uint32_t r = s; r <= e && r <= row_count; r++) {
+                rows[r] = 1;
+            }
+        } else if (ts_node_has_error(c)) {
+            cbm_mark_pp_error_rows(c, rows, row_count, src, src_len);
         }
     }
 }
@@ -963,26 +1208,11 @@ static void cbm_subtract_recovered_regions(cbm_error_regions_t *regs, const CBMD
  * missing from the graph; it's a benign call the grammar can't parse without the
  * preprocessor. True if the [start_line, end_line] span contains a call `NAME(` to
  * a file-defined function-like macro (Macro label + a parameter signature). */
-static bool cbm_span_is_macro_invocation(const char *src, int src_len, uint32_t start_line,
-                                         uint32_t end_line, const CBMDefArray *defs) {
-    if (!src || src_len <= 0 || !defs || start_line == 0 || end_line < start_line) {
+static bool cbm_byte_span_is_macro_invocation(const char *src, int src_len, int span_start,
+                                              int span_end, const CBMDefArray *defs) {
+    if (!src || src_len <= 0 || !defs || span_start < 0 || span_end > src_len ||
+        span_start >= span_end) {
         return false;
-    }
-    int span_start = 0;
-    uint32_t line = 1;
-    while (span_start < src_len && line < start_line) {
-        if (src[span_start++] == '\n') {
-            line++;
-        }
-    }
-    if (line != start_line) {
-        return false;
-    }
-    int span_end = span_start;
-    while (span_end < src_len && line <= end_line) {
-        if (src[span_end++] == '\n') {
-            line++;
-        }
     }
     for (int di = 0; di < defs->count; di++) {
         const CBMDefinition *d = &defs->items[di];
@@ -1009,6 +1239,66 @@ static bool cbm_span_is_macro_invocation(const char *src, int src_len, uint32_t 
         }
     }
     return false;
+}
+
+/* Byte offset where every 1-based line starts, so finding a line's span costs
+ * one table read instead of a walk from the start of the file.
+ *
+ * The table holds line_count + 2 entries. Entry [L] is where line L starts, and
+ * the last entry is the end of the source, which gives the final line somewhere
+ * to stop. A line the file never reaches starts at the end of the source, so its
+ * span is empty and nothing can match inside it — the same answer the walk gives.
+ *
+ * Returns NULL when the allocation fails; a caller then falls back to the walk. */
+static int *cbm_build_line_offsets(const char *src, int src_len, uint32_t line_count) {
+    int *offsets = (int *)malloc(((size_t)line_count + 2) * sizeof(int));
+    if (!offsets) {
+        return NULL;
+    }
+    for (uint32_t l = 0; l <= line_count + 1; l++) {
+        offsets[l] = src_len;
+    }
+    offsets[0] = 0;
+    offsets[1] = 0;
+    uint32_t line = 1;
+    for (int i = 0; i < src_len; i++) {
+        if (src[i] != '\n') {
+            continue;
+        }
+        line++;
+        if (line > line_count + 1) {
+            break;
+        }
+        offsets[line] = i + 1;
+    }
+    return offsets;
+}
+
+/* Same question by line number, for the few callers that ask about one region
+ * rather than every line of a file. This form walks the source to find the span,
+ * which is why the per-line caller below uses a table instead. */
+static bool cbm_span_is_macro_invocation(const char *src, int src_len, uint32_t start_line,
+                                         uint32_t end_line, const CBMDefArray *defs) {
+    if (!src || src_len <= 0 || !defs || start_line == 0 || end_line < start_line) {
+        return false;
+    }
+    int span_start = 0;
+    uint32_t line = 1;
+    while (span_start < src_len && line < start_line) {
+        if (src[span_start++] == '\n') {
+            line++;
+        }
+    }
+    if (line != start_line) {
+        return false;
+    }
+    int span_end = span_start;
+    while (span_end < src_len && line <= end_line) {
+        if (src[span_end++] == '\n') {
+            line++;
+        }
+    }
+    return cbm_byte_span_is_macro_invocation(src, src_len, span_start, span_end, defs);
 }
 
 /* True if [rs, re] is fully enclosed by an extracted callable definition (a
@@ -1051,13 +1341,123 @@ static void cbm_subtract_macro_invocation_regions(cbm_error_regions_t *regs,
     regs->count = kept;
 }
 
+/* Push [start, end] after trimming no-code lines off both ends. A run made
+ * only of directives, comments or blank lines disappears entirely — there was
+ * never a construct on it to lose. */
+static void cbm_push_trimmed_run(cbm_error_regions_t *out, uint32_t start, uint32_t end,
+                                 const uint8_t *map, uint32_t line_count) {
+    while (start <= end && start <= line_count && (map[start] & CBM_LINE_NO_CODE)) {
+        start++;
+    }
+    while (end >= start && end <= line_count && (map[end] & CBM_LINE_NO_CODE)) {
+        end--;
+    }
+    if (start > end) {
+        return; /* nothing but blank, comment or directive lines — no construct lost */
+    }
+    if (out->count >= CBM_MAX_ERROR_REGIONS) {
+        out->dropped++;
+        return;
+    }
+    out->starts[out->count] = start;
+    out->ends[out->count] = end;
+    out->count++;
+}
+
+/* #949: a top-level macro invocation is the one place where a clean second
+ * parse proves nothing. The macro can expand to a whole definition, and the
+ * recovery walker deliberately refuses to adopt that definition because it is
+ * absent from the original span. So the expanded line parses fine while the
+ * construct really is missing from the graph, and the line must stay flagged.
+ * An invocation INSIDE a function body is the benign #1071 case and is left
+ * alone here — cbm_subtract_macro_invocation_regions handles it later. */
+static bool cbm_line_is_toplevel_macro_call(const char *src, int src_len, uint32_t line,
+                                            const int *line_offsets, const CBMDefArray *defs) {
+    bool is_call = line_offsets
+                       ? cbm_byte_span_is_macro_invocation(src, src_len, line_offsets[line],
+                                                           line_offsets[line + 1], defs)
+                       : cbm_span_is_macro_invocation(src, src_len, line, line, defs);
+    return is_call && !cbm_region_inside_callable(line, line, defs);
+}
+
+/* Cut every raw region down to the lines the preprocessed parse could not
+ * vouch for. Each region becomes zero or more smaller ranges: one per run of
+ * consecutive lines that the second parse did not cover cleanly.
+ *
+ * This is what collapses a whole-file range on a file whose only real problem
+ * is an #ifdef splitting a brace. It deliberately does NOT clear the region
+ * outright — the branch the preprocessor discarded is genuinely absent from
+ * the graph and must stay flagged. */
+static void cbm_refine_regions_with_pp_lines(cbm_error_regions_t *regs, const uint8_t *map,
+                                             uint32_t line_count, const char *src, int src_len,
+                                             const CBMDefArray *defs) {
+    cbm_error_regions_t out = {{0}, {0}, 0, regs->dropped};
+    /* One offset table for the whole file. The macro check below runs once per
+     * line, and without the table each of those calls walks the source from byte
+     * 0 to find its line — bytes times lines, on exactly the whole-file-error
+     * shape this refinement exists to narrow. */
+    int *line_offsets = cbm_build_line_offsets(src, src_len, line_count);
+    for (int i = 0; i < regs->count; i++) {
+        uint32_t run_start = 0;
+        uint32_t run_end = 0;
+        uint32_t end = regs->ends[i] < line_count ? regs->ends[i] : line_count;
+        for (uint32_t line = regs->starts[i]; line <= end; line++) {
+            if ((map[line] & CBM_LINE_PP_PARSED) &&
+                !cbm_line_is_toplevel_macro_call(src, src_len, line, line_offsets, defs)) {
+                if (run_start != 0) {
+                    cbm_push_trimmed_run(&out, run_start, run_end, map, line_count);
+                    run_start = 0;
+                }
+            } else {
+                if (run_start == 0) {
+                    run_start = line;
+                }
+                run_end = line;
+            }
+        }
+        if (run_start != 0) {
+            cbm_push_trimmed_run(&out, run_start, run_end, map, line_count);
+        }
+    }
+    free(line_offsets);
+    *regs = out;
+}
+
 /* Serialize collected regions as "start-end,start-end,..." into the arena. */
+/* Share of a file one range must cover before the range stops being advice and
+ * becomes noise. 80% is well clear of anything real: the widest single range in
+ * this repo covers 25.5% of its file, and the next widest 3.9%. */
+#define CBM_UNUSABLE_PCT 80
+
+/* Number of 1-based lines in `src`. A file that does not end with a newline
+ * still has a last line, so the count is separators plus one. */
+static uint32_t cbm_count_lines(const char *src, int src_len) {
+    uint32_t n = 1;
+    for (int i = 0; i < src_len; i++) {
+        if (src[i] == '\n' && i + 1 < src_len) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Serialize collected regions as "start-end,start-end,...", with a trailing
+ * ",+<N>" when the cap threw N ranges away.
+ *
+ * The marker must stay a SUFFIX and nothing else. Every reader stops at the
+ * first token that is not a range, so a marker in the middle of a string
+ * silently hides everything after it. objectscript_export_append_error_ranges
+ * strips markers before joining two parts for exactly that reason.
+ *
+ * N can be non-zero while the kept list is short, because the recovery and
+ * macro rules run after collection and remove ranges the cap never saw. That
+ * still reports honestly: the cap bound, so what was lost is unknown. */
 static const char *cbm_error_ranges_str(CBMArena *a, const cbm_error_regions_t *regs) {
-    if (regs->count <= 0) {
+    if (regs->count <= 0 && regs->dropped <= 0) {
         return NULL;
     }
     enum { RANGE_MAX = 24 }; /* "4294967295-4294967295," */
-    char *buf = (char *)cbm_arena_alloc(a, (size_t)regs->count * RANGE_MAX);
+    char *buf = (char *)cbm_arena_alloc(a, (size_t)(regs->count + 1) * RANGE_MAX);
     if (!buf) {
         return NULL;
     }
@@ -1065,6 +1465,9 @@ static const char *cbm_error_ranges_str(CBMArena *a, const cbm_error_regions_t *
     for (int i = 0; i < regs->count; i++) {
         off += (size_t)snprintf(buf + off, RANGE_MAX, "%s%u-%u", i ? "," : "", regs->starts[i],
                                 regs->ends[i]);
+    }
+    if (regs->dropped > 0) {
+        snprintf(buf + off, RANGE_MAX, "%s+%d", off ? "," : "", regs->dropped);
     }
     return buf;
 }
@@ -1082,11 +1485,27 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
     return r;
 }
 
-CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLanguage language,
-                                   const char *project, const char *rel_path,
-                                   int64_t timeout_micros, const char **extra_defines,
-                                   const char **include_paths, const CBMMacroTable *macro_table,
-                                   const CBMReturnTypeTable *return_type_table) {
+/* Initial block for the per-file traversal scratch arena, chosen by measuring
+ * arena_grow on a 14k-file TypeScript tree: it fires on one file in 12,000 at
+ * both this size and at 1 MB, and on most files at 256 KB, where the two
+ * channel walks alone are exactly 262144 bytes. 512 KB therefore buys the same
+ * growth behaviour as 1 MB for half the resident block per worker. It is also
+ * exactly MI_LARGE_MAX_OBJ_SIZE in the vendored mimalloc
+ * (vendored/mimalloc/include/mimalloc/types.h:426, MI_LARGE_PAGE_SIZE/8 with
+ * MI_ENABLE_LARGE_PAGES defaulting to 1 at :115 and not overridden here), so
+ * the block is still bin-allocated from a large page. Growth is not free at
+ * this size for the same reason: arena_grow doubles to 1 MiB, which is above
+ * that bound and so a singleton OS allocation. One file in twelve thousand
+ * pays it, which is why the cost is accepted. */
+enum { CBM_EXTRACT_SCRATCH_BLOCK = CBM_SZ_512 * CBM_SZ_1K };
+
+static CBMFileResult *extract_file_ex_body(const char *source, int source_len, CBMLanguage language,
+                                           const char *project, const char *rel_path,
+                                           int64_t timeout_micros, const char **extra_defines,
+                                           const char **include_paths,
+                                           const CBMMacroTable *macro_table,
+                                           const CBMReturnTypeTable *return_type_table,
+                                           CBMArena *scratch) {
     // Allocate result on heap (arena inside for all string data)
     enum { SINGLE = 1 };
     CBMFileResult *result = (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));
@@ -1109,7 +1528,9 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     }
 
     cbm_index_mark_start(rel_path);
+#ifdef CBM_ENABLE_TEST_SEAMS
     cbm_test_fault_inject(rel_path);
+#endif
 
     // Get language spec
     const CBMLangSpec *spec = cbm_lang_spec(language);
@@ -1195,6 +1616,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     // Build extraction context
     CBMExtractCtx ctx = {
         .arena = a,
+        .scratch = scratch,
         .result = result,
         .source = source,
         .source_len = source_len,
@@ -1221,6 +1643,13 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         cbm_extract_k8s(&ctx);
     }
 
+    // dbt lineage pass: a dbt model's dependencies live in Jinja ({{ ref(...) }}),
+    // which the SQL grammar cannot read. Self-gated — SQL files only, and only
+    // those carrying a real dbt builtin call.
+    if (ctx.language == CBM_LANG_SQL) {
+        cbm_extract_dbt(&ctx);
+    }
+
     // LSP type-aware call/usage resolution (per-file). Runs in every mode;
     // refines the tree-sitter + textual-resolution graph with type info.
     uint64_t lsp_start = now_ns();
@@ -1229,7 +1658,8 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
             cbm_run_go_lsp(a, result, source, source_len, root);
         }
         if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
-            cbm_run_c_lsp(a, result, source, source_len, root, language != CBM_LANG_C);
+            cbm_run_c_lsp(a, result, source, source_len, root, language != CBM_LANG_C,
+                          CBM_SOURCE_ORIGIN_RAW);
         }
         if (language == CBM_LANG_PHP) {
             cbm_run_php_lsp(a, result, source, source_len, root);
@@ -1280,6 +1710,14 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     // metrics. Remember the boundary.
     int orig_calls_count = result->calls.count;
 
+    /* Phase 2 line map, built by the second (preprocessed) pass below and read
+     * by the parse-coverage block near the end of this function. Stays NULL
+     * for every language that has no second pass, which leaves the coverage
+     * signal exactly as it was. Arena-allocated so it outlives the
+     * preprocessed source and its tree. */
+    uint8_t *pp_line_map = NULL;
+    uint32_t pp_line_map_lines = 0;
+
     // Second pass: preprocess C/C++/CUDA and extract additional macro-hidden calls.
     // Defs keep original-source line numbers; only CALLS are extracted from expanded source.
     if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
@@ -1289,8 +1727,11 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         if (preprocessed && preprocessed->source) {
             char *expanded = preprocessed->source;
             int expanded_len = (int)strlen(expanded);
-            // Record calls count before second pass
+            // Record every site-bearing array boundary before the second pass.
+            // Numeric byte spans in `expanded` are not raw-source coordinates.
             int calls_before = result->calls.count;
+            int usages_before = result->usages.count;
+            int resolved_before = result->resolved_calls.count;
 
             // Parse expanded source with fresh tree
             TSParser *pp_parser = get_thread_parser(ts_lang, language);
@@ -1312,6 +1753,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                     // Build context for expanded source — extract only calls via unified extractor
                     CBMExtractCtx pp_ctx = {
                         .arena = a,
+                        .scratch = scratch,
                         .result = result,
                         .source = expanded,
                         .source_len = expanded_len,
@@ -1326,11 +1768,30 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                     // harmless (pipeline deduplicates by caller+callee).
                     cbm_extract_unified(&pp_ctx);
 
+                    /* Stamp parser carriers before C-LSP performs any
+                     * origin-sensitive rewrite. Numeric spans in the expanded
+                     * buffer may collide with unrelated raw-source spans. */
+                    for (int i = calls_before; i < result->calls.count; i++) {
+                        result->calls.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
+                    for (int i = usages_before; i < result->usages.count; i++) {
+                        result->usages.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
+
                     // Also run LSP on expanded source for additional type-resolved
                     // calls (language is already C/C++/CUDA — checked in enclosing
                     // block). Runs in every mode.
                     cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
-                                  language != CBM_LANG_C);
+                                  language != CBM_LANG_C, CBM_SOURCE_ORIGIN_PREPROCESSED);
+
+                    /* All C-LSP emitters stamp origin directly so rewrite-time
+                     * comparisons are already safe. Keep this boundary sweep as
+                     * a defensive invariant for any future emitter added to the
+                     * C resolver. */
+                    for (int i = resolved_before; i < result->resolved_calls.count; i++) {
+                        result->resolved_calls.items[i].source_origin =
+                            CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
 
                     /* #961: a def whose body braces are split across
                      * #ifdef/#else branches parses as an ERROR region on the
@@ -1343,8 +1804,8 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                      * the raw source line, and whose QN the raw pass did not
                      * already extract. */
                     if (ts_node_has_error(root)) {
-                        cbm_error_regions_t raw_regs = {{0}, {0}, 0};
-                        cbm_collect_error_regions(root, &raw_regs);
+                        cbm_error_regions_t raw_regs = {{0}, {0}, 0, 0};
+                        cbm_collect_error_regions(root, &raw_regs, source, source_len);
                         if (raw_regs.count > 0) {
                             int defs_before = result->defs.count;
                             cbm_extract_definitions(&pp_ctx);
@@ -1381,6 +1842,59 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                             }
                             result->defs.count = w;
                         }
+                    }
+
+                    /* Build the original-line map before the expanded tree
+                     * goes away. Skipped when the expanded parse is itself a
+                     * total loss (root is ERROR), because then it vouches for
+                     * nothing and there is no refinement to make. */
+                    if (strcmp(ts_node_type(pp_root), "ERROR") != 0) {
+                        uint32_t orig_lines = 1;
+                        for (int ci = 0; ci < source_len; ci++) {
+                            if (source[ci] == '\n') {
+                                orig_lines++;
+                            }
+                        }
+                        uint8_t *map = (uint8_t *)cbm_arena_alloc(a, (size_t)orig_lines + 2);
+                        int exp_lines = preprocessed->expanded_line_count;
+                        uint8_t *bad_rows =
+                            exp_lines > 0 ? (uint8_t *)calloc((size_t)exp_lines + 2, 1) : NULL;
+                        if (map && bad_rows) {
+                            memset(map, 0, (size_t)orig_lines + 2);
+                            cbm_mark_no_code_lines(source, source_len, map, orig_lines);
+                            cbm_mark_pp_error_rows(pp_root, bad_rows, (uint32_t)exp_lines, expanded,
+                                                   expanded_len);
+                            /* Walk the expanded text once. An expanded line
+                             * only vouches for its original line when it
+                             * actually HAS content: the preprocessor emits a
+                             * blank line where it dropped a branch, and a
+                             * blank line proves nothing about the code that
+                             * used to be there. */
+                            uint32_t eline = 1;
+                            bool eline_has_text = false;
+                            for (int ci = 0; ci <= expanded_len; ci++) {
+                                if (ci < expanded_len && expanded[ci] != '\n') {
+                                    char ch = expanded[ci];
+                                    if (ch != ' ' && ch != '\t' && ch != '\r') {
+                                        eline_has_text = true;
+                                    }
+                                    continue;
+                                }
+                                if (eline_has_text && (int)eline <= exp_lines && !bad_rows[eline] &&
+                                    preprocessed->belongs_to_main_file[eline]) {
+                                    uint32_t orig =
+                                        preprocessed->original_line_by_expanded_line[eline];
+                                    if (orig >= 1 && orig <= orig_lines) {
+                                        map[orig] |= CBM_LINE_PP_PARSED;
+                                    }
+                                }
+                                eline++;
+                                eline_has_text = false;
+                            }
+                            pp_line_map = map;
+                            pp_line_map_lines = orig_lines;
+                        }
+                        free(bad_rows);
                     }
 
                     ts_tree_delete(pp_tree);
@@ -1498,20 +2012,50 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
      * miss, and a fully recovered file is not flagged at all. Detection aid
      * only: the absence of this flag is NOT a completeness guarantee. */
     if (ts_node_has_error(root)) {
-        cbm_error_regions_t regs = {{0}, {0}, 0};
+        cbm_error_regions_t regs = {{0}, {0}, 0, 0};
         if (strcmp(ts_node_type(root), "ERROR") == 0) {
             cbm_error_regions_push(&regs, root); /* whole file unparseable */
         } else {
-            cbm_collect_error_regions(root, &regs);
+            cbm_collect_error_regions(root, &regs, source, source_len);
         }
+        /* Recovery subtraction runs on the RAW ranges, before the Phase 2
+         * refinement below. Its evidence is a whole definition that starts
+         * inside the range, so it has to be asked while the range still
+         * matches the construct. Ask it after the refinement and an #ifdef
+         * splitting a brace inside a recovered function looks unrecovered:
+         * the refinement keeps only the discarded branch, the function starts
+         * above it, and the evidence falls outside the range. */
         cbm_subtract_recovered_regions(&regs, &result->defs);
+        /* Phase 2: cut what is left down to the lines the preprocessed parse
+         * could not explain. */
+        if (pp_line_map) {
+            cbm_refine_regions_with_pp_lines(&regs, pp_line_map, pp_line_map_lines, source,
+                                             source_len, &result->defs);
+        }
         /* #1071: don't flag a benign function-like-macro call (defined in-file)
-         * that tree-sitter can't parse without the preprocessor. */
+         * that tree-sitter can't parse without the preprocessor. Runs AFTER the
+         * refinement, because its evidence is per-line: a narrow range points at
+         * the call itself instead of the whole blob around it. */
         cbm_subtract_macro_invocation_regions(&regs, &result->defs, source, source_len);
-        if (regs.count > 0) {
+        /* A file whose kept list is empty but whose cap still bound is NOT clean:
+         * the ranges the cap threw away were never judged by the two rules
+         * above, so nothing proves they were recovered. Flag it. */
+        if (regs.count > 0 || regs.dropped > 0) {
             result->parse_incomplete = true;
             result->error_region_count = regs.count;
             result->error_ranges = cbm_error_ranges_str(a, &regs);
+            /* One range covering nearly the whole file is not advice, it is
+             * noise: "look at lines 1 to 13047" of a 13046-line file tells a
+             * reader nothing they did not already know. Mark those separately
+             * so the report can say "read the source" instead. See
+             * parse_unusable in cbm.h for which files land here and why. */
+            if (regs.count == 1 && regs.dropped == 0) {
+                uint32_t total = cbm_count_lines(source, source_len);
+                uint32_t span = regs.ends[0] - regs.starts[0] + 1;
+                if (total > 0 && span * 100 >= total * CBM_UNUSABLE_PCT) {
+                    result->parse_unusable = true;
+                }
+            }
         }
     }
 
@@ -1529,6 +2073,26 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     return result;
 }
 
+/* Public entry. Owns the traversal scratch arena for the whole of one file's
+ * extraction: created here, handed to the body as ctx->scratch, destroyed on
+ * the way out. The body has seven early returns, so bracketing it in a wrapper
+ * is what keeps that to one create and one destroy. If the arena cannot be
+ * created, the body is handed NULL and the traversal stacks fall back to the
+ * result arena, which is what shipped before #1997. */
+CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLanguage language,
+                                   const char *project, const char *rel_path,
+                                   int64_t timeout_micros, const char **extra_defines,
+                                   const char **include_paths, const CBMMacroTable *macro_table,
+                                   const CBMReturnTypeTable *return_type_table) {
+    CBMArena scratch;
+    cbm_arena_init_sized(&scratch, CBM_EXTRACT_SCRATCH_BLOCK);
+    CBMFileResult *result = extract_file_ex_body(
+        source, source_len, language, project, rel_path, timeout_micros, extra_defines,
+        include_paths, macro_table, return_type_table, scratch.nblocks > 0 ? &scratch : NULL);
+    cbm_arena_destroy(&scratch);
+    return result;
+}
+
 void cbm_free_result(CBMFileResult *result) {
     if (!result) {
         return;
@@ -1537,6 +2101,12 @@ void cbm_free_result(CBMFileResult *result) {
         ts_tree_delete(result->cached_tree);
         result->cached_tree = NULL;
     }
+    for (int i = 0; i < result->owned_result_count; i++) {
+        cbm_free_result(result->owned_results[i]);
+    }
+    free(result->owned_results);
+    result->owned_results = NULL;
+    result->owned_result_count = 0;
     cbm_arena_destroy(&result->arena);
     free(result);
 }

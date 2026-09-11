@@ -114,20 +114,23 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
     *out_vals = NULL;
     *out_count = 0;
 
-    /* Fast path: build from cached extraction result (no JSON parsing) */
+    /* Fast path: build from cached extraction via the same resolver used for
+     * IMPORTS edges. Do NOT use cbm_pipeline_fqn_module(module_path) — Python
+     * from-imports store "pkg.symbol" (and aliases) in module_path, which is
+     * not a filesystem rel-path and misses the def node. */
     if (result && result->imports.count > 0) {
         const char **keys = calloc((size_t)result->imports.count, sizeof(const char *));
         const char **vals = calloc((size_t)result->imports.count, sizeof(const char *));
         int count = 0;
+        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
 
         for (int i = 0; i < result->imports.count; i++) {
             const CBMImport *imp = &result->imports.items[i];
             if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
                 continue;
             }
-            char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
-            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
-            free(target_qn);
+            const cbm_gbuf_node_t *target =
+                cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, imp, NULL);
             if (!target) {
                 continue;
             }
@@ -135,11 +138,18 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
             vals[count] = target->qualified_name; /* borrowed from gbuf */
             count++;
         }
+        free(file_qn);
 
-        *out_keys = keys;
-        *out_vals = vals;
-        *out_count = count;
-        return 0;
+        if (count > 0) {
+            *out_keys = keys;
+            *out_vals = vals;
+            *out_count = count;
+            return 0;
+        }
+        free((void *)keys);
+        free((void *)vals);
+        /* Fall through to IMPORTS-edge scan when extraction paths did not
+         * resolve (should be rare once resolve_import_node is used). */
     }
 
     /* Slow path: scan graph buffer IMPORTS edges + parse JSON properties */
@@ -303,7 +313,11 @@ static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
             n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\"}", i > 0 ? "," : "", a->index,
                          esc_e);
         }
-        if (n <= 0 || (size_t)n >= cap - pos - PAIR_LEN) {
+        /* Add rather than subtract: pos is unsigned, so `cap - pos - PAIR_LEN`
+         * wraps once pos reaches cap - PAIR_LEN and stops bounding the memcpy
+         * below. The closing write at the end of this function already guards
+         * additively; match it. */
+        if (n <= 0 || pos + (size_t)n + PAIR_LEN >= cap) {
             break; /* not enough room — close the array with what fits */
         }
         memcpy(props + pos, one, (size_t)n);
@@ -345,7 +359,13 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
          * substring coincidence in the resolved QN (e.g. "SalesforceRestClient"
          * matches the "RestClient" HTTP lib). Emit a plain CALLS edge — unless a
          * weak TS/JS member-call match should be suppressed (#592/#606). */
-        if (suppress_plain_calls) {
+        /* !target: the service-pattern call sites pass NULL (the route node is
+         * synthesized below) behind a hand-duplicated copy of the is_url/
+         * is_topic predicate above. While the copies agree this branch is
+         * unreachable for them -- but a drift between the two would turn
+         * target->id into a null dereference (clang-analyzer traced exactly
+         * that), and with no callee node there is nothing to emit anyway. */
+        if (suppress_plain_calls || !target) {
             return;
         }
         char esc_callee[CBM_SZ_256];
@@ -467,10 +487,16 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     /* LSP-resolved calls take precedence over registry-textual matching.
      * Unique-tail fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
-    const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution(lsp_calls, call, allow_tail);
+    const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_in_graph(
+        lsp_calls, call, allow_tail, ctx->gbuf, ctx->project_name);
     if (lsp) {
+        bool exact_external_target = call->requires_lsp_resolution &&
+                                     cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
         const cbm_gbuf_node_t *target_node =
-            cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, lsp->callee_qn, allow_tail);
+            exact_external_target ? cbm_pipeline_lsp_target_node_strict(
+                                        ctx->gbuf, ctx->project_name, lsp->callee_qn, allow_tail)
+                                  : cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
+                                                                 lsp->callee_qn, allow_tail);
         if (target_node && source_node->id != target_node->id) {
             cbm_resolution_t res = {0};
             /* Use the gbuf node's QN so downstream edge props show the canonical
@@ -483,6 +509,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                  imp_vals, imp_count, false);
             return SKIP_ONE;
         }
+    }
+
+    /* Synthetic semantic candidates (currently implicit C++ operators) are
+     * valid calls only when the language resolver identifies a concrete
+     * invocation target. Textual registry/service fallbacks would bind an
+     * unresolved primitive expression such as `int + int` to an unrelated
+     * project `operator+`, fabricating a CALLS edge. */
+    if (call->requires_lsp_resolution) {
+        return 0;
     }
 
     /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the service
@@ -571,20 +606,37 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
 
-    /* TS/JS/TSX weak-method suppression (#592/#606). A member call x.foo() only
-     * reaches the registry when the TS-LSP could not resolve the receiver type
-     * (the LSP block above already returned for type-resolved calls, including
-     * the "resolved but target out of gbuf" fall-through). Binding such a call
-     * by a weak short-name strategy fabricates an edge (`re.test()` -> a project
-     * `test`). Rather than drop it here — which would also skip the service
-     * bypasses below and emit_classified_edge's route/HTTP/CONFIG branches —
-     * defer to emit_classified_edge and suppress ONLY the plain-CALLS
-     * fall-through, so every service edge stays main-identical. res.strategy may
-     * be lsp_* here; the helper's explicit drop-list leaves lsp_* untouched. */
-    bool is_tsjs =
-        lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
-    bool tsjs_drop_plain_call =
-        cbm_tsjs_suppress_weak_method_match(is_tsjs, call->is_method, res.strategy);
+    /* Dynamic-language weak-member suppression (#592/#606/#1276). A member call
+     * x.foo() only reaches the registry when the language's LSP could not
+     * resolve the receiver type (the LSP block above already returned for
+     * type-resolved calls, including the "resolved but target out of gbuf"
+     * fall-through). Binding such a call by a weak short-name strategy
+     * fabricates an edge (`re.test()` -> a project `test`,
+     * `accelerator.print()` -> MockAccelerator.print). Rather than drop it here
+     * — which would also skip the service bypasses below and
+     * emit_classified_edge's route/HTTP/CONFIG branches — defer to
+     * emit_classified_edge and suppress ONLY the plain-CALLS fall-through, so
+     * every service edge stays main-identical. res.strategy may be lsp_* here;
+     * the helper's explicit drop-list leaves lsp_* untouched.
+     *
+     * This language set MUST match the one in pass_parallel.c exactly — a
+     * language gated on only one resolver produces an edge on the sequential
+     * path and not the parallel one (or vice versa), breaking MT determinism.
+     * ArkTS belongs to the JS/TS family here (#1842); dropping it would
+     * reintroduce the #592/#606 false-edge class for .ets files. */
+    bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
+                                lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+                                lang == CBM_LANG_ARKTS;
+    /* Bare-call local-binding suppression. A member call has a receiver the
+     * guard above can reason about; a bare `run()` has none, so that guard
+     * cannot see this class at all. Python-only today because the extraction
+     * flag is set only for Python — this gate MUST match pass_parallel.c's
+     * exactly, for the same divergence reason noted above. */
+    bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
+    bool drop_plain_call =
+        cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) ||
+        cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
+                                             call->callee_is_locally_bound, res.strategy);
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
@@ -610,8 +662,14 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
+    /* #725: suffix_match is language-agnostic and will attach a Python
+     * Store.commit() call to a JS function named commit (or a Bash main
+     * to a Python main). Drop that weak cross-language edge. */
+    if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
+        return 0;
+    }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
-                         imp_count, tsjs_drop_plain_call);
+                         imp_count, drop_plain_call);
     return SKIP_ONE;
 }
 
@@ -942,5 +1000,6 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
     }
 }
 
-/* DLL resolve tracking removed — triggered Windows Defender false positive.
- * See issue #89. */
+/* DLL resolve tracking remains removed after associated builds received a
+ * Windows Defender verdict. The verdict did not provide feature attribution;
+ * see issue #89 for the historical observation. */

@@ -18,12 +18,14 @@ enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_MARGIN = 3, PD
 enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "pipeline/pipeline.h"
 #include <stdint.h>
+#include <ctype.h>
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
+#include "foundation/str_util.h"
 #include "cbm.h"
 #include "arena.h"
 #include "iris_export_xml.h"
@@ -327,18 +329,12 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
-    /* Register callable symbols + every type-like container (Class/Struct/
-     * Interface/Enum/Type/Trait). Type-like defs must be in the registry so
-     * `class Foo : IBar` (INHERITS), `impl Trait for S` (IMPLEMENTS), and method/
-     * field resolution can reach them — Struct included so Rust/Go/Swift/D structs
-     * resolve as type targets just as a Class did. Variable/Field defs are also
-     * registered so pass_usages.c can resolve READS/WRITES accesses (rw->var_name)
-     * to a Variable/Field node QN.
-     * KEEP IN SYNC with pass_parallel.c and pipeline_incremental.c's seed sets. */
-    if (node_id > 0 && def->label &&
-        (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-         cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
-         strcmp(def->label, "Field") == 0)) {
+    /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
+     * (helpers.c): callables + type-like containers (INHERITS/IMPLEMENTS/method/
+     * field resolution), Variable/Field (READS/WRITES resolution), and Table/View
+     * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
+     * through the same predicate, so the three registries cannot diverge. */
+    if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -405,8 +401,8 @@ static void create_channel_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
  * env key and link the enclosing function (or the file node) CONFIGURES-> it,
  * so environment-driven configuration is visible even when the accessor is a
  * stdlib symbol that never resolves to an in-graph callee. */
-static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                          const char *rel) {
+int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,
+                                                const CBMFileResult *result, const char *rel) {
     int count = 0;
     char *file_qn = NULL;
     const cbm_gbuf_node_t *file_node = NULL;
@@ -470,9 +466,10 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
         const cbm_gbuf_node_t *target =
             cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
         if (target && target->id != source_node->id) {
+            char esc_ln[CBM_SZ_128];
+            cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
             char imp_props[CBM_SZ_256];
-            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}",
-                     imp->local_name ? imp->local_name : "");
+            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
             cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
             count++;
         }
@@ -480,6 +477,252 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
     free(file_qn);
     return count;
 }
+
+static bool objectscript_export_append_strings(CBMArena *arena, const char ***dst,
+                                               const char *const *src) {
+    if (!src) {
+        return true;
+    }
+    int old_count = 0;
+    int add_count = 0;
+    while (*dst && (*dst)[old_count]) {
+        old_count++;
+    }
+    while (src[add_count]) {
+        add_count++;
+    }
+    const char **items = (const char **)cbm_arena_alloc(arena, (size_t)(old_count + add_count + 1) *
+                                                                   sizeof(const char *));
+    if (!items) {
+        return false;
+    }
+    for (int i = 0; i < old_count; i++) {
+        items[i] = (*dst)[i];
+    }
+    for (int i = 0; i < add_count; i++) {
+        items[old_count + i] = src[i];
+    }
+    items[old_count + add_count] = NULL;
+    *dst = items;
+    return true;
+}
+
+#define OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, field, push_fn)                   \
+    do {                                                                                    \
+        int expected_count = (aggregate)->field.count + (part)->field.count;                \
+        for (int item_i = 0; item_i < (part)->field.count; item_i++) {                      \
+            push_fn(&(aggregate)->field, &(aggregate)->arena, (part)->field.items[item_i]); \
+        }                                                                                   \
+        if ((aggregate)->field.count != expected_count) {                                   \
+            return false;                                                                   \
+        }                                                                                   \
+    } while (0)
+
+static bool objectscript_export_append_primary_arrays(CBMFileResult *aggregate,
+                                                      const CBMFileResult *part) {
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, defs, cbm_defs_push);
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, calls, cbm_calls_push);
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, imports, cbm_imports_push);
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, usages, cbm_usages_push);
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, throws, cbm_throws_push);
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, rw, cbm_rw_push);
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, type_refs, cbm_typerefs_push);
+    return true;
+}
+
+static bool objectscript_export_append_secondary_arrays(CBMFileResult *aggregate,
+                                                        const CBMFileResult *part) {
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, env_accesses, cbm_envaccess_push);
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, type_assigns, cbm_typeassign_push);
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, impl_traits, cbm_impltrait_push);
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, resolved_calls, cbm_resolvedcall_push);
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, string_refs, cbm_stringref_push);
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, infra_bindings, cbm_infrabinding_push);
+    OBJECTSCRIPT_EXPORT_APPEND_ARRAY(aggregate, part, channels, cbm_channels_push);
+    return true;
+}
+
+/* Preserve every generated class's parse diagnostics. The generated UDL
+ * snippets all map back to one physical Studio Export file, so their compact
+ * range lists can be concatenated using the ordinary comma separator. */
+/* Read the trailing ",+<N>" truncation marker off a range string. Returns the
+ * number of dropped ranges the marker reports, or 0 when there is no marker,
+ * and writes the length of the part before the marker to `body_len`. */
+static int objectscript_export_split_range_marker(const char *ranges, size_t *body_len) {
+    size_t len = ranges ? strlen(ranges) : 0;
+    *body_len = len;
+    if (len == 0) {
+        return 0;
+    }
+    size_t i = len;
+    while (i > 0 && isdigit((unsigned char)ranges[i - 1])) {
+        i--;
+    }
+    if (i == len || i == 0 || ranges[i - 1] != '+') {
+        return 0;
+    }
+    size_t marker = i - 1; /* index of '+' */
+    if (marker > 0 && ranges[marker - 1] == ',') {
+        marker--; /* drop the separator too */
+    }
+    *body_len = marker;
+    return atoi(ranges + i);
+}
+
+/* Join one Studio Export part's ranges onto the aggregate.
+ *
+ * One export file can hold several <Class> elements, each parsed separately,
+ * so their range strings get concatenated. A ",+<N>" truncation marker must
+ * end up ONCE, at the very end: every reader stops at the first token that is
+ * not a range, so a marker left in the middle would silently hide every range
+ * after it. Strip the marker off both sides, join the plain ranges, then add
+ * one marker back carrying the summed count. */
+static bool objectscript_export_append_error_ranges(CBMFileResult *aggregate,
+                                                    const CBMFileResult *part) {
+    aggregate->parse_incomplete = aggregate->parse_incomplete || part->parse_incomplete;
+    aggregate->parse_unusable = aggregate->parse_unusable || part->parse_unusable;
+    aggregate->error_region_count += part->error_region_count;
+    if (!part->error_ranges || !part->error_ranges[0]) {
+        return true;
+    }
+
+    size_t agg_len = 0;
+    size_t part_len = 0;
+    int dropped = 0;
+    const char *agg_body = aggregate->error_ranges;
+    if (agg_body && agg_body[0]) {
+        dropped += objectscript_export_split_range_marker(agg_body, &agg_len);
+    } else {
+        agg_body = NULL;
+    }
+    dropped += objectscript_export_split_range_marker(part->error_ranges, &part_len);
+
+    const char *combined = NULL;
+    if (agg_body && agg_len > 0 && part_len > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%.*s,%.*s", (int)agg_len, agg_body,
+                                     (int)part_len, part->error_ranges);
+    } else if (agg_body && agg_len > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%.*s", (int)agg_len, agg_body);
+    } else if (part_len > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%.*s", (int)part_len, part->error_ranges);
+    } else {
+        combined = cbm_arena_strdup(&aggregate->arena, "");
+    }
+    if (!combined) {
+        return false;
+    }
+    if (dropped > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%s%s+%d", combined, combined[0] ? "," : "",
+                                     dropped);
+        if (!combined) {
+            return false;
+        }
+    }
+    aggregate->error_ranges = combined;
+    return true;
+}
+
+#if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
+/* Test seam. This join only fires for a Studio Export file holding several
+ * <Class> elements where a class overruns the 256-region cap — hard to reach
+ * through the pipeline, easy to get wrong, and a wrong result hides ranges
+ * without saying so. Expose the join so the marker rules can be pinned. */
+bool cbm_pipeline_coverage_marker_test_join(CBMFileResult *aggregate, const CBMFileResult *part) {
+    return objectscript_export_append_error_ranges(aggregate, part);
+}
+#endif
+
+/* Studio Export files may contain multiple <Class> elements, while the
+ * pipeline cache has one slot per physical file. Extract each generated UDL
+ * class independently (preserving the upstream parser behavior), then compose
+ * every extracted carrier into one result for the normal registry/call/usage/
+ * semantic passes. */
+CBMFileResult *cbm_pipeline_extract_objectscript_export(
+    const char *source, int source_len, const char *project_name, const char *rel_path,
+    const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table) {
+    CBMArena export_arena;
+    cbm_arena_init(&export_arena);
+    int class_count = 0;
+    char **udl_strings = cbm_iris_export_to_udl(&export_arena, source, source_len, &class_count);
+    if (!udl_strings || class_count <= 0) {
+        cbm_arena_destroy(&export_arena);
+        return NULL;
+    }
+
+    CBMFileResult *aggregate = (CBMFileResult *)calloc(1, sizeof(CBMFileResult));
+    if (!aggregate) {
+        cbm_arena_destroy(&export_arena);
+        return NULL;
+    }
+    cbm_arena_init(&aggregate->arena);
+    if (aggregate->arena.nblocks == 0) {
+        cbm_free_result(aggregate);
+        cbm_arena_destroy(&export_arena);
+        return NULL;
+    }
+    aggregate->owned_results =
+        (CBMFileResult **)calloc((size_t)class_count, sizeof(CBMFileResult *));
+    if (!aggregate->owned_results) {
+        cbm_free_result(aggregate);
+        cbm_arena_destroy(&export_arena);
+        return NULL;
+    }
+    aggregate->cached_lang = CBM_LANG_OBJECTSCRIPT_UDL;
+
+    for (int ci = 0; ci < class_count; ci++) {
+        CBMFileResult *part = cbm_extract_file_ex(
+            udl_strings[ci], (int)strlen(udl_strings[ci]), CBM_LANG_OBJECTSCRIPT_UDL, project_name,
+            rel_path, CBM_EXTRACT_BUDGET, NULL, NULL, macro_table, return_type_table);
+        if (!part) {
+            continue;
+        }
+
+        /* The aggregate has no single parse tree. Later ObjectScript Export
+         * passes consume extracted carriers, not a raw-XML tree. */
+        cbm_free_tree(part);
+        if (!objectscript_export_append_primary_arrays(aggregate, part) ||
+            !objectscript_export_append_secondary_arrays(aggregate, part) ||
+            !objectscript_export_append_strings(&aggregate->arena, &aggregate->exports,
+                                                part->exports) ||
+            !objectscript_export_append_strings(&aggregate->arena, &aggregate->constants,
+                                                part->constants) ||
+            !objectscript_export_append_strings(&aggregate->arena, &aggregate->global_vars,
+                                                part->global_vars) ||
+            !objectscript_export_append_strings(&aggregate->arena, &aggregate->macros,
+                                                part->macros) ||
+            !objectscript_export_append_error_ranges(aggregate, part)) {
+            goto merge_failed;
+        }
+
+        if (!aggregate->module_qn) {
+            aggregate->module_qn = part->module_qn;
+        }
+        if (!aggregate->namespace_name) {
+            aggregate->namespace_name = part->namespace_name;
+        }
+        if (part->has_error) {
+            aggregate->has_error = true;
+            if (!aggregate->error_msg) {
+                aggregate->error_msg = part->error_msg;
+            }
+        }
+        aggregate->is_test_file = aggregate->is_test_file || part->is_test_file;
+        aggregate->owned_results[aggregate->owned_result_count++] = part;
+        continue;
+
+    merge_failed:
+        cbm_free_result(part);
+        cbm_free_result(aggregate);
+        cbm_arena_destroy(&export_arena);
+        return NULL;
+    }
+
+    aggregate->imports_count = aggregate->imports.count;
+    cbm_arena_destroy(&export_arena);
+    return aggregate;
+}
+
+#undef OBJECTSCRIPT_EXPORT_APPEND_ARRAY
 
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count) {
@@ -515,6 +758,18 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
      * complete in-memory graph in Phase 2. */
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
+            /* Cancellation mid-extraction: release the cache this pass owns,
+             * including results already extracted into it (the normal cleanup
+             * at the end of the pass does the same) -- clang-analyzer caught
+             * this return leaking the whole cache. */
+            if (owns_local_cache) {
+                for (int j = 0; j < file_count; j++) {
+                    if (local_cache[j]) {
+                        cbm_free_result(local_cache[j]);
+                    }
+                }
+                free(local_cache);
+            }
             return CBM_NOT_FOUND;
         }
 
@@ -535,8 +790,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             if (!phase) {
                 phase = "crash";
             }
-            const char *reason =
-                (strcmp(phase, "hang") == 0) ? "quarantined after hang" : "quarantined after crash";
+            const char *reason = (strcmp(phase, "hang") == 0)    ? "quarantined after hang"
+                                 : (strcmp(phase, "error") == 0) ? "quarantined after error"
+                                                                 : "quarantined after crash";
             cbm_pipeline_add_file_error(ctx->pipeline, rel, reason, phase);
             errors++;
             continue;
@@ -568,42 +824,15 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             continue;
         }
 
-        /* ObjectScript Studio Export XML: transcode each <Class> to UDL and
-         * extract it as CBM_LANG_OBJECTSCRIPT_UDL. The XML→UDL mapping is 1:1,
-         * so the same UDL extractor handles the result. These files are not
-         * cached (their defs/edges are emitted directly here). */
-        if (lang == CBM_LANG_OBJECTSCRIPT_EXPORT) {
-            CBMArena export_arena;
-            cbm_arena_init(&export_arena);
-            int class_count = 0;
-            char **udl_strings =
-                cbm_iris_export_to_udl(&export_arena, source, source_len, &class_count);
-            free(source);
-            for (int ci = 0; ci < class_count; ci++) {
-                CBMFileResult *xr = cbm_extract_file_ex(
-                    udl_strings[ci], (int)strlen(udl_strings[ci]), CBM_LANG_OBJECTSCRIPT_UDL,
-                    ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL, NULL, ctx->macro_table, NULL);
-                if (!xr) {
-                    continue;
-                }
-                for (int d = 0; d < xr->defs.count; d++) {
-                    process_def(ctx, &xr->defs.items[d], rel);
-                    total_defs++;
-                }
-                total_calls += xr->calls.count;
-                total_imports += create_import_edges_for_file(ctx, xr, rel, NULL);
-                create_channel_edges_for_file(ctx, xr, rel);
-                create_env_configures_for_file(ctx, xr, rel);
-                cbm_free_result(xr);
-            }
-            cbm_arena_destroy(&export_arena);
-            continue;
-        }
-
-        /* Extract */
-        CBMFileResult *result = cbm_extract_file_ex(
-            source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL,
-            NULL /* no extra defines or include paths */, ctx->macro_table, NULL);
+        /* Studio Export XML is transformed to one cacheable aggregate so later
+         * passes see the same calls/usages/semantic carriers as native UDL. */
+        CBMFileResult *result =
+            lang == CBM_LANG_OBJECTSCRIPT_EXPORT
+                ? cbm_pipeline_extract_objectscript_export(source, source_len, ctx->project_name,
+                                                           rel, ctx->macro_table, NULL)
+                : cbm_extract_file_ex(
+                      source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL,
+                      NULL /* no extra defines or include paths */, ctx->macro_table, NULL);
         free(source);
 
         if (!result) {
@@ -623,9 +852,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         } else if (result->parse_incomplete) {
             /* Best-effort parse-coverage signal (#963): indexed, but with
              * ERROR/MISSING regions — see pass_parallel.c (keep in sync). */
-            cbm_pipeline_add_file_error(ctx->pipeline, rel,
-                                        result->error_ranges ? result->error_ranges : "unknown",
-                                        "parse_partial");
+            cbm_pipeline_add_file_error(
+                ctx->pipeline, rel, result->error_ranges ? result->error_ranges : "unknown",
+                result->parse_unusable ? "parse_unusable" : "parse_partial");
         }
 
         /* Create nodes for each definition */
@@ -647,7 +876,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
              * map is available without the cache (single-file scope). */
             total_imports += create_import_edges_for_file(ctx, result, rel, NULL);
             create_channel_edges_for_file(ctx, result, rel);
-            create_env_configures_for_file(ctx, result, rel);
+            cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
             cbm_free_result(result);
         }
     }
@@ -680,7 +909,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             total_imports +=
                 create_import_edges_for_file(ctx, result, files[i].rel_path, namespace_map);
             create_channel_edges_for_file(ctx, result, files[i].rel_path);
-            create_env_configures_for_file(ctx, result, files[i].rel_path);
+            cbm_pipeline_create_env_configures_for_file(ctx, result, files[i].rel_path);
         }
         cbm_pipeline_namespace_map_free(namespace_map);
         if (owns_local_cache) {

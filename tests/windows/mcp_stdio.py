@@ -45,7 +45,8 @@ class McpServer:
             [self.binary],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=self.env, cwd=self.cwd, bufsize=0)
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
 
     def _drain_stderr(self):
         try:
@@ -80,7 +81,10 @@ class McpServer:
             raise McpError("read error: %r" % result["exc"])
         line = result.get("line", b"")
         if not line:
-            raise McpError("EOF / server closed stdout")
+            self._stderr_thread.join(timeout=1)
+            stderr = self.stderr_text().strip()
+            detail = ": %s" % stderr[-1200:] if stderr else ""
+            raise McpError("EOF / server closed stdout%s" % detail)
         # strict: an invalid-UTF-8 JSON-RPC response is itself a failure.
         return json.loads(line.decode("utf-8", "strict"))
 
@@ -144,3 +148,34 @@ class McpServer:
                 self.proc.kill()
             except Exception:
                 pass
+
+
+def wait_projects_with_stats(server, timeout=90.0, poll=1.0):
+    """Poll list_projects until a project row carries node/edge counts.
+
+    index_repository returns when the pipeline finishes, but the project
+    stats are published asynchronously; on slow CI runners the first
+    list_projects can observe the registration row before its counts land
+    (`nodes` absent/None). That window is environmental, not a product
+    regression (#1952), so wait it out instead of failing setup on it.
+
+    Returns (projects, last_text): the parsed project list (possibly [])
+    and the last raw list_projects payload for diagnostics.
+    """
+    deadline = time.time() + timeout
+    last_txt = ""
+    while True:
+        resp = server.call_tool("list_projects", {}, timeout=60)
+        txt, err = server.tool_text(resp)
+        projects = []
+        if not err and txt:
+            last_txt = txt
+            try:
+                projects = json.loads(txt).get("projects") or []
+            except ValueError:
+                projects = []
+        if projects and projects[0].get("nodes") is not None:
+            return projects, last_txt
+        if time.time() >= deadline:
+            return projects, last_txt
+        time.sleep(poll)

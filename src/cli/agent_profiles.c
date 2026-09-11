@@ -7,6 +7,7 @@
  */
 #include "cli/agent_profiles.h"
 
+#include "cli/config_toml_edit.h"
 #include "yyjson/yyjson.h"
 
 #include <stdbool.h>
@@ -310,6 +311,10 @@ static const char *dialect_tool_prefix(cbm_graph_profile_dialect_t dialect) {
         return "codebase-memory-mcp_";
     case CBM_GRAPH_DIALECT_KIRO:
         return "@codebase-memory-mcp/";
+    case CBM_GRAPH_DIALECT_OMP:
+        return "mcp__codebase_memory_mcp_";
+    case CBM_GRAPH_DIALECT_GROK:
+        return "codebase-memory-mcp__";
     default:
         return NULL;
     }
@@ -451,9 +456,51 @@ static char *render_kiro_profile(cbm_graph_tier_t tier, cbm_graph_access_t acces
     return result;
 }
 
+/* Codex deserializes role files standalone: a server table without command/url
+ * is rejected as "invalid transport" and the whole role is dropped, so direct
+ * profiles must declare the transport. rc1_transportless reproduces the
+ * v0.9.1-rc.1 rendering so installs can migrate those files. */
+static bool append_codex_profile(profile_buffer_t *buffer, cbm_graph_tier_t tier,
+                                 cbm_graph_access_t access, const char *binary_path,
+                                 const char *prompt, bool rc1_transportless) {
+    if (!profile_buffer_append(buffer, "name = \"") ||
+        !profile_buffer_append(buffer, cbm_graph_tier_slug(tier)) ||
+        !profile_buffer_append(buffer, "\"\ndescription = \"") ||
+        !profile_buffer_append(buffer, profile_description(tier, access)) ||
+        !profile_buffer_append(buffer, "\"\nsandbox_mode = \"read-only\"\ndeveloper_instructions = "
+                                       "\"\"\"\n") ||
+        !profile_buffer_append(buffer, prompt) || !profile_buffer_append(buffer, "\"\"\"\n")) {
+        return false;
+    }
+    if (access != CBM_GRAPH_ACCESS_DIRECT) {
+        return true;
+    }
+    if (!profile_buffer_append(buffer, "\n[mcp_servers.codebase-memory-mcp]\n")) {
+        return false;
+    }
+    if (!rc1_transportless) {
+        char escaped_binary[8192];
+        if (!binary_path || !binary_path[0] ||
+            cbm_toml_escape_basic_string(binary_path, escaped_binary, sizeof(escaped_binary)) !=
+                0) {
+            return false;
+        }
+        if (!profile_buffer_append(buffer, "command = \"") ||
+            !profile_buffer_append(buffer, escaped_binary) ||
+            !profile_buffer_append(buffer, "\"\nargs = [\"--tool-profile=") ||
+            !profile_buffer_append(buffer, tier_server_profile(tier)) ||
+            !profile_buffer_append(buffer, "\"]\n")) {
+            return false;
+        }
+    }
+    return profile_buffer_append(buffer, "enabled_tools = [") &&
+           append_toml_mcp_tools(buffer, CBM_GRAPH_DIALECT_CODEX, tier, false) &&
+           profile_buffer_append(buffer, "]\n");
+}
+
 static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dialect_t dialect,
                                 cbm_graph_tier_t tier, cbm_graph_access_t access,
-                                const char *prompt) {
+                                const char *binary_path, const char *prompt) {
     const char *slug = cbm_graph_tier_slug(tier);
     const char *display = cbm_graph_tier_display_name(tier);
     const char *description = profile_description(tier, access);
@@ -471,21 +518,7 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
         }
         return true;
     case CBM_GRAPH_DIALECT_CODEX:
-        if (!profile_buffer_append(buffer, "name = \"") || !profile_buffer_append(buffer, slug) ||
-            !profile_buffer_append(buffer, "\"\ndescription = \"") ||
-            !profile_buffer_append(buffer, description) ||
-            !profile_buffer_append(
-                buffer, "\"\nsandbox_mode = \"read-only\"\ndeveloper_instructions = \"\"\"\n") ||
-            !profile_buffer_append(buffer, prompt) || !profile_buffer_append(buffer, "\"\"\"\n")) {
-            return false;
-        }
-        if (direct && (!profile_buffer_append(
-                           buffer, "\n[mcp_servers.codebase-memory-mcp]\nenabled_tools = [") ||
-                       !append_toml_mcp_tools(buffer, dialect, tier, false) ||
-                       !profile_buffer_append(buffer, "]\n"))) {
-            return false;
-        }
-        return true;
+        return append_codex_profile(buffer, tier, access, binary_path, prompt, false);
     case CBM_GRAPH_DIALECT_GEMINI:
         if (!append_yaml_identity(buffer, slug, description) ||
             !profile_buffer_append(buffer,
@@ -589,6 +622,27 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
             return false;
         }
         return true;
+    case CBM_GRAPH_DIALECT_GROK:
+        /* Grok Build children reach MCP only through the search_tool/use_tool
+         * dispatcher and inherit servers by NAME (mcpInheritance), never by
+         * tool, so the tier allowlist is spelled out in the body as the exact
+         * `server__tool` ids the dispatcher accepts. Handoff inherits nothing. */
+        if (!append_yaml_identity(buffer, slug, description) ||
+            !profile_buffer_append(buffer, "tools: read_file, grep, list_dir") ||
+            (direct && !profile_buffer_append(buffer, ", search_tool, use_tool")) ||
+            !profile_buffer_append(
+                buffer, direct ? "\nmcpInheritance:\n  named:\n    - codebase-memory-mcp\n---\n"
+                               : "\nmcpInheritance: none\n---\n") ||
+            (direct && (!profile_buffer_append(
+                            buffer, "Reach the graph only through `search_tool`/`use_tool`. "
+                                    "The only allowed tool ids are ") ||
+                        !append_csv_mcp_tools(buffer, dialect, tier) ||
+                        !profile_buffer_append(
+                            buffer, "; never call any other codebase-memory-mcp tool.\n\n"))) ||
+            !profile_buffer_append(buffer, prompt)) {
+            return false;
+        }
+        return true;
     case CBM_GRAPH_DIALECT_AUGMENT:
         return append_yaml_identity(buffer, slug, description) &&
                profile_buffer_append(buffer, "---\n") && profile_buffer_append(buffer, prompt);
@@ -605,6 +659,16 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
         return append_yaml_identity(buffer, slug, description) &&
                profile_buffer_append(buffer, "tools:\n  - readFile\n---\n") &&
                profile_buffer_append(buffer, prompt);
+    case CBM_GRAPH_DIALECT_OMP:
+        if (!append_yaml_identity(buffer, slug, description) ||
+            !profile_buffer_append(buffer, "tools:\n  - read\n  - grep\n  - glob\n") ||
+            (direct && !append_yaml_mcp_tools(buffer, dialect, tier)) ||
+            !profile_buffer_append(
+                buffer, "read-summarize: false\nautoloadSkills: [codebase-memory]\n---\n") ||
+            !profile_buffer_append(buffer, prompt)) {
+            return false;
+        }
+        return true;
     default:
         return false;
     }
@@ -627,7 +691,26 @@ char *cbm_render_graph_profile(cbm_graph_profile_dialect_t dialect, cbm_graph_ti
     }
     profile_buffer_t buffer;
     profile_buffer_init(&buffer);
-    bool ok = render_profile_text(&buffer, dialect, tier, access, prompt);
+    bool ok = render_profile_text(&buffer, dialect, tier, access, binary_path, prompt);
+    free(prompt);
+    if (!ok) {
+        profile_buffer_discard(&buffer);
+        return NULL;
+    }
+    return profile_buffer_finish(&buffer);
+}
+
+char *cbm_render_graph_profile_codex_rc1(cbm_graph_tier_t tier) {
+    if (!tier_valid(tier)) {
+        return NULL;
+    }
+    char *prompt = cbm_render_graph_prompt(tier, CBM_GRAPH_ACCESS_DIRECT);
+    if (!prompt) {
+        return NULL;
+    }
+    profile_buffer_t buffer;
+    profile_buffer_init(&buffer);
+    bool ok = append_codex_profile(&buffer, tier, CBM_GRAPH_ACCESS_DIRECT, NULL, prompt, true);
     free(prompt);
     if (!ok) {
         profile_buffer_discard(&buffer);
