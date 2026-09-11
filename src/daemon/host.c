@@ -13,6 +13,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/diagnostics.h"
+#include "foundation/limits.h"
 #include "foundation/log.h"
 #include "foundation/mem.h"
 #include "foundation/platform.h"
@@ -30,7 +31,16 @@
 #include <string.h>
 
 enum {
-    HOST_MAX_CLIENTS = 64,
+    /* Descriptor budget for the configured connection cap. Measured on a live
+     * daemon: 86 open descriptors while serving ~64 connections, so roughly
+     * 1.1 per connection over a fixed base (log, listener, index files). Ask
+     * for two per connection plus a generous base, and never less than the
+     * floor — launchd hands this process a soft cap of 256, under which a
+     * daemon configured for a few hundred connections runs out of descriptors
+     * for its own files long before it runs out of connection slots. */
+    HOST_FD_PER_CLIENT = 2,
+    HOST_FD_BASE = 256,
+    HOST_FD_FLOOR = 1024,
     HOST_LEASE_TIMEOUT_MS = 30000,
     HOST_REQUEST_TIMEOUT_MS = 5000,
     HOST_RUNTIME_SHUTDOWN_MS = 10000,
@@ -938,6 +948,72 @@ _Noreturn void cbm_daemon_host_force_terminate_for_test(const char *component) {
 #endif
 }
 
+unsigned long cbm_daemon_host_descriptor_budget(uint32_t max_clients) {
+    unsigned long desired = (unsigned long)max_clients * HOST_FD_PER_CLIENT + HOST_FD_BASE;
+    return desired < HOST_FD_FLOOR ? (unsigned long)HOST_FD_FLOOR : desired;
+}
+
+cbm_daemon_host_fd_verdict_t cbm_daemon_host_classify_descriptor_limit(uint32_t max_clients,
+                                                                       unsigned long desired,
+                                                                       unsigned long effective) {
+    if (effective == 0) {
+        return CBM_DAEMON_HOST_FD_UNKNOWN;
+    }
+    if (effective >= desired) {
+        return CBM_DAEMON_HOST_FD_SUFFICIENT;
+    }
+    /* The floor the configured cap can actually reach: one descriptor per
+     * connection plus the daemon's own files. Below this the cap is a promise
+     * the process cannot keep — it starts failing its own open() and accept()
+     * calls with EMFILE before the connection cap is ever reached, and from
+     * outside that reads as file corruption, not as "too many clients". */
+    unsigned long minimum = (unsigned long)max_clients + HOST_FD_BASE;
+    return effective < minimum ? CBM_DAEMON_HOST_FD_INSUFFICIENT : CBM_DAEMON_HOST_FD_PARTIAL;
+}
+
+/* Raise the descriptor limit to match the connection cap, and say in the log
+ * what it settled on.
+ *
+ * This runs in the daemon role itself rather than in the launchd plist because
+ * the daemon is also started by hand (`codebase-memory-mcp daemon start`) and
+ * by the client bootstrap, neither of which goes through launchd. A plist edit
+ * would cover one of the three.
+ *
+ * Never fails startup: a daemon that cannot raise its limit should still serve
+ * whatever the limit it has allows, and refusing to start would take down the
+ * whole fleet's index over a tunable. */
+static void host_prepare_descriptor_limit(uint32_t max_clients) {
+    unsigned long desired = cbm_daemon_host_descriptor_budget(max_clients);
+    unsigned long effective = cbm_raise_open_file_limit(desired);
+    cbm_daemon_host_fd_verdict_t verdict =
+        cbm_daemon_host_classify_descriptor_limit(max_clients, desired, effective);
+    if (verdict == CBM_DAEMON_HOST_FD_UNKNOWN) {
+        /* Nothing to promise and nothing to warn about. */
+        return;
+    }
+
+    char clients_text[32];
+    char desired_text[32];
+    char effective_text[32];
+    (void)snprintf(clients_text, sizeof(clients_text), "%u", max_clients);
+    (void)snprintf(desired_text, sizeof(desired_text), "%lu", desired);
+    (void)snprintf(effective_text, sizeof(effective_text), "%lu", effective);
+
+    if (verdict == CBM_DAEMON_HOST_FD_INSUFFICIENT) {
+        char minimum_text[32];
+        (void)snprintf(minimum_text, sizeof(minimum_text), "%lu",
+                       (unsigned long)max_clients + HOST_FD_BASE);
+        cbm_log_warn("daemon.descriptor_limit.insufficient", "max_clients", clients_text,
+                     "soft_limit", effective_text, "minimum_needed", minimum_text, "requested",
+                     desired_text);
+        return;
+    }
+    cbm_log_info(verdict == CBM_DAEMON_HOST_FD_SUFFICIENT ? "daemon.descriptor_limit"
+                                                          : "daemon.descriptor_limit.partial",
+                 "max_clients", clients_text, "requested", desired_text, "soft_limit",
+                 effective_text);
+}
+
 int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     if (!config || !config->endpoint || !config->executable_path ||
         !config->identity.semantic_version || !config->identity.build_fingerprint) {
@@ -1030,12 +1106,16 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     }
     cbm_daemon_runtime_application_callbacks_t callbacks =
         cbm_daemon_application_runtime_callbacks(host.application);
+    /* Resolved once here, so the descriptor limit is raised for the cap this
+     * generation will actually run with rather than for a compiled-in guess. */
+    uint32_t max_clients = (uint32_t)cbm_daemon_max_clients();
+    host_prepare_descriptor_limit(max_clients);
     cbm_daemon_runtime_service_config_t runtime_config = {
         .endpoint = config->endpoint,
         .identity = config->identity,
         .conflict_log_path = conflict_log,
         .conflict_log_cap_bytes = HOST_CONFLICT_LOG_CAP,
-        .max_clients = HOST_MAX_CLIENTS,
+        .max_clients = max_clients,
         .lease_timeout_ms = HOST_LEASE_TIMEOUT_MS,
         .request_timeout_ms = HOST_REQUEST_TIMEOUT_MS,
         .shutdown_timeout_ms = HOST_RUNTIME_SHUTDOWN_MS,

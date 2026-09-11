@@ -162,4 +162,24 @@ int64_t cbm_file_size(const char *path);
  * On POSIX, this is a no-op. Returns the input pointer. */
 char *cbm_normalize_path_sep(char *path);
 
+/* ── Process resource limits ────────────────────────────────────── */
+
+/* Raise this process's soft cap on open file descriptors toward `desired`,
+ * never above the hard cap the OS allows, and never lower it.
+ *
+ * A long-lived server has to do this for itself. Under launchd a daemon
+ * inherits a soft cap of 256 descriptors, which a few hundred concurrent
+ * connections exhaust — and the failure does not land on the connection that
+ * crossed the line: the process starts failing its own open() calls (log,
+ * index files) with EMFILE, so a descriptor shortage reads as unrelated file
+ * corruption rather than as "too many clients".
+ *
+ * Returns the soft cap in force when it returns — already-sufficient, raised,
+ * partially raised, or unchanged if the OS refused. Returns `desired` when the
+ * OS reports no cap at all. Returns 0 when there is nothing to manage on this
+ * platform or the limit could not be read; callers read 0 as "unknown", never
+ * as "zero descriptors". Never fails the caller: a process that cannot raise
+ * its limit should still run with whatever it has. */
+unsigned long cbm_raise_open_file_limit(unsigned long desired);
+
 #endif /* CBM_PLATFORM_H */

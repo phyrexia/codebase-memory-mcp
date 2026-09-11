@@ -316,6 +316,24 @@ uint64_t cbm_daemon_runtime_service_clients_admitted_total(cbm_daemon_runtime_se
 /* Includes accepted connections still waiting for HELLO. Never exceeds the
  * configured max_clients; over-cap peers receive REJECTED before close. */
 size_t cbm_daemon_runtime_service_active_connections(cbm_daemon_runtime_service_t *service);
+
+/* ── Connection-admission telemetry ──────────────────────────────
+ *
+ * Together these answer the one question the live count cannot: is the
+ * configured cap big enough? A sampled active count reads a trough far more
+ * often than a peak, and a client turned away for capacity is told only by a
+ * connect timeout — so without these, a cap sized too small and a daemon
+ * running comfortably look the same from outside. */
+
+/* The cap this service was started with (config->max_clients). Fixed for the
+ * life of the service. */
+size_t cbm_daemon_runtime_service_max_clients(cbm_daemon_runtime_service_t *service);
+/* High-water mark of active connections since start; never decremented. */
+size_t cbm_daemon_runtime_service_peak_connections(cbm_daemon_runtime_service_t *service);
+/* Connections refused because the cap was full. Refusals during shutdown are
+ * not counted — those are the daemon stopping, not the cap being too small. */
+uint64_t cbm_daemon_runtime_service_capacity_rejections(cbm_daemon_runtime_service_t *service);
+
 size_t cbm_daemon_runtime_service_job_subscribers(cbm_daemon_runtime_service_t *service,
                                                   const char *project_key);
 uint64_t cbm_daemon_runtime_service_client_process_id(cbm_daemon_runtime_service_t *service,

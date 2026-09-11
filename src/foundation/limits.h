@@ -43,4 +43,36 @@ int cbm_cypher_max_depth(void);
  * Override with CBM_MCP_MAX_DEPTH (a positive integer). Default 15. */
 int cbm_mcp_max_depth(void);
 
+enum {
+    /* Default cap on concurrent daemon client connections. Sized against
+     * measured load rather than a round number: a busy workstation running
+     * dozens of agent sessions in parallel held ~65 live frontends, and a
+     * single session of some agent CLIs opens several connections of its own
+     * rather than sharing one. 128 leaves roughly 2x that headroom, so
+     * ordinary growth in session count does not walk into the wall. */
+    CBM_DAEMON_MAX_CLIENTS_DEFAULT = 128,
+    /* Absolute ceiling CBM_MAX_CLIENTS can never raise the cap past. Each
+     * admitted connection costs a reader thread parked in a blocking read
+     * (plus a second thread for the duration of a tool call) and a socket
+     * descriptor — so this bounds threads and descriptors, not CPU. At the
+     * runtime's 256 KiB thread stacks that is ~256 MiB of virtual stack in
+     * the worst case, which is why the ceiling can sit well above the
+     * indexing-worker ceiling. */
+    CBM_DAEMON_MAX_CLIENTS_LIMIT = 512,
+};
+
+/* Cap on how many client connections the daemon admits at once, including
+ * sockets accepted but not yet through HELLO. Override with CBM_MAX_CLIENTS
+ * (a positive integer).
+ *
+ * Unlike the knobs above, an out-of-range value is WARN-*clamped* into
+ * [1, CBM_DAEMON_MAX_CLIENTS_LIMIT] rather than dropped for the default:
+ * someone who writes CBM_MAX_CLIENTS=99999 is asking for "as many as you can",
+ * and silently handing them the 128 default would read as the setting having
+ * been honoured. Unreadable text is a different mistake and does fall back to
+ * the default. Either way the daemon says in its log what it settled on.
+ *
+ * Read fresh on each call, like the other limits here. */
+int cbm_daemon_max_clients(void);
+
 #endif /* CBM_LIMITS_H */
