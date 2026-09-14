@@ -12,7 +12,7 @@ La medición de memoria del host mostró aproximadamente 11 GiB usados, pero CBM
 
 Sí existe un pico confirmado durante indexación: un worker de `CO Refactor Project` (39.291 archivos, 750.143 nodos) registró `rss_mb=10.999`, `peak_mb=13.151`, `budget_mb=12.288` y fue terminado mientras comenzaba la fase `parallel.resolve`. El daemon registró posteriormente `worker_cancelled` y `watcher.index.retry` para ese proyecto. Esto explica la observación de aproximadamente 11 GB: es un worker de indexación grande, no el daemon idle.
 
-La misma ejecución registró `parallel.extract.start ... workers=18`, aunque el LaunchAgent del daemon declara `CBM_WORKERS=4`. Esto merece una corrección separada: el límite de hilos configurado no llegó a esa ejecución supervisada, o la fase de resolución recalculó el número de hilos. No se debe asumir que cambiar la variable ya limita el worker hasta probarlo en un canary.
+La misma ejecución registró `parallel.extract.start ... workers=18`, aunque el LaunchAgent del daemon declaraba `CBM_WORKERS=4`. La causa quedó confirmada: el daemon se detuvo al desconectarse su último cliente y el siguiente cliente levantó un daemon temporal con su propio entorno, que no incluía la variable del LaunchAgent; al faltar `CBM_WORKERS`, el indexador usó los 18 cores detectados. No era un cálculo erróneo de 4 a 18.
 
 El problema material es el tamaño del caché persistente y su actividad de I/O: `~/.cache/codebase-memory-mcp` ocupa aproximadamente 18,4 GB, contiene 101 bases SQLite y 41 archivos `.stage*` que suman aproximadamente 5,4 GB. Los stages no aparecían abiertos en la captura de `lsof` y los más grandes datan del 29–30 de agosto; parecen residuos de indexaciones interrumpidas, pero no se eliminaron porque borrar caché es una operación destructiva y no se autorizó.
 
@@ -24,9 +24,9 @@ La extracción paralela puede retener hasta 1 GiB de fuentes por ejecución por 
 
 ## Recomendación operativa
 
-Para contener el incidente se detuvo únicamente el worker exacto que estaba en 34,32 GB y se recargó el LaunchAgent del daemon con `CBM_MEM_BUDGET_MB=4096` y `CBM_WORKERS=1`. El nuevo daemon arrancó con `memory_budget_bytes=4294967296`, `physical_job_limit=2` y `worker_memory_budget_bytes=2147483648`; no había workers activos ni clientes conectados después del reinicio. Esta mitigación reduce el pico por worker a aproximadamente 2 GiB, a cambio de indexaciones más lentas y posibles cancelaciones por presupuesto.
+Para contener el incidente se detuvieron los workers exactos que estaban consumiendo 34,32 GB, se desactivó el watcher y se recargó el LaunchAgent del daemon con `CBM_MEM_BUDGET_MB=4096` y `CBM_WORKERS=1`. El daemon PID 67131 arrancó con `memory_budget_bytes=4294967296`, `physical_job_limit=2`, `worker_memory_budget_bytes=2147483648` y `watcher.disabled`; no hay workers activos ni clientes comprometidos. Esta mitigación evita nuevos reintentos automáticos y reduce el presupuesto lógico por worker a 2 GiB, a cambio de indexaciones manuales más lentas.
 
-No se debe volver a ejecutar el indexado completo de `CO Refactor Project` en el Mac para validar el cambio: la directiva de cómputo exige ejecutar pruebas y cargas pesadas en infraestructura Quantum remota. La validación pendiente es un canary remoto con límites de CPU/RAM propios y datos autorizados.
+No se debe volver a ejecutar el indexado completo de `CO Refactor Project` en el Mac para validar el cambio: la directiva de cómputo exige ejecutar pruebas y cargas pesadas en infraestructura Quantum remota. El parche de código fue compilado y probado en `qf-infra` (Linux, suite `pipeline`: 274/274), pero aún requiere un build arm64 macOS antes de instalarse en el host.
 
 Antes de una limpieza, conservar backup y comprobar que ningún stage esté abierto. Si el uso de consultas lo permite, `CBM_SQLITE_MMAP_SIZE=0` puede reducir residencia de páginas; debe medirse junto al canary y no se cambió automáticamente.
 
