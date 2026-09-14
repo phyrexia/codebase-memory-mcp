@@ -12639,9 +12639,12 @@ TEST(pipeline_committed_counts_match_persisted) {
  * change that (the resident floor IS the process) — napping is provably futile.
  * OLD behavior: one full 40-spin nap cycle per pulled file (kernel index: ~63k
  * pulls × ~120 ms ÷ 12 workers ≈ 390 s of idle workers at 79% avg CPU).
- * FIXED: the first futile cycle flips a shared flag; later pulls proceed with
- * the designed soft overshoot. Cycle count then can't exceed one cycle per
- * worker (workers already inside the gate when the flag flips) plus re-probes.
+ * FIXED: the first futile cycle flips a shared flag; later extraction pulls
+ * proceed with the designed soft overshoot. At the resolve boundary, however,
+ * the same over-budget process must cancel instead of starting another
+ * allocation-heavy phase, and the staged database must never be published.
+ * Cycle count can't exceed one cycle per worker (workers already inside the
+ * gate when the flag flips) plus re-probes.
  * Four workers keep this semantic regression deterministic under TSan while
  * still exercising the parallel path. RED on the unfixed gate: cycles == file
  * count (64) > workers+2.
@@ -12651,7 +12654,7 @@ TEST(pipeline_committed_counts_match_persisted) {
  * MIN_FILES_FOR_PARALLEL (50) — else the run routes sequential, the gate never
  * fires, and the test would pass vacuously (cycles==0). The engagement assert
  * below (cycles >= 1) is a hard guard against that regressing silently. */
-TEST(pipeline_backpressure_futile_nap_disengages) {
+TEST(pipeline_backpressure_futile_nap_then_resolve_aborts) {
     /* 64 tiny files: > MIN_FILES_FOR_PARALLEL (50) so the parallel path (and its
      * back-pressure gate) actually runs; old-code cycles (~64) >> the bound. */
     snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/cbm_test_XXXXXX");
@@ -12712,6 +12715,8 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
 
     int rc = cbm_pipeline_run(p);
     long cycles = cbm_pp_bp_nap_cycles();
+    struct stat final_db_stat;
+    bool final_db_published = stat(db_path, &final_db_stat) == 0;
 
     /* Restore the caller-visible budget BEFORE asserting. */
     cbm_mem_set_budget_for_tests(saved_budget);
@@ -12722,7 +12727,12 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
     teardown_test_repo();
 
     ASSERT_EQ(restore_workers_rc, 0);
-    ASSERT_EQ(rc, 0);
+    /* Extraction may overshoot softly to finish draining in-flight files, but
+     * resolve must fail closed and the staging transaction must preserve the
+     * absence of a previous generation. RED before the resolve budget gate:
+     * rc == 0 and the completed database is published. */
+    ASSERT_NEQ(rc, 0);
+    ASSERT_FALSE(final_db_published);
     /* Engagement guard (anti-vacuous): the gate must have actually run — the
      * parallel path taken and the 1 MB budget exceeded on every pull. cycles==0
      * means the fixture routed sequential (or the gate was compiled out) and
@@ -13505,7 +13515,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cancel_null);
     RUN_TEST(pipeline_run_null);
     /* Extraction back-pressure */
-    RUN_TEST(pipeline_backpressure_futile_nap_disengages);
+    RUN_TEST(pipeline_backpressure_futile_nap_then_resolve_aborts);
     /* Sequential cross-LSP shared registry (ms-typescript quadratic) */
     RUN_TEST(pipeline_seq_ts_cross_uses_shared_registry);
     /* File persistence */
