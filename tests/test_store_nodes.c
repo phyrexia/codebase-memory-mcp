@@ -2442,6 +2442,7 @@ TEST(store_project_counts_migrate_legacy_projects_and_store_exact_totals) {
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
     ASSERT_EQ(cbm_store_upsert_project(s, "counts-project", "/tmp/counts-project"), CBM_STORE_OK);
+    int64_t node_ids[3] = {0};
     for (int i = 0; i < 3; i++) {
         char qn[64];
         snprintf(qn, sizeof(qn), "counts-project.fn%d", i);
@@ -2452,15 +2453,16 @@ TEST(store_project_counts_migrate_legacy_projects_and_store_exact_totals) {
                            .file_path = "src/main.c",
                            .start_line = i + 1,
                            .end_line = i + 1};
-        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+        node_ids[i] = cbm_store_upsert_node(s, &node);
+        ASSERT_GT(node_ids[i], 0);
     }
     cbm_edge_t edge = {.project = "counts-project",
-                       .source_id = 1,
-                       .target_id = 2,
+                       .source_id = node_ids[0],
+                       .target_id = node_ids[1],
                        .type = "CALLS",
                        .properties_json = "{}"};
     ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
-    edge.target_id = 3;
+    edge.target_id = node_ids[2];
     ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
     /* Rewind to the pre-C5 schema: `projects` exactly as ff3b9f27 shipped it. */
     ASSERT_EQ(cbm_store_exec(s, "ALTER TABLE projects DROP COLUMN node_count;"), CBM_STORE_OK);

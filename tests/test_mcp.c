@@ -5761,6 +5761,7 @@ TEST(tool_list_projects_mean_latency_with_120_projects) {
         cbm_store_t *store = cbm_store_open_path(db_path);
         ASSERT_NOT_NULL(store);
         ASSERT_EQ(cbm_store_upsert_project(store, name, root), CBM_STORE_OK);
+        int64_t bench_nodes[2] = {0};
         for (int n = 0; n < 2; n++) {
             char qn[96];
             snprintf(qn, sizeof(qn), "%s.fn%d", name, n);
@@ -5771,11 +5772,12 @@ TEST(tool_list_projects_mean_latency_with_120_projects) {
                                .file_path = "src/main.c",
                                .start_line = n + 1,
                                .end_line = n + 1};
-            ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+            bench_nodes[n] = cbm_store_upsert_node(store, &node);
+            ASSERT_GT(bench_nodes[n], 0);
         }
         cbm_edge_t edge = {.project = name,
-                           .source_id = 1,
-                           .target_id = 2,
+                           .source_id = bench_nodes[0],
+                           .target_id = bench_nodes[1],
                            .type = "CALLS",
                            .properties_json = "{}"};
         ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
