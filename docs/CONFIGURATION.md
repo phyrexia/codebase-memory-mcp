@@ -92,6 +92,8 @@ Current keys:
 | `auto_watch` | `true` | Register the session's project with the background git watcher on connect. Set `false` to keep a session from registering its project (the watcher still runs for other projects). |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
 | `max_index_jobs` | `2` | Maximum concurrent distinct physical index jobs. Strict decimal range `1..16`; missing or invalid values use `2`. Read once when the daemon starts. |
+| `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
+| `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
 
 > **`watcher_enabled` vs `auto_watch`.** `watcher_enabled` controls whether the
 > watcher *subsystem* starts at all (the background poll thread). `auto_watch` is
@@ -118,6 +120,14 @@ Current keys:
 > Disabling the watcher does not disable anything else: the daemon still starts,
 > `auto_index` still runs, and `index_repository` stays available for manual
 > reindexing.
+
+The two `index_max_*` settings are independent and disabled by default. They
+apply to explicit indexing, automatic indexing, and watcher re-indexing, but not
+to `cross-repo-intelligence`, which does not scan repository source files.
+Equality is allowed; exceeding either setting fails the complete index request
+and preserves any previously serving database. See
+[Index resource limits](INDEX_RESOURCE_LIMITS.md) for counting, validation, and
+error-response details.
 
 ### Index concurrency and the serial migration profile
 
@@ -154,10 +164,12 @@ CBM_WORKERS=4 codebase-memory-mcp daemon start
 codebase-memory-mcp daemon status
 ```
 
-The aggregate indexing memory budget is divided into equal fixed slices using
-the effective physical-job limit. If that budget is smaller than the configured
-limit, CBM reduces effective capacity before dividing so every admitted worker
-still receives a non-zero slice and the aggregate budget is not exceeded.
+The aggregate indexing memory budget is divided at spawn time: each physical
+worker receives the aggregate divided by the jobs active then, so a lone job may
+use the whole budget and concurrent jobs split it. If the budget is smaller than
+the effective physical-job limit, CBM reduces effective capacity before
+admitting work so every admitted worker still receives a non-zero slice and the
+aggregate budget is not exceeded.
 
 These controls govern scheduling only. They do not select `fast` or `moderate`
 mode, change semantic index version `3`, disable cross-file LSP, or remove stored
@@ -411,7 +423,7 @@ These environment variables affect runtime behavior:
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the cache directory used for indexes, `_config.db`, and UI `config.json`. |
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. The daemon records the randomized paths in the `diagnostics.start` discovery record (a single JSON line) in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`; that one record is emitted even when `CBM_LOG_LEVEL` suppresses ordinary logging, so the paths always remain discoverable. |
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
-| `CBM_LOG_LEVEL` | `info` | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin-frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
+| `CBM_LOG_LEVEL` | role-aware | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and supervised index workers default to `info`. Physical workers retain INFO liveness records because their private logs drive the supervisor's no-progress timeout. Frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
 | `CBM_RUNTIME_DIR` | `%LOCALAPPDATA%` (Windows), `/private/tmp` (macOS), `/tmp` (other) | Parent directory for the daemon/CLI rendezvous directory, which CBM creates inside it as `cbm-daemon-<uid>` (`cbm-daemon-<key>` on Windows). Set it when the default ancestry cannot pass the private-directory check — see below. `CBM_CACHE_DIR` does **not** move the rendezvous. |
 | `CBM_WORKERS` | auto-detected | Override parallel workers inside each physical index process. It is captured by the daemon generation and is separate from `max_index_jobs`. |
 
