@@ -7544,6 +7544,45 @@ size_t cbm_config_max_index_jobs(cbm_config_t *cfg) {
     return result;
 }
 
+bool cbm_config_session_root_value_valid(const char *value) {
+    return value && (strcmp(value, CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL) == 0 ||
+                     strcmp(value, CBM_CONFIG_SESSION_ROOT_CWD) == 0);
+}
+
+/* Strict enum reader, same contract as cbm_config_max_index_jobs: only the two
+ * documented literals count, so a truncated ("git_tople") or suffixed
+ * ("git_toplevel2") stored value can never half-match a mode and silently move
+ * where sessions bind. The comparison is done on the stored BYTES rather than
+ * through cbm_config_get(), whose C-string copy stops at an embedded NUL and
+ * would accept "git_toplevel\0junk" as a valid value. */
+cbm_session_root_mode_t cbm_config_session_root(cbm_config_t *cfg) {
+    cbm_session_root_mode_t mode = CBM_SESSION_ROOT_GIT_TOPLEVEL;
+    if (!cfg) {
+        return mode;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cfg->db, "SELECT value FROM config WHERE key = ?", SQL_NUL_TERM, &stmt,
+                           NULL) != SQLITE_OK) {
+        return mode;
+    }
+    sqlite3_bind_text(stmt, SQL_PARAM_1, CBM_CONFIG_SESSION_ROOT, SQL_NUL_TERM,
+                      cbm_sqlite_transient);
+
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *value = sqlite3_column_text(stmt, 0);
+        size_t value_bytes = (size_t)sqlite3_column_bytes(stmt, 0);
+        const char *cwd_literal = CBM_CONFIG_SESSION_ROOT_CWD;
+        size_t cwd_bytes = strlen(cwd_literal);
+        /* git_toplevel is the default, so only an exact `cwd` changes it. */
+        if (value && value_bytes == cwd_bytes && memcmp(value, cwd_literal, cwd_bytes) == 0) {
+            mode = CBM_SESSION_ROOT_CWD;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return mode;
+}
+
 bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t *policy,
                                   char *error, size_t error_size) {
     if (!cfg || !policy) {
@@ -7587,6 +7626,8 @@ static const config_key_def_t CONFIG_KEYS[] = {
      "Run the background watcher thread (auto-reindex); false to disable"},
     {CBM_CONFIG_MAX_INDEX_JOBS, "2",
      "Maximum concurrent physical index jobs (1-16; invalid values use 2)"},
+    {CBM_CONFIG_SESSION_ROOT, CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL,
+     "Session root: git_toplevel (the cwd's repository root) or cwd"},
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
@@ -7622,6 +7663,10 @@ static bool config_key_is_index_policy(const char *key) {
                    strcmp(key, CBM_INDEX_CONFIG_MAX_SOURCE_MB) == 0);
 }
 
+static bool config_key_is_session_root(const char *key) {
+    return key && strcmp(key, CBM_CONFIG_SESSION_ROOT) == 0;
+}
+
 static int config_index_policy_write(cbm_config_t *config, const char *key, const char *value) {
     cbm_index_resource_policy_t candidate;
     cbm_index_policy_init(&candidate);
@@ -7640,6 +7685,33 @@ static int config_index_policy_write(cbm_config_t *config, const char *key, cons
         (void)fprintf(stderr, "error: failed to set %s\n", key);
     }
     return rc;
+}
+
+/* `config set session_root` rejects anything but the two documented literals:
+ * an enum key that silently stores a typo leaves the reader on its default with
+ * no signal at all, and the user has no way to tell the setting took. Like
+ * config_index_policy_write, this speaks on every failure it can return, so the
+ * caller must not print its generic message. */
+static int config_session_root_write(cbm_config_t *config, const char *key, const char *value) {
+    if (!cbm_config_session_root_value_valid(value)) {
+        (void)fprintf(stderr, "error: %s must be %s or %s\n", key,
+                      CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL, CBM_CONFIG_SESSION_ROOT_CWD);
+        return CLI_ERR;
+    }
+    int rc = cbm_config_set(config, key, value);
+    if (rc != 0) {
+        (void)fprintf(stderr, "error: failed to set %s\n", key);
+    }
+    return rc;
+}
+
+/* `config get`/`list` show the value the runtime will actually use. For
+ * session_root that is the validated mode — never the raw bytes a hand edit
+ * left in _config.db, which the reader rejects back to the default. */
+static void config_session_root_read(cbm_config_t *cfg, char *out, size_t out_sz) {
+    snprintf(out, out_sz, "%s", cbm_config_session_root(cfg) == CBM_SESSION_ROOT_CWD
+                                    ? CBM_CONFIG_SESSION_ROOT_CWD
+                                    : CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL);
 }
 
 static void config_ui_read(const char *key, char *out, size_t out_sz) {
@@ -7737,6 +7809,9 @@ int cbm_cmd_config(int argc, char **argv) {
             if (config_key_is_ui(CONFIG_KEYS[i].key)) {
                 config_ui_read(CONFIG_KEYS[i].key, ui_value, sizeof(ui_value));
                 shown = ui_value;
+            } else if (config_key_is_session_root(CONFIG_KEYS[i].key)) {
+                config_session_root_read(cfg, ui_value, sizeof(ui_value));
+                shown = ui_value;
             } else {
                 shown = cbm_config_get(cfg, CONFIG_KEYS[i].key, CONFIG_KEYS[i].default_value);
             }
@@ -7759,6 +7834,10 @@ int cbm_cmd_config(int argc, char **argv) {
                     char ui_value[CLI_BUF_1K];
                     config_ui_read(def->key, ui_value, sizeof(ui_value));
                     printf("%s\n", ui_value);
+                } else if (config_key_is_session_root(def->key)) {
+                    char root_value[CLI_BUF_1K];
+                    config_session_root_read(cfg, root_value, sizeof(root_value));
+                    printf("%s\n", root_value);
                 } else {
                     printf("%s\n", cbm_config_get(cfg, def->key, def->default_value));
                 }
@@ -7779,14 +7858,25 @@ int cbm_cmd_config(int argc, char **argv) {
                 rc = CLI_TRUE;
             }
         } else {
-            int set_rc =
-                config_key_is_index_policy(argv[CLI_SKIP_ONE])
-                    ? config_index_policy_write(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN])
-                    : cbm_config_set(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]);
-            if (set_rc == 0) {
-                printf("%s = %s\n", argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]);
+            const char *key = argv[CLI_SKIP_ONE];
+            const char *value = argv[CLI_PAIR_LEN];
+            /* Keys whose writer speaks on every failure own their error
+             * message; the generic one would only dilute it. */
+            bool writer_speaks = false;
+            int set_rc;
+            if (config_key_is_index_policy(key)) {
+                writer_speaks = true;
+                set_rc = config_index_policy_write(cfg, key, value);
+            } else if (config_key_is_session_root(key)) {
+                writer_speaks = true;
+                set_rc = config_session_root_write(cfg, key, value);
             } else {
-                if (!config_key_is_index_policy(argv[CLI_SKIP_ONE])) {
+                set_rc = cbm_config_set(cfg, key, value);
+            }
+            if (set_rc == 0) {
+                printf("%s = %s\n", key, value);
+            } else {
+                if (!writer_speaks) {
                     (void)fprintf(stderr, "error: failed to set %s\n", argv[CLI_SKIP_ONE]);
                 }
                 rc = CLI_TRUE;
