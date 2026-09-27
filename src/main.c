@@ -2524,6 +2524,25 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
         printf("daemon: active (%s)\n", status.permanent ? "permanent" : "session-managed");
         printf("  pid: %lu\n", (unsigned long)status.daemon_pid);
         printf("  build: %s (%.12s...)\n", status.semantic_version, status.build_fingerprint);
+        /* B1: the ceiling and parallelism this generation actually runs with —
+         * the same values its daemon.start line logged, not a re-resolution of
+         * this process's config and environment. */
+        if (status.has_budget_status) {
+            char index_workers[32];
+            if (status.index_workers > 0) {
+                (void)snprintf(index_workers, sizeof(index_workers), "%u", status.index_workers);
+            } else {
+                (void)snprintf(index_workers, sizeof(index_workers), "auto");
+            }
+            printf("  memory_budget_bytes: %llu\n",
+                   (unsigned long long)status.memory_budget_bytes);
+            printf("  budget_source: %s\n", cbm_daemon_budget_source_name(status.budget_source));
+            printf("  index_workers: %s\n", index_workers);
+        } else {
+            printf("  memory_budget_bytes: unavailable\n");
+            printf("  budget_source: unavailable\n");
+            printf("  index_workers: unavailable\n");
+        }
         if (status.stopping) {
             printf("  state: stopping\n");
         }

@@ -31,7 +31,8 @@ void cbm_mem_init_with_cap(double ram_fraction, size_t hard_cap_bytes);
  * the caller never re-parses the env string. */
 typedef struct {
     size_t budget;      /* resolved budget in bytes */
-    const char *source; /* "ram_fraction" | "CBM_MEM_BUDGET_MB" | "daemon_worker_cap" */
+    const char *source; /* "ram_fraction" | "CBM_MEM_BUDGET_MB" | "config" |
+                         * "daemon_worker_cap" | "available_ram" */
     bool clamped;       /* override was valid but exceeded total_ram → clamped down */
     bool invalid;       /* override was present but unparseable / out-of-range / ≤0 */
     bool hard_capped;   /* internal worker hard cap reduced the resolved budget */
@@ -49,6 +50,30 @@ cbm_mem_budget_t cbm_mem_resolve_budget(size_t total_ram, double ram_fraction,
 /* Pure capped variant used by supervised workers and deterministic tests. */
 cbm_mem_budget_t cbm_mem_resolve_budget_capped(size_t total_ram, double ram_fraction,
                                                const char *budget_mb, size_t hard_cap_bytes);
+
+/* B1: pure three-layer resolver — explicit CBM_MEM_BUDGET_MB env, then the
+ * persistent configured budget (0 = "off"), then the RAM fraction. Sources:
+ * "CBM_MEM_BUDGET_MB" | "config" | "ram_fraction". A present-but-unparseable
+ * env value is not a deliberate choice: it sets invalid=true (so the caller
+ * warns) and falls through to the configured layer instead of dropping
+ * straight to the fraction. Reads no globals/env. */
+cbm_mem_budget_t cbm_mem_resolve_budget_layers(size_t total_ram, double ram_fraction,
+                                               const char *env_budget_mb,
+                                               size_t configured_budget_mb);
+
+/* B1: the durable layer of CBM_MEM_BUDGET_MB, staged from _config.db
+ * (index_memory_budget_mb) by the daemon host BEFORE cbm_mem_init_with_cap
+ * resolves the ceiling. 0 = "off". A call made after initialization is
+ * recorded but cannot change a budget that is already fixed. */
+void cbm_mem_set_configured_budget_mb(size_t budget_mb);
+size_t cbm_mem_configured_budget_mb(void);
+
+/* Coarse provenance of the resolved budget — "env" | "config" |
+ * "ram_fraction" — which daemon.start and `daemon status` report verbatim as
+ * budget_source. Derived budgets that were trimmed to what the machine can
+ * spare, or capped for a supervised worker, still report "ram_fraction":
+ * those are internal refinements of a derived budget, not a user layer. */
+const char *cbm_mem_budget_source(void);
 
 /* Reduce a budget derived from TOTAL ram to something the machine can actually
  * spare right now, keeping a headroom reserve for the OS and other processes.
@@ -92,6 +117,13 @@ size_t cbm_mem_budget(void);
  * save cbm_mem_budget() first and restore it before their assertions.
  * Never call from production code. */
 void cbm_mem_set_budget_for_tests(size_t bytes);
+
+/* TEST HOOK: undo the init-once guard and every staged/resolved value, so a
+ * test can drive the full cbm_mem_init* path (budget layering, source
+ * attribution) instead of only the pure resolver. Restore afterwards with
+ * cbm_mem_set_configured_budget_mb(0) + cbm_mem_init(0.5).
+ * Never call from production code. */
+void cbm_mem_reset_for_tests(void);
 
 /* Returns true if current RSS exceeds the budget. */
 bool cbm_mem_over_budget(void);

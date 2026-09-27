@@ -7631,6 +7631,135 @@ bool cbm_config_build_fingerprint_cache(cbm_config_t *cfg) {
     return result;
 }
 
+/* ── B1: durable index budget / parallelism ───────────────────── */
+
+#define CONFIG_VALUE_MAX_BYTES 32U
+#define CONFIG_MIB_BYTES (1024U * 1024U)
+
+/* ASCII decimal digits only, accumulating with the same overflow guard as
+ * cbm_config_max_index_jobs: signs, whitespace, radix prefixes, fractions and
+ * suffixes all fail on the first non-digit, and a value that would exceed
+ * `maximum` is rejected rather than wrapped. Values longer than 32 bytes are
+ * refused outright so `config set` and the readers (which read the stored TEXT
+ * with its exact byte length) can never disagree about a value's validity. */
+static bool config_parse_bounded_uint(const char *value, size_t maximum, size_t *parsed) {
+    if (!value || !parsed || value[0] == '\0' || strlen(value) > CONFIG_VALUE_MAX_BYTES) {
+        return false;
+    }
+    size_t result = 0;
+    for (const unsigned char *cursor = (const unsigned char *)value; *cursor; cursor++) {
+        if (*cursor < (unsigned char)'0' || *cursor > (unsigned char)'9') {
+            return false;
+        }
+        size_t digit = (size_t)(*cursor - (unsigned char)'0');
+        if (digit > maximum || result > (maximum - digit) / 10U) {
+            return false;
+        }
+        result = result * 10U + digit;
+    }
+    *parsed = result;
+    return true;
+}
+
+/* Read a stored config value exactly as SQLite holds it: no truncating copy,
+ * so an over-long value or one whose bytes contain an embedded NUL is rejected
+ * instead of validating as its visible prefix (the cbm_config_get() 4 KiB TLS
+ * buffer would happily hand "7\0x" to a parser as "7"). */
+static bool config_get_exact(cbm_config_t *cfg, const char *key, char *out, size_t out_size) {
+    if (!cfg || !key || !out || out_size == 0) {
+        return false;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cfg->db, "SELECT value FROM config WHERE key = ?", SQL_NUL_TERM, &stmt,
+                           NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, SQL_PARAM_1, key, SQL_NUL_TERM, cbm_sqlite_transient);
+    bool exact = false;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *value = sqlite3_column_text(stmt, 0);
+        int bytes = sqlite3_column_bytes(stmt, 0);
+        if (value && bytes > 0 && (size_t)bytes < out_size) {
+            memcpy(out, value, (size_t)bytes);
+            out[bytes] = '\0';
+            exact = strlen(out) == (size_t)bytes;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return exact;
+}
+
+bool cbm_config_parse_index_memory_budget_mb(const char *value, size_t total_ram_mb,
+                                             size_t *out_mb) {
+    if (!value || !out_mb) {
+        return false;
+    }
+    if (strcmp(value, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB_OFF) == 0) {
+        *out_mb = 0;
+        return true;
+    }
+    size_t parsed = 0;
+    if (!config_parse_bounded_uint(value, total_ram_mb > 0 ? total_ram_mb : SIZE_MAX, &parsed)) {
+        return false;
+    }
+    if (parsed < CBM_CONFIG_INDEX_MEMORY_BUDGET_MB_MIN) {
+        return false;
+    }
+    *out_mb = parsed;
+    return true;
+}
+
+bool cbm_config_parse_index_workers(const char *value, int core_count, size_t *out_workers) {
+    if (!value || !out_workers) {
+        return false;
+    }
+    if (strcmp(value, CBM_CONFIG_INDEX_WORKERS_AUTO) == 0) {
+        *out_workers = 0;
+        return true;
+    }
+    size_t parsed = 0;
+    size_t bound = core_count > 0 ? (size_t)core_count : SIZE_MAX;
+    if (!config_parse_bounded_uint(value, bound, &parsed)) {
+        return false;
+    }
+    if (parsed < CBM_CONFIG_INDEX_WORKERS_MIN) {
+        return false;
+    }
+    *out_workers = parsed;
+    return true;
+}
+
+static size_t config_index_memory_budget_ram_mb(void) {
+    return cbm_system_info().total_ram / CONFIG_MIB_BYTES;
+}
+
+size_t cbm_config_index_memory_budget_mb(cbm_config_t *cfg) {
+    if (!cfg) {
+        return 0;
+    }
+    char value[CONFIG_VALUE_MAX_BYTES + 1];
+    size_t budget_mb = 0;
+    if (!config_get_exact(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, value, sizeof(value)) ||
+        !cbm_config_parse_index_memory_budget_mb(value, config_index_memory_budget_ram_mb(),
+                                                 &budget_mb)) {
+        return 0;
+    }
+    return budget_mb;
+}
+
+size_t cbm_config_index_workers(cbm_config_t *cfg) {
+    if (!cfg) {
+        return 0;
+    }
+    char value[CONFIG_VALUE_MAX_BYTES + 1];
+    size_t workers = 0;
+    if (!config_get_exact(cfg, CBM_CONFIG_INDEX_WORKERS, value, sizeof(value)) ||
+        !cbm_config_parse_index_workers(value, cbm_system_info().total_cores, &workers)) {
+        return 0;
+    }
+    return workers;
+}
+
 bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t *policy,
                                   char *error, size_t error_size) {
     if (!cfg || !policy) {
@@ -7678,6 +7807,10 @@ static const config_key_def_t CONFIG_KEYS[] = {
      "Session root: git_toplevel (the cwd's repository root) or cwd"},
     {CBM_CONFIG_BUILD_FINGERPRINT_CACHE, "false",
      "Cache the executable SHA-256 by (dev, ino, size, mtime); true rehashes only on change"},
+    {CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB_OFF,
+     "Aggregate index memory budget in MiB (512..total RAM), or off; read at daemon start"},
+    {CBM_CONFIG_INDEX_WORKERS, CBM_CONFIG_INDEX_WORKERS_AUTO,
+     "Parallel workers per index process (1..online cores), or auto; read at daemon start"},
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
@@ -7715,6 +7848,11 @@ static bool config_key_is_index_policy(const char *key) {
 
 static bool config_key_is_session_root(const char *key) {
     return key && strcmp(key, CBM_CONFIG_SESSION_ROOT) == 0;
+}
+
+static bool config_key_is_index_budget(const char *key) {
+    return key && (strcmp(key, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB) == 0 ||
+                   strcmp(key, CBM_CONFIG_INDEX_WORKERS) == 0);
 }
 
 static int config_index_policy_write(cbm_config_t *config, const char *key, const char *value) {
@@ -7762,6 +7900,40 @@ static void config_session_root_read(cbm_config_t *cfg, char *out, size_t out_sz
     snprintf(out, out_sz, "%s", cbm_config_session_root(cfg) == CBM_SESSION_ROOT_CWD
                                     ? CBM_CONFIG_SESSION_ROOT_CWD
                                     : CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL);
+}
+
+/* B1: validated write for the two runtime knobs. The upper bound is a property
+ * of the machine (total RAM / online cores), so the refusal names both the rule
+ * and the bound this host enforces — an "invalid value" alone sent operators
+ * back to the source to learn the floor. */
+static int config_index_budget_write(cbm_config_t *config, const char *key, const char *value) {
+    size_t parsed = 0;
+    size_t total_ram_mb = config_index_memory_budget_ram_mb();
+    bool valid = false;
+    char error[CLI_BUF_256];
+    if (strcmp(key, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB) == 0) {
+        valid = cbm_config_parse_index_memory_budget_mb(value, total_ram_mb, &parsed);
+        (void)snprintf(error, sizeof(error), "%s must be %s or an integer from %u to %zu (MiB)",
+                       key, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB_OFF,
+                       CBM_CONFIG_INDEX_MEMORY_BUDGET_MB_MIN, total_ram_mb);
+    } else {
+        valid = cbm_config_parse_index_workers(value, cbm_system_info().total_cores, &parsed);
+        (void)snprintf(error, sizeof(error), "%s must be %s or an integer from %u to %d", key,
+                       CBM_CONFIG_INDEX_WORKERS_AUTO, CBM_CONFIG_INDEX_WORKERS_MIN,
+                       cbm_system_info().total_cores);
+    }
+    if (!valid) {
+        (void)fprintf(stderr, "error: %s\n", error);
+        return CLI_ERR;
+    }
+    int rc = cbm_config_set(config, key, value);
+    if (rc != 0) {
+        /* Every failure this helper can return must speak for itself: the
+         * caller suppresses its own message for keys with a validating
+         * writer. */
+        (void)fprintf(stderr, "error: failed to set %s\n", key);
+    }
+    return rc;
 }
 
 static void config_ui_read(const char *key, char *out, size_t out_sz) {
@@ -7925,6 +8097,9 @@ int cbm_cmd_config(int argc, char **argv) {
             if (config_key_is_index_policy(key)) {
                 writer_speaks = true;
                 set_rc = config_index_policy_write(cfg, key, value);
+            } else if (config_key_is_index_budget(key)) {
+                writer_speaks = true;
+                set_rc = config_index_budget_write(cfg, key, value);
             } else if (config_key_is_session_root(key)) {
                 writer_speaks = true;
                 set_rc = config_session_root_write(cfg, key, value);
@@ -7935,7 +8110,7 @@ int cbm_cmd_config(int argc, char **argv) {
                 printf("%s = %s\n", key, value);
             } else {
                 if (!writer_speaks) {
-                    (void)fprintf(stderr, "error: failed to set %s\n", argv[CLI_SKIP_ONE]);
+                    (void)fprintf(stderr, "error: failed to set %s\n", key);
                 }
                 rc = CLI_TRUE;
             }

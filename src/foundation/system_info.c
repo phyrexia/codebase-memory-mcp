@@ -12,7 +12,9 @@
  */
 #include "foundation/constants.h"
 
-enum { DEFAULT_CORES = 1, MIN_WORKERS = 1, CBM_WORKERS_MAX = 256 };
+/* CBM_WORKERS_MAX lives in platform.h next to cbm_default_worker_count so the
+ * daemon's index_workers layer shares one definition of the env bound. */
+enum { DEFAULT_CORES = 1, MIN_WORKERS = 1 };
 #include "foundation/log.h"
 #include "foundation/mem_core.h" /* cbm_alloc: one accounted allocation path */
 #include "foundation/platform.h"

@@ -151,6 +151,12 @@ int cbm_default_worker_count(bool initial);
  * its limit should still run with whatever it has. */
 unsigned long cbm_raise_open_file_limit(unsigned long desired);
 
+/* Upper bound of the CBM_WORKERS env override, as enforced by
+ * cbm_default_worker_count. Exported so the daemon's index_workers layer can
+ * tell whether an inherited CBM_WORKERS is a value the workers will actually
+ * honor. */
+#define CBM_WORKERS_MAX 256
+
 /* ── Environment variables ──────────────────────────────────────── */
 
 /* Thread-safe getenv: copies the value into a caller-provided buffer.

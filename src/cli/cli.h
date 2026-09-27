@@ -522,6 +522,40 @@ bool cbm_config_session_root_value_valid(const char *value);
  * false: a malformed value can never enable caching. NULL-safe (false). */
 bool cbm_config_build_fingerprint_cache(cbm_config_t *cfg);
 
+/* ── B1: durable index budget / parallelism ─────────────────────
+ * These two keys are the durable layer of knobs that used to exist only as
+ * daemon environment: CBM_MEM_BUDGET_MB (aggregate index memory budget) and
+ * CBM_WORKERS (parallel workers inside each physical index process). The
+ * daemon reads both once at startup, before it fixes the memory ceiling, and
+ * an explicit environment variable still wins over the stored value.
+ *
+ * Shape: the `index_max_files` contract ("off"/"auto" or a bounded decimal)
+ * with the `cbm_config_max_index_jobs` strictness (ASCII digits only, no
+ * signs, whitespace, radix, suffix, truncation or embedded NUL). Out-of-range
+ * values are refused by `config set`; anything a hand-edited database may
+ * contain falls back to the sentinel at read time. */
+#define CBM_CONFIG_INDEX_MEMORY_BUDGET_MB "index_memory_budget_mb"
+#define CBM_CONFIG_INDEX_MEMORY_BUDGET_MB_OFF "off"
+#define CBM_CONFIG_INDEX_MEMORY_BUDGET_MB_MIN 512U
+#define CBM_CONFIG_INDEX_WORKERS "index_workers"
+#define CBM_CONFIG_INDEX_WORKERS_AUTO "auto"
+#define CBM_CONFIG_INDEX_WORKERS_MIN 1U
+
+/* Strict parsers shared by `config set` and the readers. `value` must be a
+ * NUL-terminated string of at most 32 bytes that is exactly the sentinel or a
+ * decimal integer in [MIN, bound]; `out_*` receives 0 for the sentinel.
+ * A `bound`/`core_count` of 0 means "detection failed" and drops only the
+ * upper bound — the floor still applies. */
+bool cbm_config_parse_index_memory_budget_mb(const char *value, size_t total_ram_mb,
+                                             size_t *out_mb);
+bool cbm_config_parse_index_workers(const char *value, int core_count, size_t *out_workers);
+
+/* Readers for the daemon host startup path. Return the validated value, or 0
+ * when the key holds its sentinel ("off"/"auto") or a value that fails the
+ * strict parse. The bound is the machine's total RAM / online core count. */
+size_t cbm_config_index_memory_budget_mb(cbm_config_t *cfg);
+size_t cbm_config_index_workers(cbm_config_t *cfg);
+
 /* ── Binary activation safety ─────────────────────────────────── */
 
 typedef void *cbm_cli_activation_lock_t;

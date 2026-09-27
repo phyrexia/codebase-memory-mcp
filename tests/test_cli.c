@@ -15604,6 +15604,324 @@ TEST(cli_config_build_fingerprint_cache_is_strict_boolean_and_persistent) {
     PASS();
 }
 
+/* ── B1: index_memory_budget_mb / index_workers ─────────────────────────
+ * These keys are the durable layer of the CBM_MEM_BUDGET_MB / CBM_WORKERS
+ * environment knobs. Contract: the `index_max_files` shape ("off"/"auto" or a
+ * bounded decimal) with the cbm_config_max_index_jobs strictness — truncated
+ * values, suffixes, signs, whitespace, zeros and out-of-range values are
+ * refused by `config set`, and the readers fall back to the sentinel for
+ * anything a hand-edited database may contain. */
+TEST(cli_config_index_memory_budget_mb_parse_is_strict_and_bounded) {
+    size_t out = 12345;
+
+    /* Sentinel: off. */
+    ASSERT_TRUE(cbm_config_parse_index_memory_budget_mb("off", 8192, &out));
+    ASSERT_EQ(out, 0);
+
+    /* The range is 512..total RAM in MiB, inclusive at both ends. */
+    ASSERT_TRUE(cbm_config_parse_index_memory_budget_mb("512", 8192, &out));
+    ASSERT_EQ(out, 512);
+    ASSERT_TRUE(cbm_config_parse_index_memory_budget_mb("0512", 8192, &out));
+    ASSERT_EQ(out, 512);
+    ASSERT_TRUE(cbm_config_parse_index_memory_budget_mb("8192", 8192, &out));
+    ASSERT_EQ(out, 8192);
+    ASSERT_FALSE(cbm_config_parse_index_memory_budget_mb("511", 8192, &out));
+    ASSERT_FALSE(cbm_config_parse_index_memory_budget_mb("8193", 8192, &out));
+
+    const char *invalid[] = {"",
+                             "0",
+                             "00",
+                             "-1",
+                             "+2",
+                             " 2",
+                             "2 ",
+                             "1.5",
+                             "0x10",
+                             "2x",
+                             "abc",
+                             "off ",
+                             "OFF",
+                             "Off",
+                             "auto",
+                             "123456789012345678901234567890"};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        ASSERT_FALSE(cbm_config_parse_index_memory_budget_mb(invalid[i], 8192, &out));
+    }
+
+    /* Total RAM detection failed: the floor still applies, only the ceiling
+     * is unknown. */
+    ASSERT_TRUE(cbm_config_parse_index_memory_budget_mb("1048576", 0, &out));
+    ASSERT_EQ(out, 1048576);
+    ASSERT_FALSE(cbm_config_parse_index_memory_budget_mb("511", 0, &out));
+
+    /* NULL arguments are refused, not dereferenced. */
+    ASSERT_FALSE(cbm_config_parse_index_memory_budget_mb(NULL, 8192, &out));
+    ASSERT_FALSE(cbm_config_parse_index_memory_budget_mb("512", 8192, NULL));
+    PASS();
+}
+
+TEST(cli_config_index_workers_parse_is_strict_and_bounded) {
+    size_t out = 12345;
+
+    /* Sentinel: auto. */
+    ASSERT_TRUE(cbm_config_parse_index_workers("auto", 8, &out));
+    ASSERT_EQ(out, 0);
+
+    /* The range is 1..online cores, inclusive at both ends. */
+    ASSERT_TRUE(cbm_config_parse_index_workers("1", 8, &out));
+    ASSERT_EQ(out, 1);
+    ASSERT_TRUE(cbm_config_parse_index_workers("8", 8, &out));
+    ASSERT_EQ(out, 8);
+    ASSERT_FALSE(cbm_config_parse_index_workers("0", 8, &out));
+    ASSERT_FALSE(cbm_config_parse_index_workers("9", 8, &out));
+
+    const char *invalid[] = {"",     "0",     "-1",      "+2",   " 2",  "2 ",
+                             "1.5",  "0x10",  "2x",      "abc",  "AUTO",
+                             "off",  "1e3",   "9999999999999999999999999999999999"};
+    /* "off" is the other key's sentinel and must not parse here; "auto" is
+     * this key's own sentinel and is asserted valid above, so it cannot be in
+     * this list. */
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        ASSERT_FALSE(cbm_config_parse_index_workers(invalid[i], 8, &out));
+    }
+
+    /* Core detection failed: same shape as the budget key. */
+    ASSERT_TRUE(cbm_config_parse_index_workers("16", 0, &out));
+    ASSERT_EQ(out, 16);
+    ASSERT_FALSE(cbm_config_parse_index_workers("0", 0, &out));
+
+    ASSERT_FALSE(cbm_config_parse_index_workers(NULL, 8, &out));
+    ASSERT_FALSE(cbm_config_parse_index_workers("1", 8, NULL));
+    PASS();
+}
+
+/* The B1 config tests point the CLI at a private cache. ASSERT_* returns out of
+ * a failing test (test_framework.h), so the restore and the rmtree belong to
+ * the wrapper at the end of each test: an aborted test must not leave
+ * CBM_CACHE_DIR pointing at a cache holding a _config.db — every later
+ * `uninstall` in this shared runner would then fail against an index it cannot
+ * remove (same contract as b1_knobs_env_end in test_daemon_application.c). */
+typedef struct {
+    char tmpdir[512];
+    char *saved_cache;
+    bool ready;
+} cli_budget_cfg_env_t;
+
+static bool cli_budget_cfg_env_begin(cli_budget_cfg_env_t *env) {
+    memset(env, 0, sizeof(*env));
+    const char *prior = getenv("CBM_CACHE_DIR");
+    env->saved_cache = prior ? strdup(prior) : NULL;
+    snprintf(env->tmpdir, sizeof(env->tmpdir), "%s/cli-cfg-budget-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(env->tmpdir)) {
+        return false;
+    }
+    cbm_setenv("CBM_CACHE_DIR", env->tmpdir, 1);
+    env->ready = true;
+    return true;
+}
+
+static void cli_budget_cfg_env_end(cli_budget_cfg_env_t *env) {
+    if (env->saved_cache) {
+        cbm_setenv("CBM_CACHE_DIR", env->saved_cache, 1);
+        free(env->saved_cache);
+        env->saved_cache = NULL;
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (env->ready) {
+        test_rmdir_r(env->tmpdir);
+        env->ready = false;
+    }
+}
+
+static int cli_config_index_budget_keys_round_trip_reset_and_persist_body(
+    cli_budget_cfg_env_t *env) {
+    bool ready = cli_budget_cfg_env_begin(env);
+    ASSERT_TRUE(ready);
+    char *tmpdir = env->tmpdir;
+
+    char out[512];
+    /* Discoverable and defaulted to the sentinel on an empty store. */
+    bool listed_budget = false;
+    bool listed_workers = false;
+    for (size_t i = 0; i < cbm_cli_config_key_count_for_testing(); i++) {
+        const char *key = cbm_cli_config_key_at_for_testing(i);
+        listed_budget = listed_budget || (key && strcmp(key, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB) == 0);
+        listed_workers = listed_workers || (key && strcmp(key, CBM_CONFIG_INDEX_WORKERS) == 0);
+    }
+    ASSERT_TRUE(listed_budget);
+    ASSERT_TRUE(listed_workers);
+
+    char *get_budget[] = {"get", CBM_CONFIG_INDEX_MEMORY_BUDGET_MB};
+    char *get_workers[] = {"get", CBM_CONFIG_INDEX_WORKERS};
+    ASSERT_EQ(cli_config_cmd_capture(2, get_budget, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "off\n");
+    ASSERT_EQ(cli_config_cmd_capture(2, get_workers, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "auto\n");
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg), 0);
+    ASSERT_EQ(cbm_config_index_workers(cfg), 0);
+    cbm_config_close(cfg);
+
+    /* A daemon-sized machine can hold 1536 MiB and 1 worker on any host this
+     * suite has ever run on; the upper bound is exercised separately. */
+    char *set_budget[] = {"set", CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, "1536"};
+    char *set_workers[] = {"set", CBM_CONFIG_INDEX_WORKERS, "1"};
+    ASSERT_EQ(cli_config_cmd_capture(3, set_budget, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(3, set_workers, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_budget, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "1536\n");
+    ASSERT_EQ(cli_config_cmd_capture(2, get_workers, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "1\n");
+
+    /* The daemon-side readers agree with the CLI, and the values survive a
+     * reopen of _config.db (this is the durability B1 exists for). */
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg), 1536);
+    ASSERT_EQ(cbm_config_index_workers(cfg), 1);
+    cbm_config_close(cfg);
+
+    /* Reset returns both keys to their sentinel. */
+    char *reset_budget[] = {"reset", CBM_CONFIG_INDEX_MEMORY_BUDGET_MB};
+    char *reset_workers[] = {"reset", CBM_CONFIG_INDEX_WORKERS};
+    ASSERT_EQ(cli_config_cmd_capture(2, reset_budget, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, reset_workers, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_budget, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "off\n");
+    ASSERT_EQ(cli_config_cmd_capture(2, get_workers, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "auto\n");
+
+    PASS();
+}
+
+TEST(cli_config_index_budget_keys_round_trip_reset_and_persist) {
+    cli_budget_cfg_env_t env = {0};
+    int rc = cli_config_index_budget_keys_round_trip_reset_and_persist_body(&env);
+    cli_budget_cfg_env_end(&env);
+    return rc;
+}
+
+static int cli_config_index_budget_keys_reject_invalid_and_out_of_range_values_body(
+    cli_budget_cfg_env_t *env) {
+    bool ready = cli_budget_cfg_env_begin(env);
+    ASSERT_TRUE(ready);
+
+    char out[512];
+    char *set_budget[] = {"set", CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, "1536"};
+    char *set_workers[] = {"set", CBM_CONFIG_INDEX_WORKERS, "1"};
+    char *get_budget[] = {"get", CBM_CONFIG_INDEX_MEMORY_BUDGET_MB};
+    char *get_workers[] = {"get", CBM_CONFIG_INDEX_WORKERS};
+    ASSERT_EQ(cli_config_cmd_capture(3, set_budget, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(3, set_workers, out, sizeof(out)), 0);
+
+    /* Every malformed value is refused with a non-zero exit, clean stdout, and
+     * the stored value left exactly as it was. */
+    const char *invalid_budget[] = {"",      "0",    "511", "-1",   "+2",       " 2",   "2 ",
+                                    "1.5",   "0x10", "2x",  "abc",  "off ",     "auto",
+                                    "1536x", "8GB",  "123456789012345678901234567890"};
+    for (size_t i = 0; i < sizeof(invalid_budget) / sizeof(invalid_budget[0]); i++) {
+        char *argv_set[] = {"set", CBM_CONFIG_INDEX_MEMORY_BUDGET_MB,
+                            (char *)invalid_budget[i]};
+        ASSERT_TRUE(cli_config_cmd_capture(3, argv_set, out, sizeof(out)) != 0);
+        ASSERT_STR_EQ(out, "");
+        ASSERT_EQ(cli_config_cmd_capture(2, get_budget, out, sizeof(out)), 0);
+        ASSERT_STR_EQ(out, "1536\n");
+    }
+
+    const char *invalid_workers[] = {"",    "0",   "-1",  "+2",  " 2",  "2 ",  "1.5",
+                                     "2x",  "abc", "auto ", "AUTO", "off", "1e3",
+                                     "123456789012345678901234567890"};
+    for (size_t i = 0; i < sizeof(invalid_workers) / sizeof(invalid_workers[0]); i++) {
+        char *argv_set[] = {"set", CBM_CONFIG_INDEX_WORKERS, (char *)invalid_workers[i]};
+        ASSERT_TRUE(cli_config_cmd_capture(3, argv_set, out, sizeof(out)) != 0);
+        ASSERT_STR_EQ(out, "");
+        ASSERT_EQ(cli_config_cmd_capture(2, get_workers, out, sizeof(out)), 0);
+        ASSERT_STR_EQ(out, "1\n");
+    }
+
+    /* Machine bounds: one over total RAM / the online core count is refused.
+     * (A host that cannot report either leaves only the floor, which the pure
+     * parse tests already pin.) */
+    cbm_system_info_t info = cbm_system_info();
+    size_t total_ram_mb = info.total_ram / (1024U * 1024U);
+    char over_budget[64];
+    if (total_ram_mb >= 512) {
+        snprintf(over_budget, sizeof(over_budget), "%zu", total_ram_mb + 1);
+        char *argv_set[] = {"set", CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, over_budget};
+        ASSERT_TRUE(cli_config_cmd_capture(3, argv_set, out, sizeof(out)) != 0);
+    }
+    char over_workers[64];
+    if (info.total_cores > 0) {
+        snprintf(over_workers, sizeof(over_workers), "%d", info.total_cores + 1);
+        char *argv_set[] = {"set", CBM_CONFIG_INDEX_WORKERS, over_workers};
+        ASSERT_TRUE(cli_config_cmd_capture(3, argv_set, out, sizeof(out)) != 0);
+    }
+
+    PASS();
+}
+
+TEST(cli_config_index_budget_keys_reject_invalid_and_out_of_range_values) {
+    cli_budget_cfg_env_t env = {0};
+    int rc = cli_config_index_budget_keys_reject_invalid_and_out_of_range_values_body(&env);
+    cli_budget_cfg_env_end(&env);
+    return rc;
+}
+
+TEST(cli_config_index_budget_readers_reject_truncated_and_embedded_nul_values) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-cfg-budget-bytes-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    /* The readers take the stored TEXT by its exact byte length (no truncating
+     * copy like cbm_config_get()'s 4 KiB TLS buffer), so a value whose visible
+     * prefix is a valid 1536 but whose stored bytes continue is refused rather
+     * than read as its prefix. */
+    char truncated_to_budget[4097];
+    memset(truncated_to_budget, '0', sizeof(truncated_to_budget) - 6);
+    memcpy(truncated_to_budget + sizeof(truncated_to_budget) - 6, "1536x", 5);
+    truncated_to_budget[sizeof(truncated_to_budget) - 1] = '\0';
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, truncated_to_budget), 0);
+    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg), 0);
+
+    char overlong[36];
+    memset(overlong, '0', sizeof(overlong) - 2);
+    overlong[sizeof(overlong) - 2] = '7';
+    overlong[sizeof(overlong) - 1] = '\0';
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INDEX_WORKERS, overlong), 0);
+    ASSERT_EQ(cbm_config_index_workers(cfg), 0);
+
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", tmpdir);
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(dbpath, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(stmt, 1, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, -1, SQLITE_TRANSIENT),
+              SQLITE_OK);
+    const char embedded_nul[] = {'1', '5', '3', '6', '\0', 'x'};
+    ASSERT_EQ(sqlite3_bind_text(stmt, 2, embedded_nul, (int)sizeof(embedded_nul), SQLITE_TRANSIENT),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg), 0);
+
+    /* And a well-formed value still reads through the exact-byte path. */
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, "1536"), 0);
+    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg), 1536);
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_config_delete) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -17080,6 +17398,11 @@ SUITE(cli) {
     RUN_TEST(cli_config_session_root_is_a_strict_enum);
     RUN_TEST(cli_config_cmd_rejects_invalid_session_root);
     RUN_TEST(cli_config_build_fingerprint_cache_is_strict_boolean_and_persistent);
+    RUN_TEST(cli_config_index_memory_budget_mb_parse_is_strict_and_bounded);
+    RUN_TEST(cli_config_index_workers_parse_is_strict_and_bounded);
+    RUN_TEST(cli_config_index_budget_keys_round_trip_reset_and_persist);
+    RUN_TEST(cli_config_index_budget_keys_reject_invalid_and_out_of_range_values);
+    RUN_TEST(cli_config_index_budget_readers_reject_truncated_and_embedded_nul_values);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
     RUN_TEST(cli_config_watcher_enabled_default_and_persist);

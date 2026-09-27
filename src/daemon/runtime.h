@@ -54,7 +54,16 @@
  * fixed-size with a capped committed-client pid table. */
 #define CBM_DAEMON_CONTROL_REQUEST_SIZE 65U
 #define CBM_DAEMON_CONTROL_CLIENT_CAP 8U
+/* B1 grew the status response with the daemon's budget observability
+ * (memory_budget_bytes, index_workers, budget_source). The 121-byte layout is
+ * frozen: a requester whose build differs from the daemon's still receives
+ * exactly those bytes, because `daemon status` is the probe meant to keep
+ * working across build skew. A same-build requester gets the 132-byte layout,
+ * which appends u64 memory_budget_bytes @121, u16 index_workers @129 (0 =
+ * auto), u8 budget_source @131 — all network byte order. Clients accept
+ * either length and report the snapshot only when the long form arrived. */
 #define CBM_DAEMON_STATUS_RESPONSE_SIZE 121U
+#define CBM_DAEMON_STATUS_RESPONSE_FULL_SIZE 132U
 #define CBM_DAEMON_STOP_RESPONSE_SIZE 40U
 #define CBM_DAEMON_RUNTIME_PROJECT_KEY_MAX 4096U
 #define CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX (CBM_DAEMON_MAX_FRAME_SIZE - 16U)
@@ -177,6 +186,35 @@ typedef struct {
     cbm_daemon_runtime_application_session_close_fn session_close;
 } cbm_daemon_runtime_application_callbacks_t;
 
+/* B1: the daemon's resolved budget/parallelism, captured once at startup and
+ * surfaced by `daemon status` (daemon.start logs the same values). */
+typedef enum {
+    CBM_DAEMON_BUDGET_SOURCE_RAM_FRACTION = 0,
+    CBM_DAEMON_BUDGET_SOURCE_CONFIG = 1,
+    CBM_DAEMON_BUDGET_SOURCE_ENV = 2,
+} cbm_daemon_budget_source_t;
+
+typedef struct {
+    uint64_t memory_budget_bytes;
+    uint32_t index_workers; /* 0 = auto */
+    cbm_daemon_budget_source_t budget_source;
+} cbm_daemon_runtime_budget_status_t;
+
+/* "ram_fraction" | "config" | "env" — the daemon.start / `daemon status`
+ * spelling of the enum. */
+const char *cbm_daemon_budget_source_name(cbm_daemon_budget_source_t source);
+
+/* Inverse mapping, for the memory core's cbm_mem_budget_source() spelling.
+ * Anything unrecognised is a derived budget. */
+cbm_daemon_budget_source_t cbm_daemon_budget_source_from_name(const char *name);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Force the status response down to the frozen cross-build layout, so tests
+ * can cover both wire lengths (and the client's dual-length parse) without a
+ * second binary. Never called from production code. */
+void cbm_daemon_runtime_force_legacy_status_for_test(bool legacy);
+#endif
+
 typedef struct {
     const cbm_daemon_ipc_endpoint_t *endpoint;
     cbm_daemon_build_identity_t identity;
@@ -199,6 +237,9 @@ typedef struct {
      * last committed client disconnects; only the stop/drain ops or an
      * explicit process kill end it. */
     bool permanent;
+    /* B1: what `daemon status` reports about the ceiling and parallelism this
+     * generation runs with. */
+    cbm_daemon_runtime_budget_status_t budget_status;
 } cbm_daemon_runtime_service_config_t;
 
 typedef enum {
@@ -276,6 +317,13 @@ typedef struct {
      * kernel-reported PID of the mute holder. `daemon status` uses this to
      * name a zombie generation instead of reporting bare "not running". */
     uint64_t muted_endpoint_holder_pid;
+    /* B1 budget observability. Present only when the daemon answered with the
+     * same-build (132-byte) status layout; a cross-build daemon answers with
+     * the frozen 121-byte layout and these stay zero. */
+    bool has_budget_status;
+    uint64_t memory_budget_bytes;
+    uint32_t index_workers; /* 0 = auto */
+    cbm_daemon_budget_source_t budget_source;
 } cbm_daemon_runtime_status_t;
 
 typedef struct {

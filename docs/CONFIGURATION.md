@@ -97,6 +97,8 @@ Current keys:
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
 | `build_fingerprint_cache` | `false` | Cache the executable's SHA-256 keyed by `(dev, ino, size, mtime_ns)` in the cache directory. `true` skips rehashing the binary on every one-shot CLI run; the cache is invalidated whenever the identity tuple changes. |
+| `index_memory_budget_mb` | `off` | Aggregate index memory budget in MiB. Strict decimal range `512..`total RAM; `off` defers to `CBM_MEM_BUDGET_MB` or the RAM fraction. Read once when the daemon starts. |
+| `index_workers` | `auto` | Parallel workers inside each physical index process. Strict decimal range `1..`online cores; `auto` defers to `CBM_WORKERS` or detected core count. Read once when the daemon starts. |
 
 > **`build_fingerprint_cache`.** Opt-in, off by default. The cached hash is only
 > a memo: it is used when the executable's `(dev, ino, size, mtime_ns)` identity
@@ -192,6 +194,59 @@ aggregate budget is not exceeded.
 These controls govern scheduling only. They do not select `fast` or `moderate`
 mode, change semantic index version `3`, disable cross-file LSP, or remove stored
 coverage. The canonical full-mode quality contract remains unchanged.
+
+### Persistent index budget and worker parallelism
+
+`index_memory_budget_mb` and `index_workers` are the durable layer of knobs that
+used to exist only in the daemon's environment. Each resolves in three layers,
+first deliberate value wins:
+
+| Layer | `index_memory_budget_mb` | `index_workers` |
+|---|---|---|
+| 1. Environment | `CBM_MEM_BUDGET_MB` | `CBM_WORKERS` |
+| 2. `_config.db` | `index_memory_budget_mb` | `index_workers` |
+| 3. Default | `ram_fraction × total RAM` | detected core count |
+
+An environment value is *explicit* only when it is one the runtime would honor;
+a malformed `CBM_MEM_BUDGET_MB` warns (`mem.budget.env.invalid`) and falls
+through to the config layer instead of dropping straight to the RAM fraction.
+`CBM_WORKERS` is the exception: it is never overwritten, so an existing value —
+even one the workers reject and warn about (`workers.env.invalid`) — keeps
+winning and `index_workers` has no effect until it is removed. When
+`index_workers` does apply, the daemon exports it as `CBM_WORKERS` so every
+index worker inherits the same value.
+
+`config set` refuses values outside the documented range and leaves the stored
+value untouched (the error names the bound this host enforces); anything a
+hand-edited database may hold falls back to the sentinel (`off` / `auto`) at
+read time.
+
+Both keys are read **once, when the daemon starts**, before the memory ceiling
+is resolved — so the ceiling is derived from the configured budget in that same
+resolution. Retire the daemon after changing them:
+
+```bash
+codebase-memory-mcp config set index_memory_budget_mb 6144
+codebase-memory-mcp config set index_workers 4
+codebase-memory-mcp daemon stop
+codebase-memory-mcp daemon status
+```
+
+The running generation reports what it resolved — the same values its
+`daemon.start` record logged in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`:
+
+```text
+daemon: active (permanent)
+  memory_budget_bytes: 6442450944
+  budget_source: config
+  index_workers: 4
+```
+
+`budget_source` is `config`, `env`, or `ram_fraction` (a budget derived from
+RAM and then trimmed to what the machine can spare still reports
+`ram_fraction`). When `daemon status` reaches a daemon built from a different
+binary, the three fields report `unavailable`: the status probe deliberately
+keeps its cross-build answer layout frozen.
 
 #### One-time database format migration
 
@@ -444,7 +499,8 @@ These environment variables affect runtime behavior:
 | `CBM_LOG_LEVEL` | role-aware | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and supervised index workers default to `info`. Physical workers retain INFO liveness records because their private logs drive the supervisor's no-progress timeout. Frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
 | `CBM_MAX_CLIENTS` | `128` | How many client connections the daemon admits at once, counting sockets accepted but not yet through HELLO. Clamped to `[1, 512]`: a value outside that range is clamped and logged, not discarded, while text that is not a number falls back to the default. Read once when the daemon starts — see below. |
 | `CBM_RUNTIME_DIR` | `%LOCALAPPDATA%` (Windows), `/private/tmp` (macOS), `/tmp` (other) | Parent directory for the daemon/CLI rendezvous directory, which CBM creates inside it as `cbm-daemon-<uid>` (`cbm-daemon-<key>` on Windows). Set it when the default ancestry cannot pass the private-directory check — see below. `CBM_CACHE_DIR` does **not** move the rendezvous. |
-| `CBM_WORKERS` | auto-detected | Override parallel workers inside each physical index process. It is captured by the daemon generation and is separate from `max_index_jobs`. Governs the indexing pipeline only — it has no effect on how many clients the daemon accepts; use `CBM_MAX_CLIENTS` for that. |
+| `CBM_WORKERS` | auto-detected | Override parallel workers inside each physical index process. It is captured by the daemon generation and is separate from `max_index_jobs`. Wins over the `index_workers` config key, which is never applied over an existing value. Governs the indexing pipeline only — it has no effect on how many clients the daemon accepts; use `CBM_MAX_CLIENTS` for that. |
+| `CBM_MEM_BUDGET_MB` | auto-detected | Override the aggregate index memory budget in MiB. Wins over the `index_memory_budget_mb` config key; both outrank the `ram_fraction × total RAM` default. A malformed value warns (`mem.budget.env.invalid`) and falls through to the config layer. |
 
 ### Connection capacity
 

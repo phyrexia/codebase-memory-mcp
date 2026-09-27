@@ -748,14 +748,26 @@ codebase-memory-mcp config set watcher_enabled false     # stop the watcher thre
 codebase-memory-mcp config set max_index_jobs 2          # physical index processes (1-16; default 2)
 codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
 codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
+codebase-memory-mcp config set index_memory_budget_mb 6144 # index memory budget in MiB (512..total RAM; default off)
+codebase-memory-mcp config set index_workers 4          # parallel workers per index job (1..cores; default auto)
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
 `max_index_jobs` caps distinct physical index jobs owned by one daemon
-generation. `CBM_WORKERS` caps parallel workers inside each physical index job;
-it is a separate control, not a replacement for `max_index_jobs`. Both are
-captured by the daemon generation, so retire/restart the daemon after changing
-either one. Identical requests still coalesce into one physical job.
+generation. `index_workers` (or `CBM_WORKERS`) caps parallel workers inside
+each physical index job; it is a separate control, not a replacement for
+`max_index_jobs`. Both are captured by the daemon generation, so
+retire/restart the daemon after changing either one. Identical requests still
+coalesce into one physical job.
+
+`index_memory_budget_mb` and `index_workers` are the durable layer of
+`CBM_MEM_BUDGET_MB` and `CBM_WORKERS`: an explicit environment variable wins
+over the stored value, which in turn wins over the automatic default (a RAM
+fraction for the budget, detected core count for workers). Both are read once
+when the daemon starts — retire it after changing them — and
+`codebase-memory-mcp daemon status` reports what the running generation
+actually resolved (`memory_budget_bytes`, `budget_source`,
+`index_workers`).
 
 The two `index_max_*` settings default to `off`. Exceeding one fails the complete
 index attempt rather than publishing a partial graph; an existing serving index
@@ -770,8 +782,8 @@ is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 | `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable the shared daemon's periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. Exact paths are logged by `diagnostics.start`. |
 | `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
 | `CBM_LOG_LEVEL` | role-aware | Set the minimum log level. Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and its supervised index workers default to `info` so lifecycle and liveness records remain available. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none` — or their numeric equivalents `0`–`4`. A physical worker retains INFO liveness records even under a stricter override because its private log drives the supervisor's no-progress timeout. Frontend messages go to that session's stderr; detached daemon events go to `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. Stdout is reserved for MCP JSON-RPC. |
-| `CBM_WORKERS` | *(detected)* | Override the parallel-indexing worker count returned by `cbm_default_worker_count`. Useful inside containers where `sysconf(_SC_NPROCESSORS_ONLN)` reports host CPUs rather than the cgroup's effective quota. Range 1–256; invalid values are ignored with a warning. |
-| `CBM_MEM_BUDGET_MB` | *(detected)* | Override the in-memory graph budget with an explicit cap in MiB, taking precedence over the `ram_fraction × total_RAM` default. Useful on bare-metal hosts without a cgroup limit, or to pin a budget *below* the cgroup limit so headroom is left for sibling processes. Must be a positive integer; it is clamped to detected total RAM (logged as `mem.budget.clamped`), and non-numeric or non-positive values are ignored with a warning (`mem.budget.env.invalid`). |
+| `CBM_WORKERS` | *(detected)* | Override the parallel-indexing worker count returned by `cbm_default_worker_count`. Useful inside containers where `sysconf(_SC_NPROCESSORS_ONLN)` reports host CPUs rather than the cgroup's effective quota. Range 1–256; invalid values are ignored with a warning. When set it wins over the `index_workers` config key (which is never applied over an existing value); when unset, the daemon exports `index_workers` for its workers to inherit. |
+| `CBM_MEM_BUDGET_MB` | *(detected)* | Override the in-memory graph budget with an explicit cap in MiB, taking precedence over the `index_memory_budget_mb` config key and the `ram_fraction × total_RAM` default. Useful on bare-metal hosts without a cgroup limit, or to pin a budget *below* the cgroup limit so headroom is left for sibling processes. Must be a positive integer; it is clamped to detected total RAM (logged as `mem.budget.clamped`), and non-numeric or non-positive values are ignored with a warning (`mem.budget.env.invalid`) and fall through to `index_memory_budget_mb`. |
 | `CBM_DUMP_VERIFY_MIN_RATIO` | `0.5` | After indexing, compare persisted SQLite node count to the in-memory dump count. When persisted nodes fall below this fraction of committed nodes (and committed > 50), `index_repository` returns `status:"degraded"` instead of silent `indexed`. Range 0–1; set `0` to disable. Invalid values are ignored with a warning. |
 
 Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join that process and cannot replace those values. To change them, close all daemon-backed sessions, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands read their own environment without starting the daemon.
