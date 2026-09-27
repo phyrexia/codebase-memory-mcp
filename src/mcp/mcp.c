@@ -1007,6 +1007,18 @@ int cbm_mcp_tool_count(void) {
     return TOOL_COUNT;
 }
 
+bool cbm_mcp_tool_is_known(const char *tool_name) {
+    if (!tool_name) {
+        return false;
+    }
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        if (strcmp(TOOLS[i].name, tool_name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const char *cbm_mcp_tool_name(int index) {
     if (index < 0 || index >= TOOL_COUNT) {
         return NULL;

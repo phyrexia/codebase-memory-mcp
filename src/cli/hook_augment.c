@@ -1796,6 +1796,28 @@ char *cbm_hook_augment_process_for(cbm_mcp_server_t *srv, const char *input_json
     return ha_process(srv, input_json, forced_event, dialect, outcome);
 }
 
+/* Every hook event name a dialect can deliver (the union across dialects:
+ * ha_dialect_event_supported and ha_tool_event_supported are the sources).
+ * Metric names are checked against this catalog so a payload that invents an
+ * event name cannot mint a metrics slot. */
+static const char *const ha_event_names[] = {
+    "PreToolUse",    "PostToolUse",     "AfterTool",      "SessionStart",
+    "SubagentStart", "UserPromptSubmit", "PostCompaction", "TaskStart",
+    "TaskResume",    "PreCompact",      "pre_llm_call",
+};
+
+bool cbm_hook_augment_event_is_known(const char *event) {
+    if (!event || !event[0]) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(ha_event_names) / sizeof(ha_event_names[0]); i++) {
+        if (strcmp(event, ha_event_names[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* TRUE iff `input` is an un-forced PreToolUse Bash event whose command can
  * never produce augmentation output: not a recognised search, or no queryable
  * token. Pure string work — safe to run BEFORE executable-identity hashing,

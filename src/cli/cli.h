@@ -639,6 +639,11 @@ char *cbm_hook_augment_process_for(cbm_mcp_server_t *srv, const char *input_json
                                    const char *forced_event, const char *dialect_name,
                                    cbm_hook_augment_outcome_t *outcome);
 
+/* True iff `event` names a hook event a dialect can deliver. Metric `name`
+ * values are checked against this catalog so client-invented event names fold
+ * instead of minting slots. */
+bool cbm_hook_augment_event_is_known(const char *event);
+
 /* True for an absolute path the augmenter can walk up: POSIX "/..." or a
  * Windows drive root — "X:/..." or a bare "X:" (callers normalize '\\' to '/'
  * first). Exposed for tests — regression coverage for the Windows drive-letter
