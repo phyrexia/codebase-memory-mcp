@@ -17913,20 +17913,22 @@ static void detect_session(cbm_mcp_server_t *srv) {
         const char *home = cbm_get_home_dir();
         /* Skip useless roots: / and $HOME */
         if (!is_useless_session_root(cwd, home)) {
-            const char *root = cwd;
             bool rooted_at_toplevel = false;
             if (cbm_config_session_root(srv->config) == CBM_SESSION_ROOT_GIT_TOPLEVEL) {
                 cbm_git_context_t ctx = {0};
                 if (cbm_git_context_resolve(cwd, &ctx) == 0 && ctx.is_git && ctx.worktree_root &&
                     !is_useless_session_root(ctx.worktree_root, home)) {
-                    root = ctx.worktree_root;
+                    /* Copy while ctx is alive: cbm_git_context_free below owns
+                     * worktree_root, and srv->session_root outlives the resolve. */
+                    snprintf(srv->session_root, sizeof(srv->session_root), "%s", ctx.worktree_root);
                     rooted_at_toplevel = true;
-                    cbm_log_info("session.root.git_toplevel", "cwd", cwd, "root", root);
+                    cbm_log_info("session.root.git_toplevel", "cwd", cwd, "root",
+                                 ctx.worktree_root);
                 }
                 cbm_git_context_free(&ctx);
             }
-            snprintf(srv->session_root, sizeof(srv->session_root), "%s", root);
             if (!rooted_at_toplevel) {
+                snprintf(srv->session_root, sizeof(srv->session_root), "%s", cwd);
                 cbm_log_info("session.root.cwd", "path", cwd);
             }
         }
