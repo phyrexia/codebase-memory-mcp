@@ -2955,7 +2955,9 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         free(records);
         return cbm_mcp_text_result("out of memory while listing projects", true);
     }
-    qsort(records, (size_t)record_count, sizeof(*records), project_record_compare);
+    if (record_count > 1) {
+        qsort(records, (size_t)record_count, sizeof(*records), project_record_compare);
+    }
 
     int limit = cbm_mcp_get_int_arg(args, "limit", 50);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
