@@ -6201,7 +6201,7 @@ TEST(daemon_host_pins_workers_from_config_without_overwriting_env) {
     b1_knobs_env_t env;
     bool setup = b1_knobs_env_begin(&env, "b1-workers");
     cbm_config_t *cfg = setup ? cbm_config_open(env.cache) : NULL;
-    bool seeded = cfg != NULL && cbm_config_set(cfg, CBM_CONFIG_INDEX_WORKERS, "4") == 0;
+    bool seeded = cfg != NULL && cbm_config_set(cfg, CBM_CONFIG_INDEX_WORKERS, "1") == 0;
 
     cbm_mem_reset_for_tests();
     cbm_mem_set_configured_budget_mb(0);
@@ -6211,10 +6211,10 @@ TEST(daemon_host_pins_workers_from_config_without_overwriting_env) {
     ASSERT_TRUE(setup);
     ASSERT_TRUE(seeded);
     ASSERT_TRUE(loaded);
-    ASSERT_EQ(knobs.index_workers, 4);
-    ASSERT_STR_EQ(knobs.index_workers_text, "4");
+    ASSERT_EQ(knobs.index_workers, 1);
+    ASSERT_STR_EQ(knobs.index_workers_text, "1");
     ASSERT_TRUE(knobs.workers_exported);
-    ASSERT_STR_EQ(getenv("CBM_WORKERS"), "4");
+    ASSERT_STR_EQ(getenv("CBM_WORKERS"), "1");
 
     /* An explicit environment value outranks the config and is left alone. */
     ASSERT_EQ(cbm_setenv("CBM_WORKERS", "2", 1), 0);

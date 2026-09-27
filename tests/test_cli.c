@@ -15395,20 +15395,20 @@ TEST(cli_config_index_budget_keys_round_trip_reset_and_persist) {
     /* A daemon-sized machine can hold 1536 MiB and 1 worker on any host this
      * suite has ever run on; the upper bound is exercised separately. */
     char *set_budget[] = {"set", CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, "1536"};
-    char *set_workers[] = {"set", CBM_CONFIG_INDEX_WORKERS, "4"};
+    char *set_workers[] = {"set", CBM_CONFIG_INDEX_WORKERS, "1"};
     ASSERT_EQ(cli_config_cmd_capture(3, set_budget, out, sizeof(out)), 0);
     ASSERT_EQ(cli_config_cmd_capture(3, set_workers, out, sizeof(out)), 0);
     ASSERT_EQ(cli_config_cmd_capture(2, get_budget, out, sizeof(out)), 0);
     ASSERT_STR_EQ(out, "1536\n");
     ASSERT_EQ(cli_config_cmd_capture(2, get_workers, out, sizeof(out)), 0);
-    ASSERT_STR_EQ(out, "4\n");
+    ASSERT_STR_EQ(out, "1\n");
 
     /* The daemon-side readers agree with the CLI, and the values survive a
      * reopen of _config.db (this is the durability B1 exists for). */
     cfg = cbm_config_open(tmpdir);
     ASSERT_NOT_NULL(cfg);
     ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg), 1536);
-    ASSERT_EQ(cbm_config_index_workers(cfg), 4);
+    ASSERT_EQ(cbm_config_index_workers(cfg), 1);
     cbm_config_close(cfg);
 
     /* Reset returns both keys to their sentinel. */
@@ -15444,7 +15444,7 @@ TEST(cli_config_index_budget_keys_reject_invalid_and_out_of_range_values) {
 
     char out[512];
     char *set_budget[] = {"set", CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, "1536"};
-    char *set_workers[] = {"set", CBM_CONFIG_INDEX_WORKERS, "4"};
+    char *set_workers[] = {"set", CBM_CONFIG_INDEX_WORKERS, "1"};
     char *get_budget[] = {"get", CBM_CONFIG_INDEX_MEMORY_BUDGET_MB};
     char *get_workers[] = {"get", CBM_CONFIG_INDEX_WORKERS};
     ASSERT_EQ(cli_config_cmd_capture(3, set_budget, out, sizeof(out)), 0);
@@ -15472,7 +15472,7 @@ TEST(cli_config_index_budget_keys_reject_invalid_and_out_of_range_values) {
         ASSERT_TRUE(cli_config_cmd_capture(3, argv_set, out, sizeof(out)) != 0);
         ASSERT_STR_EQ(out, "");
         ASSERT_EQ(cli_config_cmd_capture(2, get_workers, out, sizeof(out)), 0);
-        ASSERT_STR_EQ(out, "4\n");
+        ASSERT_STR_EQ(out, "1\n");
     }
 
     /* Machine bounds: one over total RAM / the online core count is refused.

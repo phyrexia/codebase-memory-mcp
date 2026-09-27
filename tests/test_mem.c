@@ -695,13 +695,11 @@ TEST(mem_init_uses_staged_config_budget_and_reports_config_source) {
     /* Restore the state an ordinary cbm_mem_init(0.5) leaves behind. */
     cbm_mem_reset_for_tests();
     cbm_mem_set_configured_budget_mb(0);
-    cbm_mem_init(0.5);
-    ASSERT_STR_EQ(cbm_mem_budget_source(), "ram_fraction");
-
     if (saved_env) {
         cbm_setenv("CBM_MEM_BUDGET_MB", saved_env, 1);
         free(saved_env);
     }
+    cbm_mem_init(0.5);
     PASS();
 }
 
