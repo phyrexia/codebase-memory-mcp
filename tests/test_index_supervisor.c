@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h> /* time(NULL): the rotation clock the mtime epoch expects */
 
 enum {
     INDEX_SUPERVISOR_TEST_PATH_CAP = 1024,
@@ -944,8 +945,9 @@ TEST(index_supervisor_job_memory_limit_has_floor_headroom_and_no_overflow) {
 /* C9: <cache>/logs accumulates one .worker-log-* per physical worker attempt
  * (only clean runs delete theirs): 6503 were on disk at audit time. Rotation
  * keeps the young (inside the retention window) and the recent floor, and
- * unlinks the rest. `now_ms` comes from the caller so the test can age files
- * without touching any clock. */
+ * unlinks the rest. `now_unix_s` comes from the caller — Unix time, the same
+ * epoch as the file mtimes — so the test ages files by handing rotation a
+ * future wall clock instead of touching any clock. */
 static bool worker_logs_seed(const char *dir, int count) {
     for (int i = 0; i < count; i++) {
         char path[INDEX_SUPERVISOR_TEST_PATH_CAP];
@@ -989,7 +991,7 @@ TEST(index_supervisor_worker_logs_rotate_keeps_young_and_recent) {
     bool extras = seeded && th_write_file(response_path, "keep") == 0 &&
                   th_write_file(note_path, "note") == 0 && th_mkdir_p(subdir) == 0;
 
-    const int64_t later = (int64_t)cbm_now_ms() + (int64_t)20 * 24 * 3600 * 1000;
+    const int64_t later = (int64_t)time(NULL) + (int64_t)20 * 24 * 3600;
     size_t removed = extras ? cbm_index_worker_logs_rotate(old_dir, later) : 1;
     int left = worker_logs_count(old_dir);
     bool extras_kept =
@@ -1002,7 +1004,7 @@ TEST(index_supervisor_worker_logs_rotate_keeps_young_and_recent) {
     ASSERT_NOT_NULL(cbm_mkdtemp(young_dir));
     bool young_seeded = worker_logs_seed(young_dir, 3);
     size_t young_removed =
-        young_seeded ? cbm_index_worker_logs_rotate(young_dir, (int64_t)cbm_now_ms()) : 1;
+        young_seeded ? cbm_index_worker_logs_rotate(young_dir, (int64_t)time(NULL)) : 1;
     int young_left = worker_logs_count(young_dir);
     (void)th_rmtree(young_dir);
 

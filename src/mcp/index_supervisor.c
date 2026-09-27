@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <time.h> /* time(NULL): worker-log rotation ages files in Unix time */
 
 #ifdef _WIN32
 #include <io.h>
@@ -612,7 +613,10 @@ static bool worker_unique_file(char *out, size_t out_size, const char *kind) {
  * rest: anything inside CBM_WORKER_LOG_RETENTION_DAYS is recent enough to be
  * the post-mortem evidence someone is looking for, and the
  * CBM_WORKER_LOG_KEEP_RECENT newest always survive so a small set of logs is
- * never emptied out. Only regular `.worker-log-*` files are ever unlinked. */
+ * never emptied out. Only regular `.worker-log-*` files are ever unlinked.
+ * Ages are Unix time (the epoch of `cbm_path_info_t.mtime_ns`), never the
+ * monotonic `cbm_now_ms()`: that one counts from boot, so every log would look
+ * younger than the window and rotation would unlink nothing. */
 enum {
     /* Two weeks of worker evidence: the same window the ops-side ephemeral
      * cleanup uses, in one place for the binary. */
@@ -637,7 +641,7 @@ static int worker_log_entry_newest_first(const void *left, const void *right) {
     return strcmp(a->name, b->name);
 }
 
-size_t cbm_index_worker_logs_rotate(const char *logs_dir, int64_t now_ms) {
+size_t cbm_index_worker_logs_rotate(const char *logs_dir, int64_t now_unix_s) {
     if (!logs_dir || !logs_dir[0]) {
         return 0;
     }
@@ -688,10 +692,10 @@ size_t cbm_index_worker_logs_rotate(const char *logs_dir, int64_t now_ms) {
     if (count > 1) {
         qsort(entries, count, sizeof(*entries), worker_log_entry_newest_first);
     }
-    const int64_t window_ms = (int64_t)CBM_WORKER_LOG_RETENTION_DAYS * 24 * 3600 * 1000;
+    const int64_t window_s = (int64_t)CBM_WORKER_LOG_RETENTION_DAYS * 24 * 3600;
     size_t removed = 0;
     for (size_t i = 0; i < count; i++) {
-        bool young = now_ms - entries[i].mtime_ns / 1000000 <= window_ms;
+        bool young = now_unix_s - entries[i].mtime_ns / 1000000000 <= window_s;
         if (i < (size_t)CBM_WORKER_LOG_KEEP_RECENT || young) {
             continue;
         }
@@ -833,7 +837,9 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
     char cache_dir[INDEX_WORKER_PATH_CAP] = {0};
     char logs_dir[INDEX_WORKER_PATH_CAP];
     if (worker_cache_dir(cache_dir) && worker_logs_dir(cache_dir, logs_dir, sizeof(logs_dir))) {
-        size_t rotated = cbm_index_worker_logs_rotate(logs_dir, (int64_t)cbm_now_ms());
+        /* Wall clock, never cbm_now_ms(): the retention window is compared
+         * against file mtimes, which carry Unix-epoch nanoseconds. */
+        size_t rotated = cbm_index_worker_logs_rotate(logs_dir, (int64_t)time(NULL));
         if (rotated > 0) {
             char removed_text[CBM_SZ_32];
             (void)snprintf(removed_text, sizeof(removed_text), "%zu", rotated);

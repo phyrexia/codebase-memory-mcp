@@ -74,9 +74,12 @@ void cbm_index_worker_log_begin(const char *args_json, const char *repo_path);
 /* Rotate the accumulated `.worker-log-*` files in `logs_dir` (one per physical
  * worker attempt; only clean runs delete theirs): files newer than
  * CBM_WORKER_LOG_RETENTION_DAYS or among the CBM_WORKER_LOG_KEEP_RECENT newest
- * stay, the rest are unlinked. `now_ms` is the caller's clock (tests inject a
- * future one to age files). Returns how many were removed. */
-size_t cbm_index_worker_logs_rotate(const char *logs_dir, int64_t now_ms);
+ * stay, the rest are unlinked. `now_unix_s` is wall-clock Unix time in seconds
+ * (`time(NULL)`, the same epoch as `cbm_path_info_t.mtime_ns`) and MUST NOT be
+ * the monotonic `cbm_now_ms()`: that one counts from boot, so every log looks
+ * younger than the window and rotation unlinks nothing. Tests inject a future
+ * value to age files. Returns how many were removed. */
+size_t cbm_index_worker_logs_rotate(const char *logs_dir, int64_t now_unix_s);
 
 /* Capture the exact executable-image fingerprint once, during process startup
  * before any worker can be launched. Repeated calls return the original capture
