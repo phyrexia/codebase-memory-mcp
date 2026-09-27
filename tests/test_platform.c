@@ -6,9 +6,11 @@
 #include "../src/foundation/compat_fs.h"
 #include "../src/foundation/constants.h"
 #include "../src/foundation/compat_thread.h"
+#include "../src/foundation/limits.h"
 #include "../src/foundation/platform.h"
 #include "../src/foundation/platform_internal.h"
 #include "../src/foundation/system_info_internal.h"
+#include <limits.h> /* ULONG_MAX — the absurd descriptor request */
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -986,6 +988,113 @@ TEST(platform_system_info) {
     PASS();
 }
 
+/* ── Daemon connection cap (CBM_MAX_CLIENTS) ───────────────────────
+ *
+ * The cap decides how many agent sessions can hold a daemon connection at
+ * once. Over it, a client is told only by a 30 s connect timeout, so getting
+ * the resolution wrong is expensive and invisible. */
+
+TEST(platform_daemon_max_clients_default) {
+    cbm_unsetenv("CBM_MAX_CLIENTS");
+    ASSERT_EQ(cbm_daemon_max_clients(), CBM_DAEMON_MAX_CLIENTS_DEFAULT);
+    ASSERT_EQ(CBM_DAEMON_MAX_CLIENTS_DEFAULT, 128);
+    PASS();
+}
+
+TEST(platform_daemon_max_clients_env_override) {
+    cbm_setenv("CBM_MAX_CLIENTS", "200", 1);
+    ASSERT_EQ(cbm_daemon_max_clients(), 200);
+    /* A value under the default is honoured too — the override sets the cap,
+     * it does not merely raise it. */
+    cbm_setenv("CBM_MAX_CLIENTS", "8", 1);
+    ASSERT_EQ(cbm_daemon_max_clients(), 8);
+    cbm_unsetenv("CBM_MAX_CLIENTS");
+    PASS();
+}
+
+TEST(platform_daemon_max_clients_clamps_instead_of_discarding) {
+    /* Out of range is clamped to the nearest end, NOT dropped for the default.
+     * Someone writing 99999 is asking for as many as the daemon can take;
+     * handing them 128 and saying nothing would look like it was honoured. */
+    cbm_setenv("CBM_MAX_CLIENTS", "99999", 1);
+    ASSERT_EQ(cbm_daemon_max_clients(), CBM_DAEMON_MAX_CLIENTS_LIMIT);
+    ASSERT_EQ(CBM_DAEMON_MAX_CLIENTS_LIMIT, 512);
+
+    cbm_setenv("CBM_MAX_CLIENTS", "0", 1);
+    ASSERT_EQ(cbm_daemon_max_clients(), 1);
+
+    cbm_setenv("CBM_MAX_CLIENTS", "-5", 1);
+    ASSERT_EQ(cbm_daemon_max_clients(), 1);
+
+    cbm_unsetenv("CBM_MAX_CLIENTS");
+    PASS();
+}
+
+TEST(platform_daemon_max_clients_unreadable_falls_back) {
+    /* Text that is not a number at all carries no intent to clamp toward, so
+     * this one does take the default — including the shapes that atoi would
+     * silently read as a number and truncate. */
+    cbm_setenv("CBM_MAX_CLIENTS", "not-a-number", 1);
+    ASSERT_EQ(cbm_daemon_max_clients(), CBM_DAEMON_MAX_CLIENTS_DEFAULT);
+
+    cbm_setenv("CBM_MAX_CLIENTS", "200clients", 1);
+    ASSERT_EQ(cbm_daemon_max_clients(), CBM_DAEMON_MAX_CLIENTS_DEFAULT);
+
+    cbm_setenv("CBM_MAX_CLIENTS", "", 1);
+    ASSERT_EQ(cbm_daemon_max_clients(), CBM_DAEMON_MAX_CLIENTS_DEFAULT);
+
+    cbm_unsetenv("CBM_MAX_CLIENTS");
+    PASS();
+}
+
+/* ── RLIMIT_NOFILE ────────────────────────────────────────────────
+ *
+ * Deliberately never lowers the real limit: it is process-wide, and every
+ * other test in this runner shares it. What matters is the contract — raise
+ * toward the request, never below what is already in force, never fail. */
+
+TEST(platform_open_file_limit_never_lowers) {
+    unsigned long baseline = cbm_raise_open_file_limit(1);
+    if (baseline == 0) {
+        /* No manageable per-process cap on this platform. */
+        PASS();
+    }
+    ASSERT_GT(baseline, 1);
+
+    /* Asking for far less than is already in force must leave it alone. */
+    ASSERT_EQ(cbm_raise_open_file_limit(2), baseline);
+    PASS();
+}
+
+TEST(platform_open_file_limit_raises_toward_request) {
+    unsigned long baseline = cbm_raise_open_file_limit(1);
+    if (baseline == 0) {
+        PASS();
+    }
+    unsigned long asked = baseline + 64;
+    unsigned long raised = cbm_raise_open_file_limit(asked);
+    /* The OS may cap the raise, but it must never come back with less than it
+     * started at — a partial raise is still a raise. */
+    ASSERT_GTE(raised, baseline);
+    ASSERT_EQ(cbm_raise_open_file_limit(1), raised);
+    PASS();
+}
+
+TEST(platform_open_file_limit_survives_an_absurd_request) {
+    unsigned long baseline = cbm_raise_open_file_limit(1);
+    if (baseline == 0) {
+        PASS();
+    }
+    /* macOS refuses a soft cap above kern.maxfilesperproc with EINVAL even
+     * when the hard cap reads unlimited, so the one-shot raise fails and the
+     * backoff has to find a value the kernel accepts — without spinning. */
+    unsigned long absurd = cbm_raise_open_file_limit(ULONG_MAX);
+    ASSERT_GTE(absurd, baseline);
+    /* Zero is not a request for zero descriptors; it is no request at all. */
+    ASSERT_EQ(cbm_raise_open_file_limit(0), 0);
+    PASS();
+}
+
 /* ── cgroup-aware detection (Linux only) ─────────────────────────── */
 
 #ifdef __linux__
@@ -1191,6 +1300,13 @@ SUITE(platform) {
     RUN_TEST(platform_default_workers_env_unset);
     RUN_TEST(platform_env_long_reads_a_clean_number);
     RUN_TEST(platform_env_long_refuses_what_it_cannot_read);
+    RUN_TEST(platform_daemon_max_clients_default);
+    RUN_TEST(platform_daemon_max_clients_env_override);
+    RUN_TEST(platform_daemon_max_clients_clamps_instead_of_discarding);
+    RUN_TEST(platform_daemon_max_clients_unreadable_falls_back);
+    RUN_TEST(platform_open_file_limit_never_lowers);
+    RUN_TEST(platform_open_file_limit_raises_toward_request);
+    RUN_TEST(platform_open_file_limit_survives_an_absurd_request);
     RUN_TEST(platform_system_info);
 #ifdef __linux__
     RUN_TEST(cgroup_v2_cpu_quota);

@@ -8,6 +8,7 @@
 
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
+#include "foundation/limits.h"
 #include "foundation/log.h"
 #include "foundation/mem.h"
 #include "foundation/platform.h"
@@ -84,7 +85,10 @@ void cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(uint32_
 #endif
 
 enum {
-    RUNTIME_MAX_CLIENTS_HARD = 64,
+    /* Single source of truth with the CBM_MAX_CLIENTS knob: the env override
+     * clamps to this same ceiling, so a configured cap can never arrive here
+     * above what the service will accept. */
+    RUNTIME_MAX_CLIENTS_HARD = CBM_DAEMON_MAX_CLIENTS_LIMIT,
     RUNTIME_WAIT_POLL_NS = 1000000,
     RUNTIME_WORKER_STACK_SIZE = 256 * 1024,
     /* Bounds the drain-before-close wait for a peer consuming its final
@@ -219,6 +223,17 @@ struct cbm_daemon_runtime_service {
     size_t worker_capacity;
     size_t worker_mutexes_initialized;
     size_t active_connections;
+    /* High-water mark of active_connections since service start; never
+     * decremented. The live count above answers "how full is it right now",
+     * which a poller almost always catches at a trough. Deciding whether a
+     * configured cap is big enough needs the peak the daemon actually reached
+     * between two samples, which only the daemon can see. */
+    size_t peak_connections;
+    /* Admissions refused because the cap was already full. Until this existed
+     * a capacity rejection was told only to the client being turned away —
+     * from the daemon's own records, a saturated cap and an idle one looked
+     * identical. */
+    uint64_t capacity_rejections;
     size_t committed_clients;
     /* Monotonic count of every admission since service start. The host's
      * nobody-ever-connected window latches on this instead of sampling the
@@ -2226,6 +2241,37 @@ static void runtime_reject_inline(cbm_daemon_ipc_connection_t *connection, const
     cbm_daemon_ipc_connection_close(connection);
 }
 
+/* Connection-admission telemetry. Both helpers run with service->mutex already
+ * released and take plain values rather than the service, so a log write can
+ * never sit inside the accept-path lock. */
+
+static void runtime_log_connection_peak(size_t peak, size_t capacity) {
+    char peak_text[32];
+    char capacity_text[32];
+    char utilization_text[32];
+    (void)snprintf(peak_text, sizeof(peak_text), "%zu", peak);
+    (void)snprintf(capacity_text, sizeof(capacity_text), "%zu", capacity);
+    (void)snprintf(utilization_text, sizeof(utilization_text), "%zu",
+                   capacity > 0 ? (peak * 100U) / capacity : 0U);
+    cbm_log_info("daemon.runtime.connections_peak", "peak_connections", peak_text, "max_clients",
+                 capacity_text, "utilization_percent", utilization_text);
+}
+
+static void runtime_log_capacity_rejection(size_t active, size_t capacity, uint64_t peer_pid,
+                                           uint64_t total_rejections) {
+    char active_text[32];
+    char capacity_text[32];
+    char peer_text[32];
+    char total_text[32];
+    (void)snprintf(active_text, sizeof(active_text), "%zu", active);
+    (void)snprintf(capacity_text, sizeof(capacity_text), "%zu", capacity);
+    (void)snprintf(peer_text, sizeof(peer_text), "%llu", (unsigned long long)peer_pid);
+    (void)snprintf(total_text, sizeof(total_text), "%llu", (unsigned long long)total_rejections);
+    cbm_log_warn("daemon.runtime.capacity_rejected", "active_connections", active_text,
+                 "max_clients", capacity_text, "peer_pid", peer_text, "rejections_total",
+                 total_text);
+}
+
 static void runtime_accept_connection(cbm_daemon_runtime_service_t *service,
                                       cbm_daemon_ipc_connection_t *connection) {
     uint64_t peer_pid = cbm_daemon_ipc_connection_peer_pid(connection);
@@ -2234,6 +2280,7 @@ static void runtime_accept_connection(cbm_daemon_runtime_service_t *service,
         return;
     }
 
+    bool admission_failed = false;
     cbm_mutex_lock(&service->mutex);
     bool running = service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
     bool capacity = service->active_connections >= service->worker_capacity;
@@ -2264,20 +2311,68 @@ static void runtime_accept_connection(cbm_daemon_runtime_service_t *service,
                                         runtime_connection_worker, worker);
         if (created == 0) {
             worker->thread_started = true;
+            size_t peak = 0;
+            if (service->active_connections > service->peak_connections) {
+                service->peak_connections = service->active_connections;
+                peak = service->peak_connections;
+            }
+            size_t capacity_now = service->worker_capacity;
             cbm_mutex_unlock(&service->mutex);
+            /* Logged outside the lock, and only when the mark actually moves,
+             * so a busy daemon churning connections below its peak stays
+             * quiet. This is the line that says how close the cap ever came
+             * to being reached. */
+            if (peak > 0) {
+                runtime_log_connection_peak(peak, capacity_now);
+            }
             return;
         }
         service->active_connections--;
         runtime_service_changed_locked(service);
         runtime_worker_reset_after_join(worker);
+        /* A slot was free; spawning its thread is what failed. The peer is
+         * still told "capacity reached", but this is thread exhaustion below
+         * the cap, not the cap being full — counting it as a capacity
+         * rejection would argue for raising a cap that was never reached. */
+        admission_failed = true;
+    }
+    /* Only a genuinely full cap counts. Keeping this metric clean is the whole
+     * point of it: it is the evidence for whether the configured cap is too
+     * small, and one mis-attributed cause sends that decision the wrong way. */
+    bool cap_was_full = running && !admission_failed && capacity;
+    uint64_t rejections = 0;
+    size_t active_at_reject = 0;
+    size_t capacity_at_reject = 0;
+    if (cap_was_full) {
+        service->capacity_rejections++;
+        rejections = service->capacity_rejections;
+        active_at_reject = service->active_connections;
+        capacity_at_reject = service->worker_capacity;
     }
     cbm_mutex_unlock(&service->mutex);
 
     if (!running) {
         runtime_reject_inline(connection, "CBM daemon is stopping");
-    } else {
-        runtime_reject_inline(connection, "CBM daemon connection capacity reached");
+        return;
     }
+    if (cap_was_full) {
+        /* A rejected client only ever sees a 30 s connect timeout: its
+         * bootstrap keeps retrying a daemon that is demonstrably alive, so
+         * "capacity reached" never reaches a human. Record it here, on the
+         * side that knows, or a cap that is too small is indistinguishable
+         * from a daemon that is merely slow. */
+        runtime_log_capacity_rejection(active_at_reject, capacity_at_reject, peer_pid, rejections);
+    } else {
+        /* Refused with the cap not full: a thread that would not spawn, or no
+         * free worker when the count said there was one. The peer sees the
+         * same message either way, so without this line the two causes are
+         * indistinguishable in hindsight — and they need opposite fixes. */
+        char peer_text[32];
+        (void)snprintf(peer_text, sizeof(peer_text), "%llu", (unsigned long long)peer_pid);
+        cbm_log_error("daemon.runtime.admission_failed", "peer_pid", peer_text, "reason",
+                      admission_failed ? "worker_thread_create" : "no_free_worker");
+    }
+    runtime_reject_inline(connection, "CBM daemon connection capacity reached");
 }
 
 static bool runtime_service_can_exit_locked(cbm_daemon_runtime_service_t *service,
@@ -2568,6 +2663,15 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
         return NULL;
     }
     service->accept_thread_started = true;
+    /* The cap in force, stated once at start. Peak and rejection lines later
+     * in the log are only readable against it, and it is the first thing to
+     * check when a client reports being turned away. */
+    char capacity_text[32];
+    char hard_cap_text[32];
+    (void)snprintf(capacity_text, sizeof(capacity_text), "%zu", service->worker_capacity);
+    (void)snprintf(hard_cap_text, sizeof(hard_cap_text), "%d", RUNTIME_MAX_CLIENTS_HARD);
+    cbm_log_info("daemon.runtime.capacity", "max_clients", capacity_text, "hard_cap",
+                 hard_cap_text);
     return service;
 }
 
@@ -2685,6 +2789,39 @@ void cbm_daemon_runtime_service_reconcile_lifetime(cbm_daemon_runtime_service_t 
          * service drains and exits cleanly rather than only on the deadline. */
         cbm_daemon_coordinator_set_linger(service->coordinator, false);
     }
+}
+
+size_t cbm_daemon_runtime_service_max_clients(cbm_daemon_runtime_service_t *service) {
+    if (!service) {
+        return 0;
+    }
+    /* worker_capacity is written once before the accept thread starts and
+     * never again; the lock is here only to keep every counter accessor
+     * reading the same way. */
+    cbm_mutex_lock(&service->mutex);
+    size_t capacity = service->worker_capacity;
+    cbm_mutex_unlock(&service->mutex);
+    return capacity;
+}
+
+size_t cbm_daemon_runtime_service_peak_connections(cbm_daemon_runtime_service_t *service) {
+    if (!service) {
+        return 0;
+    }
+    cbm_mutex_lock(&service->mutex);
+    size_t peak = service->peak_connections;
+    cbm_mutex_unlock(&service->mutex);
+    return peak;
+}
+
+uint64_t cbm_daemon_runtime_service_capacity_rejections(cbm_daemon_runtime_service_t *service) {
+    if (!service) {
+        return 0;
+    }
+    cbm_mutex_lock(&service->mutex);
+    uint64_t rejections = service->capacity_rejections;
+    cbm_mutex_unlock(&service->mutex);
+    return rejections;
 }
 
 size_t cbm_daemon_runtime_service_job_subscribers(cbm_daemon_runtime_service_t *service,

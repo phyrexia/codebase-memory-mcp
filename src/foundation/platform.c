@@ -340,6 +340,58 @@ char *cbm_normalize_path_sep(char *path) {
 
 #endif /* _WIN32 */
 
+/* ── Process resource limits ──────────────────────────── */
+
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
+
+unsigned long cbm_raise_open_file_limit(unsigned long desired) {
+#ifdef _WIN32
+    /* Windows has no per-process descriptor rlimit to raise; the CRT's
+     * stdio-handle cap is unrelated to sockets. Nothing to manage. */
+    (void)desired;
+    return 0;
+#else
+    struct rlimit limit;
+    if (desired == 0 || getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        return 0;
+    }
+    /* An unlimited soft cap satisfies any request. Report it as the amount
+     * asked for rather than inventing a sentinel the caller has to decode. */
+    if (limit.rlim_cur == RLIM_INFINITY) {
+        return desired;
+    }
+    if (limit.rlim_cur >= (rlim_t)desired) {
+        return (unsigned long)limit.rlim_cur;
+    }
+
+    rlim_t target = (rlim_t)desired;
+    if (limit.rlim_max != RLIM_INFINITY && target > limit.rlim_max) {
+        target = limit.rlim_max;
+    }
+
+    /* macOS refuses a soft cap above kern.maxfilesperproc with EINVAL even
+     * when rlim_max reports RLIM_INFINITY, so a single attempt at the full
+     * target can fail while a smaller raise would have succeeded. Halve the
+     * gap after each refusal and keep whatever the kernel does accept: a
+     * partial raise still buys real headroom, and the caller is told the
+     * number actually in force. Each step shrinks the gap by at least one, so
+     * this terminates at the original soft cap in O(log) syscalls. */
+    struct rlimit raised = limit;
+    rlim_t attempt = target;
+    while (attempt > limit.rlim_cur) {
+        raised.rlim_cur = attempt;
+        if (setrlimit(RLIMIT_NOFILE, &raised) == 0) {
+            return (unsigned long)attempt;
+        }
+        rlim_t step = (attempt - limit.rlim_cur + 1) / 2;
+        attempt -= step;
+    }
+    return (unsigned long)limit.rlim_cur;
+#endif
+}
+
 /* ── Environment variables ──────────────────────────── */
 
 /* Thread-safe getenv: iterates environ directly instead of calling getenv().

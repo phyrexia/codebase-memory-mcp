@@ -35,6 +35,12 @@ enum {
      * #1997 #832) instead of the former open-ended soft overshoot. */
     PP_BACKPRESSURE_MAX_SPINS = 40,
     PP_BACKPRESSURE_NAP_NS = 3000000, /* 3 ms */
+    /* task_info()/GetProcessMemoryInfo()/procfs is too expensive per file in
+     * resolve. Probe on every worker's first file and then amortize the syscall,
+     * bounding post-threshold work to at most this many files per worker. This
+     * bounds detection latency in file count, not bytes: one in-flight file may
+     * still transiently overshoot before the next probe. */
+    PP_RESOLVE_BUDGET_CHECK_INTERVAL = 8,
 };
 #define PP_NSEC_PER_SEC 1000000000ULL
 #define PP_USEC_PER_MS 1000000ULL
@@ -1792,6 +1798,7 @@ typedef struct {
     _Atomic int64_t *shared_ids;
     _Atomic int *cancelled;
     _Atomic int next_file_idx;
+    _Atomic int budget_abort_logged;
 
     /* Cross-file LSP inputs — pre-built once by the caller in pipeline.c
      * and shared read-only by usage across workers (typed non-const to
@@ -3469,7 +3476,33 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     cbm_pxc_thread_scratch_begin();
     file_node_cache_clear();
 
+    int files_until_budget_check = 0;
     while (SKIP_ONE) {
+        if (atomic_load_explicit(rc->cancelled, memory_order_relaxed)) {
+            break;
+        }
+        if (files_until_budget_check == 0) {
+            if (cbm_mem_budget() > 0 && cbm_mem_over_budget()) {
+                atomic_store_explicit(rc->cancelled, 1, memory_order_relaxed);
+                if (atomic_exchange_explicit(&rc->budget_abort_logged, 1,
+                                             memory_order_relaxed) == 0) {
+                    const size_t mb = (size_t)CBM_SZ_1K * CBM_SZ_1K;
+                    char rss_mb[CBM_SZ_32];
+                    char budget_mb[CBM_SZ_32];
+                    char worker_text[CBM_SZ_32];
+                    snprintf(rss_mb, sizeof(rss_mb), "%zu", cbm_mem_rss() / mb);
+                    snprintf(budget_mb, sizeof(budget_mb), "%zu", cbm_mem_budget() / mb);
+                    snprintf(worker_text, sizeof(worker_text), "%d", worker_id);
+                    cbm_log_warn("parallel.resolve.memory_budget_exceeded", "action",
+                                 "cancel_pipeline", "project",
+                                 rc->project_name ? rc->project_name : "", "worker", worker_text,
+                                 "rss_mb", rss_mb, "budget_mb", budget_mb);
+                }
+                break;
+            }
+            files_until_budget_check = PP_RESOLVE_BUDGET_CHECK_INTERVAL;
+        }
+        files_until_budget_check--;
         int file_idx =
             atomic_fetch_add_explicit(&rc->next_file_idx, SKIP_ONE, memory_order_relaxed);
         if (file_idx >= rc->file_count) {
@@ -3785,6 +3818,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .rust_manifest = rust_manifest_ptr,
     };
     atomic_init(&rc.next_file_idx, 0);
+    atomic_init(&rc.budget_abort_logged, 0);
     atomic_init(&rc.lsp_cross_processed, 0);
     atomic_init(&rc.lsp_cross_skipped_no_source, 0);
     /* F4 lazy shared Rust registry: mutex up before workers spawn. */
@@ -3810,6 +3844,16 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_mutex_destroy(&rc.rust_shared_mu);
     if (rust_manifest_arena_live) {
         cbm_arena_destroy(&rust_manifest_arena);
+    }
+
+    if (atomic_load_explicit(ctx->cancelled, memory_order_relaxed)) {
+        for (int i = 0; i < worker_count; i++) {
+            if (workers[i].local_edge_buf) {
+                cbm_gbuf_free(workers[i].local_edge_buf);
+            }
+        }
+        cbm_aligned_free(workers);
+        return CBM_NOT_FOUND;
     }
 
     /* Sub-phase: Merge all local edge bufs into main gbuf (SEQUENTIAL) */

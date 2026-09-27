@@ -20,6 +20,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
+#include "foundation/limits.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/sanitized.h"
@@ -2924,6 +2925,164 @@ TEST(daemon_runtime_authenticated_idle_connection_outlives_lease_interval) {
     PASS();
 }
 
+/* The cap that ships is the one an operator gets without setting anything, and
+ * it has to clear real observed load: a workstation running dozens of agent
+ * sessions held ~65 concurrent frontends against a cap of 64, which is exactly
+ * how every new client ended up waiting out a 30 s connect timeout. */
+TEST(daemon_runtime_default_cap_clears_observed_concurrency) {
+    ASSERT_EQ(CBM_DAEMON_MAX_CLIENTS_DEFAULT, 128);
+    ASSERT_GT(CBM_DAEMON_MAX_CLIENTS_DEFAULT, 65);
+    /* The ceiling an operator may raise CBM_MAX_CLIENTS to must be one the
+     * runtime will actually accept — the two used to be the same number in two
+     * files, and this is the assertion that keeps them from drifting apart. */
+    ASSERT_GTE(CBM_DAEMON_MAX_CLIENTS_LIMIT, CBM_DAEMON_MAX_CLIENTS_DEFAULT);
+    ASSERT_EQ(CBM_DAEMON_MAX_CLIENTS_LIMIT, 512);
+    PASS();
+}
+
+/* A service configured at the ceiling must actually start. Before the cap was
+ * raised, the runtime refused any max_clients above 64 at config validation —
+ * so this fails loudly if the two ends of the change are ever reverted apart. */
+TEST(daemon_runtime_starts_at_the_configurable_ceiling) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start_limited(&fixture, "ceiling-cap", &identity,
+                                                      CBM_DAEMON_MAX_CLIENTS_LIMIT);
+    size_t reported = started ? cbm_daemon_runtime_service_max_clients(fixture.service) : 0;
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_EQ(reported, (size_t)CBM_DAEMON_MAX_CLIENTS_LIMIT);
+    PASS();
+}
+
+/* Whether the cap is big enough cannot be answered by sampling the live count:
+ * a poller lands in a trough far more often than at a peak, and a client
+ * turned away for capacity is told only by a connect timeout it cannot
+ * distinguish from a slow daemon. The daemon has to keep the record itself. */
+TEST(daemon_runtime_capacity_telemetry_records_peak_and_rejections) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start_limited(&fixture, "capacity-telemetry", &identity, 2);
+    cbm_daemon_runtime_client_t *first = NULL;
+    cbm_daemon_runtime_client_t *second = NULL;
+    cbm_daemon_runtime_client_t *rejected = NULL;
+    cbm_daemon_runtime_connect_result_t first_result = {0};
+    cbm_daemon_runtime_connect_result_t second_result = {0};
+    cbm_daemon_runtime_connect_result_t rejected_result = {0};
+
+    size_t reported_cap = 0;
+    uint64_t rejections_before = 1;
+    size_t peak_at_full = 0;
+    uint64_t rejections_after = 0;
+    size_t peak_after_release = 0;
+    size_t active_after_release = 0;
+    bool was_rejected = false;
+
+    if (started) {
+        reported_cap = cbm_daemon_runtime_service_max_clients(fixture.service);
+        /* Nothing has been turned away yet: a fresh service must not claim
+         * rejections it never made. */
+        rejections_before = cbm_daemon_runtime_service_capacity_rejections(fixture.service);
+        first = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                  RUNTIME_TEST_TIMEOUT_MS, &first_result);
+    }
+    if (first) {
+        second = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                   RUNTIME_TEST_TIMEOUT_MS, &second_result);
+    }
+    if (second) {
+        peak_at_full = cbm_daemon_runtime_service_peak_connections(fixture.service);
+        rejected = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                     RUNTIME_TEST_TIMEOUT_MS, &rejected_result);
+        was_rejected = rejected == NULL &&
+                       rejected_result.status == CBM_DAEMON_RUNTIME_CONNECT_REJECTED &&
+                       strstr(rejected_result.message, "capacity") != NULL;
+        rejections_after = cbm_daemon_runtime_service_capacity_rejections(fixture.service);
+
+        /* Release a slot: the live count must fall, and the peak must not —
+         * a high-water mark that decays with load answers the wrong question. */
+        (void)cbm_daemon_runtime_client_close(second, RUNTIME_TEST_TIMEOUT_MS);
+        second = NULL;
+        (void)cbm_daemon_runtime_service_wait_for_connections(fixture.service, 1,
+                                                              RUNTIME_TEST_TIMEOUT_MS);
+        active_after_release = cbm_daemon_runtime_service_active_connections(fixture.service);
+        peak_after_release = cbm_daemon_runtime_service_peak_connections(fixture.service);
+    }
+
+    if (rejected) {
+        (void)cbm_daemon_runtime_client_close(rejected, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    if (second) {
+        (void)cbm_daemon_runtime_client_close(second, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    if (first) {
+        (void)cbm_daemon_runtime_client_close(first, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_EQ(reported_cap, 2);
+    ASSERT_EQ(rejections_before, 0);
+    ASSERT_EQ(peak_at_full, 2);
+    ASSERT_TRUE(was_rejected);
+    ASSERT_EQ(rejections_after, 1);
+    ASSERT_EQ(active_after_release, 1);
+    ASSERT_EQ(peak_after_release, 2);
+    PASS();
+}
+
+/* The descriptor budget is the half of the cap change that is easy to forget:
+ * raising max_clients without it produces a cap the process cannot reach,
+ * because it runs out of descriptors for its own log and index files first —
+ * and that failure does not look like "too many clients" from outside. */
+TEST(daemon_runtime_descriptor_budget_tracks_the_connection_cap) {
+    /* Under launchd the daemon inherits a 256 soft cap, so the floor exists to
+     * clear it even for a small configured cap. */
+    ASSERT_GTE(cbm_daemon_host_descriptor_budget(1), 1024);
+    ASSERT_GTE(cbm_daemon_host_descriptor_budget(CBM_DAEMON_MAX_CLIENTS_DEFAULT), 1024);
+    /* At the ceiling the budget must exceed the ~578 descriptors measured for
+     * 512 connections, with room over it rather than exactly at it. */
+    unsigned long ceiling_budget =
+        cbm_daemon_host_descriptor_budget(CBM_DAEMON_MAX_CLIENTS_LIMIT);
+    ASSERT_GT(ceiling_budget, 578);
+    /* Monotonic in the cap: a bigger cap never asks for fewer descriptors. */
+    ASSERT_GTE(ceiling_budget, cbm_daemon_host_descriptor_budget(CBM_DAEMON_MAX_CLIENTS_DEFAULT));
+    PASS();
+}
+
+TEST(daemon_runtime_descriptor_verdict_separates_thin_from_broken) {
+    unsigned long desired = cbm_daemon_host_descriptor_budget(CBM_DAEMON_MAX_CLIENTS_LIMIT);
+
+    /* Nothing to manage — never a warning. */
+    ASSERT_EQ(cbm_daemon_host_classify_descriptor_limit(CBM_DAEMON_MAX_CLIENTS_LIMIT, desired, 0),
+              CBM_DAEMON_HOST_FD_UNKNOWN);
+    /* The full budget, and more than it. */
+    ASSERT_EQ(
+        cbm_daemon_host_classify_descriptor_limit(CBM_DAEMON_MAX_CLIENTS_LIMIT, desired, desired),
+        CBM_DAEMON_HOST_FD_SUFFICIENT);
+    ASSERT_EQ(cbm_daemon_host_classify_descriptor_limit(CBM_DAEMON_MAX_CLIENTS_LIMIT, desired,
+                                                        desired * 2),
+              CBM_DAEMON_HOST_FD_SUFFICIENT);
+    /* Short of the budget but still able to reach the cap: thinner headroom,
+     * not a broken promise — this must not cry wolf. */
+    ASSERT_EQ(cbm_daemon_host_classify_descriptor_limit(CBM_DAEMON_MAX_CLIENTS_LIMIT, desired,
+                                                        desired - 1),
+              CBM_DAEMON_HOST_FD_PARTIAL);
+    /* The launchd default, against a cap of 512: this is the exact case the
+     * warning exists for. */
+    ASSERT_EQ(cbm_daemon_host_classify_descriptor_limit(CBM_DAEMON_MAX_CLIENTS_LIMIT, desired, 256),
+              CBM_DAEMON_HOST_FD_INSUFFICIENT);
+    /* That same 256 is fine for a small cap — the verdict is about the pair,
+     * not about the number of descriptors alone. */
+    ASSERT_EQ(cbm_daemon_host_classify_descriptor_limit(
+                  2, cbm_daemon_host_descriptor_budget(2), 600),
+              CBM_DAEMON_HOST_FD_PARTIAL);
+    PASS();
+}
+
 TEST(daemon_runtime_connection_cap_covers_slow_hello_and_stopping_is_terminal) {
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
@@ -5300,6 +5459,11 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_ephemeral_linger_retires_within_bound);
 #endif
     RUN_TEST(daemon_runtime_authenticated_idle_connection_outlives_lease_interval);
+    RUN_TEST(daemon_runtime_default_cap_clears_observed_concurrency);
+    RUN_TEST(daemon_runtime_starts_at_the_configurable_ceiling);
+    RUN_TEST(daemon_runtime_capacity_telemetry_records_peak_and_rejections);
+    RUN_TEST(daemon_runtime_descriptor_budget_tracks_the_connection_cap);
+    RUN_TEST(daemon_runtime_descriptor_verdict_separates_thin_from_broken);
     RUN_TEST(daemon_runtime_connection_cap_covers_slow_hello_and_stopping_is_terminal);
     RUN_TEST(daemon_runtime_rejects_forged_identity_extension);
     RUN_TEST(daemon_runtime_application_response_roundtrip_is_byte_exact);
