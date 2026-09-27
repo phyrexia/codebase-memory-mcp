@@ -14143,6 +14143,261 @@ TEST(pipeline_over_budget_after_futility_fails_whole_and_preserves_db) {
     PASS();
 }
 
+/* ── Budget contract across the extract/resolve boundary (ADR A3) ─────
+ *
+ * The two halves of the budget contract are deliberately different:
+ *
+ * - EXTRACT over budget: upstream answers with relief FIRST — spill mode
+ *   latches on the over-budget observation, every cached result is parked on
+ *   disk, and the run goes on (7b77fd48). The first test pins that the spill
+ *   really latches while the run is over budget and that extraction then
+ *   completes and publishes. (When relief cannot bring the charge under — the
+ *   1 MB floor where the process IS the resident floor — upstream fails the
+ *   attempt whole instead; that half is pinned by
+ *   pipeline_backpressure_futile_nap_disengages and
+ *   pipeline_over_budget_after_futility_fails_whole_and_preserves_db.)
+ *
+ * - RESOLVE over budget: nothing upstream relieves (the result cache is read
+ *   back and the edge arena grows), and on 2026-09-14 a worker died entering
+ *   parallel.resolve at rss_mb=10.999 against budget_mb=12.288. The guard
+ *   (1356220d, ported to cbm_mem_should_relieve()) must fail the attempt whole
+ *   with CBM_PIPELINE_ABORT_OVER_BUDGET — the code MCP names
+ *   "over_memory_budget" (mcp.c, d72250a9/b5f10c22) — never a generic error,
+ *   with the previous generation still serving.
+ *
+ * Budgets are simulated with the 699be6c2 seam (cbm_mem_set_budget_for_tests)
+ * and the phase boundaries with the cbm_log_set_sink seam: the pipeline logs
+ * `parallel.extract.start` and `parallel.resolve.start` on the calling thread
+ * BEFORE that phase's workers spawn, so a budget written at those tags lands
+ * exactly at the boundary with no worker mid-gate. The one mid-run write (the
+ * relief at the spill latch) runs on the latching worker while its peers read
+ * the budget, which is why g_budget is atomic (mem.c).
+ *
+ * The 1 MB budget sits under the test process floor on purpose: the run is
+ * over budget on every probe, exactly like the upstream tests above. */
+enum { CBM_TEST_BUDGET_OVER_BYTES = 1024 * 1024 };
+/* Relief target: a budget the charge can never exceed again. NOT 0 — with 0
+ * every consumer's over-budget reading is `charged > 0`, i.e. always over. */
+static const size_t CBM_TEST_BUDGET_NEVER_OVER = SIZE_MAX;
+
+static bool g_extract_sink_started;
+static bool g_extract_sink_spilled;
+static bool g_extract_sink_over_at_spill;
+
+static void extract_spill_budget_sink(const char *line) {
+    if (strstr(line, "parallel.extract.start")) {
+        g_extract_sink_started = true;
+        cbm_mem_set_budget_for_tests((size_t)CBM_TEST_BUDGET_OVER_BYTES);
+    } else if (strstr(line, "mem.spill.on") && !g_extract_sink_spilled) {
+        /* Sample BEFORE the relief: if the latch was not reached over budget,
+         * this proves nothing. The latch logs once, on the 0→1 transition. */
+        g_extract_sink_spilled = true;
+        g_extract_sink_over_at_spill = cbm_mem_over_budget();
+        cbm_mem_set_budget_for_tests(CBM_TEST_BUDGET_NEVER_OVER);
+    } else if (strstr(line, "parallel.resolve.start")) {
+        /* Extract is done; disarm the budget gates for the rest of the run so
+         * this test cannot trip the resolve guard — pinned by the next test. */
+        cbm_mem_set_budget_for_tests(0);
+    }
+}
+
+static bool g_resolve_sink_started;
+static bool g_resolve_sink_spilled;
+static bool g_resolve_sink_aborted;
+
+static void resolve_over_budget_sink(const char *line) {
+    if (strstr(line, "parallel.resolve.start")) {
+        g_resolve_sink_started = true;
+        cbm_mem_set_budget_for_tests((size_t)CBM_TEST_BUDGET_OVER_BYTES);
+    } else if (strstr(line, "pass.timing") && strstr(line, "parallel_resolve")) {
+        cbm_mem_set_budget_for_tests(0);
+    } else if (strstr(line, "mem.spill.on")) {
+        g_resolve_sink_spilled = true;
+    } else if (strstr(line, "parallel.resolve.memory_budget_exceeded")) {
+        /* The guard's own record: fired in resolve, not somewhere else. This
+         * is an engagement guard, not the contract assertion — the code the
+         * run returns is. */
+        g_resolve_sink_aborted = true;
+    }
+}
+
+TEST(pipeline_extract_over_budget_spills_and_completes) {
+    if (!write_backpressure_fixture()) {
+        FAIL("failed to create fixture");
+    }
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    if ((old_workers && !saved_workers) || cbm_setenv("CBM_WORKERS", "4", 1) != 0) {
+        free(saved_workers);
+        teardown_test_repo();
+        FAIL("failed to pin CBM_WORKERS");
+    }
+
+    size_t saved_budget = cbm_mem_budget();
+    CBMLogLevel saved_level = cbm_log_get_level();
+    cbm_mem_set_budget_for_tests(0); /* gates off until the sink arms them */
+    cbm_log_set_level(CBM_LOG_INFO); /* the seam keys on INFO lifecycle lines */
+    g_extract_sink_started = false;
+    g_extract_sink_spilled = false;
+    g_extract_sink_over_at_spill = false;
+    cbm_log_set_sink(extract_spill_budget_sink);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/extract_spill.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    char *project = p ? strdup(cbm_pipeline_project_name(p)) : NULL;
+
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(saved_level);
+    cbm_mem_set_budget_for_tests(saved_budget);
+    cbm_pipeline_free(p);
+
+    int nodes = -1;
+    bool valid = false;
+    cbm_store_t *live = rc == 0 && project ? cbm_store_open_path(db_path) : NULL;
+    if (live) {
+        valid = cbm_store_check_integrity(live);
+        nodes = cbm_store_count_nodes(live, project);
+        cbm_store_close(live);
+    }
+    free(project);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    free(saved_workers);
+    teardown_test_repo();
+
+    ASSERT_EQ(restore_workers_rc, 0);
+    /* Engagement guards (anti-vacuous): the budget really flipped before the
+     * extract workers spawned, and the spill really latched while the run was
+     * over budget — or this test proved nothing. */
+    if (!g_extract_sink_started) {
+        FAIL("budget never armed (parallel.extract.start unseen) — fixture routed sequential?");
+    }
+    if (!g_extract_sink_spilled) {
+        FAIL("spill never latched (mem.spill.on unseen)");
+    }
+    if (!g_extract_sink_over_at_spill) {
+        FAIL("spill latched without the run being over budget");
+    }
+    /* Extract over budget spills and COMPLETES: a published, valid graph. */
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(valid);
+    ASSERT_GT(nodes, 0);
+    PASS();
+}
+
+/* Decision A3: resolve over budget fails WHOLE with the named code — not the
+ * cancel sentinel, not success — and the previously serving generation is
+ * byte-identical afterwards. RED before the guard port: the run returns the
+ * generic cancel code (or completes), which MCP cannot name
+ * "over_memory_budget". */
+TEST(pipeline_over_budget_resolve_aborts_named_over_memory_budget) {
+    if (!write_backpressure_fixture()) {
+        FAIL("failed to create fixture");
+    }
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    if ((old_workers && !saved_workers) || cbm_setenv("CBM_WORKERS", "4", 1) != 0) {
+        free(saved_workers);
+        teardown_test_repo();
+        FAIL("failed to pin CBM_WORKERS");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/resolve_budget.db", g_tmpdir);
+
+    /* Generation 1 at the process budget: publishes normally. */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    int rc_first = p ? cbm_pipeline_run(p) : -1;
+    char *project = p ? strdup(cbm_pipeline_project_name(p)) : NULL;
+    cbm_pipeline_free(p);
+    int nodes_before = -1;
+    bool valid_before = false;
+    cbm_store_t *live = rc_first == 0 && project ? cbm_store_open_path(db_path) : NULL;
+    if (live) {
+        valid_before = cbm_store_check_integrity(live);
+        nodes_before = cbm_store_count_nodes(live, project);
+        cbm_store_close(live);
+    }
+    size_t before_len = 0;
+    unsigned char *before = read_file_bytes(db_path, &before_len);
+
+    /* Generation 2 over a CHANGED repo (every file gains a definition, so the
+     * run must re-extract all 64). Extraction spills its results (the incident
+     * shape: the spill keeps extraction alive), and the budget is exceeded at
+     * the resolve boundary — the phase nothing upstream relieves. */
+    bool mutated = mutate_backpressure_fixture();
+    size_t saved_budget = cbm_mem_budget();
+    CBMLogLevel saved_level = cbm_log_get_level();
+    cbm_mem_set_budget_for_tests(0); /* extraction must not trip any gate */
+    cbm_log_set_level(CBM_LOG_INFO);
+    g_resolve_sink_started = false;
+    g_resolve_sink_spilled = false;
+    g_resolve_sink_aborted = false;
+    cbm_log_set_sink(resolve_over_budget_sink);
+    cbm_setenv("CBM_MEM_SPILL", "1", 1); /* park every extraction result */
+
+    p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    int rc_second = p ? cbm_pipeline_run(p) : -1;
+    cbm_unsetenv("CBM_MEM_SPILL");
+
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(saved_level);
+    cbm_mem_set_budget_for_tests(saved_budget);
+    cbm_pipeline_free(p);
+
+    size_t after_len = 0;
+    unsigned char *after = read_file_bytes(db_path, &after_len);
+    int stage_count = count_generation_stage_artifacts(g_tmpdir, "resolve_budget.db");
+    int nodes_after = -1;
+    bool valid_after = false;
+    live = cbm_store_open_path(db_path);
+    if (live) {
+        valid_after = cbm_store_check_integrity(live);
+        nodes_after = project ? cbm_store_count_nodes(live, project) : -1;
+        cbm_store_close(live);
+    }
+    bool bytes_identical =
+        before && after && before_len == after_len && memcmp(before, after, before_len) == 0;
+    free(before);
+    free(after);
+    free(project);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    free(saved_workers);
+    teardown_test_repo();
+
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(rc_first, 0);
+    ASSERT_TRUE(valid_before);
+    ASSERT_GT(nodes_before, 0);
+    ASSERT_TRUE(before_len > 0);
+    ASSERT_TRUE(mutated);
+    /* Engagement guards (anti-vacuous): the budget flipped at the resolve
+     * boundary, the guard really fired there, and extraction really spilled
+     * first. */
+    if (!g_resolve_sink_started) {
+        FAIL("budget never armed at the resolve boundary");
+    }
+    if (!g_resolve_sink_aborted) {
+        FAIL("no resolve budget abort (parallel.resolve.memory_budget_exceeded unseen)");
+    }
+    if (!g_resolve_sink_spilled) {
+        FAIL("extraction never spilled (mem.spill.on unseen)");
+    }
+    /* THE contract: the named failure — the code MCP delivers as
+     * "over_memory_budget", not the cancel sentinel and not success. */
+    ASSERT_EQ(rc_second, CBM_PIPELINE_ABORT_OVER_BUDGET);
+    /* The serving generation is untouched: same bytes, still valid, same
+     * graph; and the failed attempt left no stage residue behind. */
+    ASSERT_TRUE(bytes_identical);
+    ASSERT_TRUE(valid_after);
+    ASSERT_EQ(nodes_after, nodes_before);
+    ASSERT_EQ(stage_count, 0);
+    PASS();
+}
+
 /* TS cross-registry test hooks (ts_lsp.c) — extern to avoid pulling the
  * tree-sitter-typed ts_lsp.h into this store-level test. */
 extern long cbm_ts_full_registry_builds(void);
@@ -15102,6 +15357,8 @@ SUITE(pipeline) {
     /* Extraction back-pressure */
     RUN_TEST(pipeline_backpressure_futile_nap_disengages);
     RUN_TEST(pipeline_over_budget_after_futility_fails_whole_and_preserves_db);
+    RUN_TEST(pipeline_extract_over_budget_spills_and_completes);
+    RUN_TEST(pipeline_over_budget_resolve_aborts_named_over_memory_budget);
     /* Sequential cross-LSP shared registry (ms-typescript quadratic) */
     RUN_TEST(pipeline_seq_ts_cross_uses_shared_registry);
     /* File persistence */

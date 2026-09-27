@@ -84,7 +84,13 @@ extern void _mi_auto_process_init(void);
 
 /* ── Static state ─────────────────────────────────────────────── */
 
-static size_t g_budget;          /* budget in bytes */
+/* Atomic: cbm_mem_set_budget_for_tests flips the budget mid-run from the
+ * thread that logs a phase boundary (the pipeline tests arm it at
+ * parallel.extract.start / parallel.resolve.start and relieve it at the spill
+ * latch) while worker threads read it on every gate probe. Plain reads and
+ * writes were a data race the moment the seam stopped being
+ * before-run/after-run only. */
+static _Atomic size_t g_budget;  /* budget in bytes */
 static atomic_int g_initialized; /* init guard */
 static atomic_int g_was_over;    /* pressure hysteresis */
 
