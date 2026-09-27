@@ -91,3 +91,15 @@ int cbm_daemon_max_clients(void) {
     }
     return (int)clamped;
 }
+
+const char *cbm_daemon_max_clients_source_name(cbm_daemon_max_clients_source_t source) {
+    switch (source) {
+    case CBM_DAEMON_MAX_CLIENTS_SOURCE_ENV:
+        return "env";
+    case CBM_DAEMON_MAX_CLIENTS_SOURCE_CONFIG:
+        return "config";
+    case CBM_DAEMON_MAX_CLIENTS_SOURCE_DEFAULT:
+    default:
+        return "default";
+    }
+}

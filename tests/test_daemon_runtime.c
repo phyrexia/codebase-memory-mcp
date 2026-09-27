@@ -1296,6 +1296,9 @@ static bool runtime_test_fixture_start_failed(const char *tag, const char *stage
 static bool runtime_test_fixture_permanent = false;
 /* B1: budget snapshot the fixture's service reports via `daemon status`. */
 static cbm_daemon_runtime_budget_status_t runtime_test_fixture_budget_status;
+/* C8: provenance of the fixture's connection cap, reported the same way. */
+static cbm_daemon_max_clients_source_t runtime_test_fixture_max_clients_source =
+    CBM_DAEMON_MAX_CLIENTS_SOURCE_DEFAULT;
 
 static bool runtime_test_fixture_start_configured(
     runtime_test_fixture_t *fixture, const char *tag, const cbm_daemon_build_identity_t *identity,
@@ -1342,6 +1345,7 @@ static bool runtime_test_fixture_start_configured(
         .conflict_log_path = fixture->log_path,
         .conflict_log_cap_bytes = 64U * 1024U,
         .max_clients = max_clients,
+        .max_clients_source = runtime_test_fixture_max_clients_source,
         .lease_timeout_ms = lease_timeout_ms,
         .request_timeout_ms = RUNTIME_TEST_TIMEOUT_MS,
         .shutdown_timeout_ms = RUNTIME_TEST_TIMEOUT_MS,
@@ -5444,7 +5448,9 @@ TEST(daemon_runtime_status_reports_budget_snapshot_and_keeps_the_frozen_layout) 
         started && cbm_daemon_runtime_request_status(fixture.endpoint, &identity,
                                                      RUNTIME_TEST_TIMEOUT_MS, &legacy) &&
         !legacy.has_budget_status && legacy.memory_budget_bytes == 0 && legacy.index_workers == 0 &&
-        legacy.daemon_pid != 0 && strcmp(legacy.build_fingerprint, runtime_test_self_build()) == 0;
+        !legacy.has_capacity_status && legacy.max_clients == 0 && legacy.connections_peak == 0 &&
+        legacy.capacity_rejected == 0 && legacy.daemon_pid != 0 &&
+        strcmp(legacy.build_fingerprint, runtime_test_self_build()) == 0;
     cbm_daemon_runtime_force_legacy_status_for_test(false);
 
     runtime_test_fixture_finish(&fixture);
@@ -5454,12 +5460,80 @@ TEST(daemon_runtime_status_reports_budget_snapshot_and_keeps_the_frozen_layout) 
     PASS();
 }
 
+/* C8: the admission record the cap keeps has to reach `daemon status`, not
+ * just the log — "was this cap ever hit?" is the question that decides whether
+ * the cap is big enough, and answering it required reading every
+ * connections_peak line since the daemon started. The counters ride the same
+ * additive block as the resolved cap and its provenance. */
+TEST(daemon_runtime_status_reports_capacity_counters_and_the_resolved_cap) {
+    cbm_daemon_build_identity_t identity = runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    runtime_test_fixture_max_clients_source = CBM_DAEMON_MAX_CLIENTS_SOURCE_CONFIG;
+    bool started = runtime_test_fixture_start_limited(&fixture, "status-capacity", &identity, 2);
+    runtime_test_fixture_max_clients_source = CBM_DAEMON_MAX_CLIENTS_SOURCE_DEFAULT;
+
+    cbm_daemon_runtime_client_t *first = NULL;
+    cbm_daemon_runtime_client_t *second = NULL;
+    cbm_daemon_runtime_connect_result_t first_result = {0};
+    cbm_daemon_runtime_connect_result_t second_result = {0};
+    cbm_daemon_runtime_connect_result_t rejected_result = {0};
+    bool was_rejected = false;
+    bool slot_released = false;
+
+    if (started) {
+        first = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                  RUNTIME_TEST_TIMEOUT_MS, &first_result);
+    }
+    if (first) {
+        second = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                   RUNTIME_TEST_TIMEOUT_MS, &second_result);
+    }
+    if (second) {
+        /* Fill the cap first: a rejection that never happened would be the one
+         * thing this test could not report on. */
+        (void)cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                RUNTIME_TEST_TIMEOUT_MS, &rejected_result);
+        was_rejected = rejected_result.status == CBM_DAEMON_RUNTIME_CONNECT_REJECTED;
+        /* A control request is admitted like any other connection, so the
+         * status probe needs a free slot — and the peak must not move when the
+         * slot it takes is the one that was already counted. */
+        (void)cbm_daemon_runtime_client_close(second, RUNTIME_TEST_TIMEOUT_MS);
+        second = NULL;
+        slot_released = cbm_daemon_runtime_service_wait_for_connections(fixture.service, 1,
+                                                                       RUNTIME_TEST_TIMEOUT_MS);
+    }
+
+    cbm_daemon_runtime_status_t status = {0};
+    bool snapshot_ok =
+        slot_released && cbm_daemon_runtime_request_status(fixture.endpoint, &identity,
+                                                           RUNTIME_TEST_TIMEOUT_MS, &status) &&
+        status.has_capacity_status && status.max_clients == 2 &&
+        status.max_clients_source == CBM_DAEMON_MAX_CLIENTS_SOURCE_CONFIG &&
+        strcmp(cbm_daemon_max_clients_source_name(status.max_clients_source), "config") == 0 &&
+        status.connections_peak == 2 && status.capacity_rejected == 1 &&
+        /* The capacity block and the B1 budget block travel together. */
+        status.has_budget_status;
+
+    if (first) {
+        (void)cbm_daemon_runtime_client_close(first, RUNTIME_TEST_TIMEOUT_MS);
+        first = NULL;
+    }
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(was_rejected);
+    ASSERT_TRUE(slot_released);
+    ASSERT_TRUE(snapshot_ok);
+    PASS();
+}
+
 SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_idle_accept_has_no_timeout_wakes);
     RUN_TEST(daemon_runtime_state_waiters_recheck_after_spurious_broadcast);
     RUN_TEST(daemon_runtime_permanent_service_survives_last_disconnect_until_stop);
     RUN_TEST(daemon_runtime_stop_refuses_while_committed_clients_exist);
     RUN_TEST(daemon_runtime_status_reports_budget_snapshot_and_keeps_the_frozen_layout);
+    RUN_TEST(daemon_runtime_status_reports_capacity_counters_and_the_resolved_cap);
     RUN_TEST(daemon_host_early_coordination_failure_is_durable);
     RUN_TEST(daemon_host_refuses_unopenable_runtime_config_database);
     RUN_TEST(daemon_host_http_reconcile_rate_limits_and_retries_transient_failures);

@@ -99,6 +99,7 @@ Current keys:
 | `build_fingerprint_cache` | `false` | Cache the executable's SHA-256 keyed by `(dev, ino, size, mtime_ns)` in the cache directory. `true` skips rehashing the binary on every one-shot CLI run; the cache is invalidated whenever the identity tuple changes. |
 | `index_memory_budget_mb` | `off` | Aggregate index memory budget in MiB. Strict decimal range `512..`total RAM; `off` defers to `CBM_MEM_BUDGET_MB` or the RAM fraction. Read once when the daemon starts. |
 | `index_workers` | `auto` | Parallel workers inside each physical index process. Strict decimal range `1..`online cores; `auto` defers to `CBM_WORKERS` or detected core count. Read once when the daemon starts. |
+| `max_clients` | `auto` | Concurrent client connections the daemon admits at once, counting sockets accepted but not yet through HELLO. Strict decimal range `1..512` — the same range `CBM_MAX_CLIENTS` is clamped into, so a stored value is never one the daemon would have to clamp; `auto` defers to `CBM_MAX_CLIENTS` or the `128` default. Read once when the daemon starts. |
 
 > **`build_fingerprint_cache`.** Opt-in, off by default. The cached hash is only
 > a memo: it is used when the executable's `(dev, ino, size, mtime_ns)` identity
@@ -497,7 +498,7 @@ These environment variables affect runtime behavior:
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. The daemon records the randomized paths in the `diagnostics.start` discovery record (a single JSON line) in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`; that one record is emitted even when `CBM_LOG_LEVEL` suppresses ordinary logging, so the paths always remain discoverable. |
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
 | `CBM_LOG_LEVEL` | role-aware | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and supervised index workers default to `info`. Physical workers retain INFO liveness records because their private logs drive the supervisor's no-progress timeout. Frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
-| `CBM_MAX_CLIENTS` | `128` | How many client connections the daemon admits at once, counting sockets accepted but not yet through HELLO. Clamped to `[1, 512]`: a value outside that range is clamped and logged, not discarded, while text that is not a number falls back to the default. Read once when the daemon starts — see below. |
+| `CBM_MAX_CLIENTS` | `128` | How many client connections the daemon admits at once, counting sockets accepted but not yet through HELLO. Clamped to `[1, 512]`: a value outside that range is clamped and logged, not discarded, while text that is not a number falls back to the default. Wins over the `max_clients` config key, which in turn outranks the `128` default. Read once when the daemon starts — see below. |
 | `CBM_RUNTIME_DIR` | `%LOCALAPPDATA%` (Windows), `/private/tmp` (macOS), `/tmp` (other) | Parent directory for the daemon/CLI rendezvous directory, which CBM creates inside it as `cbm-daemon-<uid>` (`cbm-daemon-<key>` on Windows). Set it when the default ancestry cannot pass the private-directory check — see below. `CBM_CACHE_DIR` does **not** move the rendezvous. |
 | `CBM_WORKERS` | auto-detected | Override parallel workers inside each physical index process. It is captured by the daemon generation and is separate from `max_index_jobs`. Wins over the `index_workers` config key, which is never applied over an existing value. Governs the indexing pipeline only — it has no effect on how many clients the daemon accepts; use `CBM_MAX_CLIENTS` for that. |
 | `CBM_MEM_BUDGET_MB` | auto-detected | Override the aggregate index memory budget in MiB. Wins over the `index_memory_budget_mb` config key; both outrank the `ram_fraction × total RAM` default. A malformed value warns (`mem.budget.env.invalid`) and falls through to the config layer. |
@@ -509,12 +510,38 @@ holds one connection for its whole life. Past the cap, a new client is not told
 "full" in any way it can act on: its bootstrap sees a live daemon that will not
 admit it and keeps retrying until the 30 s startup budget runs out, so a cap set
 too low surfaces as *"CBM daemon is active or starting but could not accept this
-client within 30000 ms"*. Raise `CBM_MAX_CLIENTS` if that appears while the
-daemon is otherwise healthy.
+client within 30000 ms"*. Raise the cap if that appears while the daemon is
+otherwise healthy.
+
+The cap resolves in three layers, first deliberate value wins — the same shape
+as `index_memory_budget_mb` / `index_workers`:
+
+| Layer | Cap | Reported as |
+|---|---|---|
+| 1. Environment | `CBM_MAX_CLIENTS` | `env` |
+| 2. `_config.db` | `max_clients` | `config` |
+| 3. Default | `CBM_DAEMON_MAX_CLIENTS_DEFAULT` (`128`) | `default` |
+
+The environment layer is interpreted by the rule `CBM_MAX_CLIENTS` already had:
+an out-of-range value is clamped to `[1, 512]` and logged, and text that is not
+a number falls back to `128` — the config layer is not consulted in either case,
+because the variable is present and was the operator's explicit choice. The
+config layer is stricter on the way in: `config set max_clients` refuses
+anything outside `1..512` (or anything that is not `auto`) and leaves the stored
+value untouched, so a value the daemon would have to clamp cannot be stored at
+all. A hand-edited database is the remaining case: the daemon ignores what it
+finds, logs `daemon.max_clients.config_invalid` naming the rejected text, and
+runs with the default.
+
+```bash
+codebase-memory-mcp config set max_clients 192   # durable; survives restarts
+codebase-memory-mcp daemon stop
+codebase-memory-mcp daemon start
+```
 
 Two things are worth knowing before raising it:
 
-- **The daemon reads it once, at startup.** Changing the variable does not
+- **The daemon reads it once, at startup.** Changing either layer does not
   affect a running daemon; it has to be restarted, which drops every connection
   it is currently serving. On a busy machine, pick the moment.
 - **Descriptors are raised to match.** At startup the daemon raises its own
@@ -526,11 +553,31 @@ Two things are worth knowing before raising it:
   `daemon.descriptor_limit.insufficient` with the numbers.
 
 The daemon's log carries the rest: `daemon.runtime.capacity` at startup with the
-cap in force, `daemon.runtime.connections_peak` whenever the high-water mark of
-concurrent connections moves, and `daemon.runtime.capacity_rejected` for every
-client actually turned away. The peak line is the one to read when deciding
-whether the cap is right — sampling the live count almost always catches a
-trough.
+cap in force and the layer that chose it (`max_clients_source`),
+`daemon.runtime.connections_peak` whenever the high-water mark of concurrent
+connections moves, and `daemon.runtime.capacity_rejected` for every client
+actually turned away. The peak line is the one to read when deciding whether the
+cap is right — sampling the live count almost always catches a trough.
+
+The same numbers are on `daemon status`, so the question "has this cap ever been
+hit?" needs no log archaeology:
+
+```text
+daemon: active (permanent)
+  memory_budget_bytes: 6442450944
+  budget_source: config
+  index_workers: 4
+  max_clients: 192
+  max_clients_source: config
+  connections_peak: 71
+  capacity_rejected: 0
+```
+
+`max_clients_source` is `env`, `config`, or `default`, and `capacity_rejected`
+is what decides the next step: while it stays `0` the cap is not the bottleneck,
+and a non-zero value is the evidence for raising it. When `daemon status` reaches
+a daemon built from a different binary these fields report `unavailable`, like
+the budget block above them.
 
 ### Relocating the daemon rendezvous directory
 

@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 #include "foundation/index_policy.h"
+#include "foundation/limits.h"
 
 typedef struct cbm_mcp_server cbm_mcp_server_t;
 
@@ -555,6 +556,34 @@ bool cbm_config_parse_index_workers(const char *value, int core_count, size_t *o
  * strict parse. The bound is the machine's total RAM / online core count. */
 size_t cbm_config_index_memory_budget_mb(cbm_config_t *cfg);
 size_t cbm_config_index_workers(cbm_config_t *cfg);
+
+/* ── C8: durable connection cap ─────────────────────────────────
+ * Third knob of the same family: the durable layer of CBM_MAX_CLIENTS, the
+ * cap on concurrent client connections the daemon admits. The range is the
+ * one the env knob already accepts — cbm_daemon_max_clients() clamps into
+ * [1, CBM_DAEMON_MAX_CLIENTS_LIMIT] — so a value `config set` stores is
+ * always a value the cap would have honoured without clamping. Same shape as
+ * index_workers: "auto" or a bounded decimal, strict ASCII, refused on write
+ * rather than stored and silently ignored at read time. */
+#define CBM_CONFIG_MAX_CLIENTS "max_clients"
+#define CBM_CONFIG_MAX_CLIENTS_AUTO "auto"
+#define CBM_CONFIG_MAX_CLIENTS_MIN 1U
+#define CBM_CONFIG_MAX_CLIENTS_MAX ((size_t)CBM_DAEMON_MAX_CLIENTS_LIMIT)
+
+bool cbm_config_parse_max_clients(const char *value, size_t *out_clients);
+
+/* What a stored max_clients says. UNSET is "auto"/absent — the user's choice
+ * of CBM_DAEMON_MAX_CLIENTS_DEFAULT; INVALID is text the reader refuses (a
+ * hand edit the `config set` writer would never have accepted), which the
+ * daemon reports before it falls back. `out_clients` receives the validated
+ * cap only for SET. */
+typedef enum {
+    CBM_CONFIG_MAX_CLIENTS_UNSET = 0,
+    CBM_CONFIG_MAX_CLIENTS_SET = 1,
+    CBM_CONFIG_MAX_CLIENTS_INVALID = 2,
+} cbm_config_max_clients_status_t;
+
+cbm_config_max_clients_status_t cbm_config_max_clients(cbm_config_t *cfg, size_t *out_clients);
 
 /* ── Binary activation safety ─────────────────────────────────── */
 

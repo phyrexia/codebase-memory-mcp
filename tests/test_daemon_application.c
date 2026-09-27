@@ -13,6 +13,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
+#include "foundation/log.h"
 #include "foundation/mem.h"
 #include "foundation/platform.h"
 #include "foundation/sha256.h"
@@ -6393,19 +6394,24 @@ typedef struct {
     char *saved_cache;
     char *saved_workers;
     char *saved_budget_env;
+    char *saved_max_clients_env;
     cbm_config_t *config;
+    CBMLogLevel saved_log_level;
+    bool log_saved;
     bool active;
     bool ready;
-} b1_knobs_env_t;
+} knobs_env_t;
 
-static bool b1_knobs_env_begin(b1_knobs_env_t *env, const char *tag) {
+static bool knobs_env_begin(knobs_env_t *env, const char *tag) {
     memset(env, 0, sizeof(*env));
     const char *prior_cache = getenv("CBM_CACHE_DIR");
     const char *prior_workers = getenv("CBM_WORKERS");
     const char *prior_budget = getenv("CBM_MEM_BUDGET_MB");
+    const char *prior_max_clients = getenv("CBM_MAX_CLIENTS");
     env->saved_cache = prior_cache ? strdup(prior_cache) : NULL;
     env->saved_workers = prior_workers ? strdup(prior_workers) : NULL;
     env->saved_budget_env = prior_budget ? strdup(prior_budget) : NULL;
+    env->saved_max_clients_env = prior_max_clients ? strdup(prior_max_clients) : NULL;
     env->active = true;
     snprintf(env->cache, sizeof(env->cache), "%s/%s-XXXXXX", cbm_tmpdir(), tag);
     if (!cbm_mkdtemp(env->cache)) {
@@ -6413,12 +6419,13 @@ static bool b1_knobs_env_begin(b1_knobs_env_t *env, const char *tag) {
     }
     cbm_unsetenv("CBM_WORKERS");
     cbm_unsetenv("CBM_MEM_BUDGET_MB");
+    cbm_unsetenv("CBM_MAX_CLIENTS");
     cbm_setenv("CBM_CACHE_DIR", env->cache, 1);
     env->ready = true;
     return true;
 }
 
-static void b1_knobs_env_restore(b1_knobs_env_t *env) {
+static void knobs_env_restore(knobs_env_t *env) {
     if (!env->active) {
         return;
     }
@@ -6444,6 +6451,47 @@ static void b1_knobs_env_restore(b1_knobs_env_t *env) {
     } else {
         cbm_unsetenv("CBM_MEM_BUDGET_MB");
     }
+    if (env->saved_max_clients_env) {
+        cbm_setenv("CBM_MAX_CLIENTS", env->saved_max_clients_env, 1);
+        free(env->saved_max_clients_env);
+        env->saved_max_clients_env = NULL;
+    } else {
+        cbm_unsetenv("CBM_MAX_CLIENTS");
+    }
+}
+
+/* Log capture for the tests that assert a daemon warning fired. The sink
+ * swallows every line it is handed (REPLACE), so the level is forced to WARN
+ * for the window: that both keeps the capture quiet and proves the record is a
+ * warning rather than an info line. */
+static char knobs_log_capture[4096];
+
+static void knobs_log_capture_sink(const char *line) {
+    if (!line) {
+        return;
+    }
+    size_t used = strlen(knobs_log_capture);
+    if (used + 2U >= sizeof(knobs_log_capture)) {
+        return;
+    }
+    (void)snprintf(knobs_log_capture + used, sizeof(knobs_log_capture) - used, "%s\n", line);
+}
+
+static void knobs_env_capture_log(knobs_env_t *env) {
+    env->saved_log_level = cbm_log_get_level();
+    env->log_saved = true;
+    knobs_log_capture[0] = '\0';
+    cbm_log_set_level(CBM_LOG_WARN);
+    cbm_log_set_sink_ex(knobs_log_capture_sink, CBM_LOG_SINK_REPLACE);
+}
+
+static void knobs_env_restore_log(knobs_env_t *env) {
+    if (!env->log_saved) {
+        return;
+    }
+    env->log_saved = false;
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(env->saved_log_level);
 }
 
 /* The whole cleanup of a test lives here, never after its assertions: ASSERT_*
@@ -6451,10 +6499,11 @@ static void b1_knobs_env_restore(b1_knobs_env_t *env) {
  * aborted run of these tests used to leave CBM_CACHE_DIR pointing at a cache
  * holding an undeletable _config.db — every later `uninstall` in the shared
  * runner then failed against an index it could not remove. */
-static void b1_knobs_env_end(b1_knobs_env_t *env) {
+static void knobs_env_end(knobs_env_t *env) {
+    knobs_env_restore_log(env);
     cbm_config_close(env->config);
     env->config = NULL;
-    b1_knobs_env_restore(env);
+    knobs_env_restore(env);
     if (env->ready) {
         (void)th_rmtree(env->cache);
         env->ready = false;
@@ -6482,8 +6531,8 @@ static void b1_config_open_probe(void *context) {
  * audit round 1 (pages reserved before the ceiling are still charged by
  * cbm_mem_charged) is only true if this ordering holds. */
 static int daemon_host_reads_runtime_config_before_fixing_the_memory_ceiling_body(
-    b1_knobs_env_t *env) {
-    bool setup = b1_knobs_env_begin(env, "b1-order");
+    knobs_env_t *env) {
+    bool setup = knobs_env_begin(env, "b1-order");
     bool seeded = false;
     if (setup) {
         cbm_config_t *cfg = cbm_config_open(env->cache);
@@ -6531,10 +6580,10 @@ static int daemon_host_reads_runtime_config_before_fixing_the_memory_ceiling_bod
 
 TEST(daemon_host_reads_runtime_config_before_fixing_the_memory_ceiling) {
     /* ASSERT_* returns straight out of a failing test, so all cleanup lives in
-     * this wrapper, which always runs (see b1_knobs_env_end). */
-    b1_knobs_env_t env = {0};
+     * this wrapper, which always runs (see knobs_env_end). */
+    knobs_env_t env = {0};
     int rc = daemon_host_reads_runtime_config_before_fixing_the_memory_ceiling_body(&env);
-    b1_knobs_env_end(&env);
+    knobs_env_end(&env);
     cbm_mem_reset_for_tests();
     cbm_mem_set_configured_budget_mb(0);
     cbm_mem_init(0.5);
@@ -6544,8 +6593,8 @@ TEST(daemon_host_reads_runtime_config_before_fixing_the_memory_ceiling) {
 /* The daemon pins CBM_WORKERS so every worker it spawns inherits the same
  * value — but never over an explicit one (cbm_setenv with overwrite=0). What
  * is reported is what the workers will read back. */
-static int daemon_host_pins_workers_from_config_without_overwriting_env_body(b1_knobs_env_t *env) {
-    bool setup = b1_knobs_env_begin(env, "b1-workers");
+static int daemon_host_pins_workers_from_config_without_overwriting_env_body(knobs_env_t *env) {
+    bool setup = knobs_env_begin(env, "b1-workers");
     cbm_config_t *cfg = setup ? cbm_config_open(env->cache) : NULL;
     env->config = cfg;
     bool seeded = cfg != NULL && cbm_config_set(cfg, CBM_CONFIG_INDEX_WORKERS, "1") == 0;
@@ -6595,9 +6644,9 @@ static int daemon_host_pins_workers_from_config_without_overwriting_env_body(b1_
 }
 
 TEST(daemon_host_pins_workers_from_config_without_overwriting_env) {
-    b1_knobs_env_t env = {0};
+    knobs_env_t env = {0};
     int rc = daemon_host_pins_workers_from_config_without_overwriting_env_body(&env);
-    b1_knobs_env_end(&env);
+    knobs_env_end(&env);
     cbm_mem_reset_for_tests();
     cbm_mem_set_configured_budget_mb(0);
     cbm_mem_init(0.5);
@@ -6608,8 +6657,8 @@ TEST(daemon_host_pins_workers_from_config_without_overwriting_env) {
  * did not: an unopenable _config.db refuses startup instead of silently
  * running on defaults. */
 static int daemon_host_runtime_knobs_refuse_an_unopenable_config_database_body(
-    b1_knobs_env_t *env) {
-    bool setup = b1_knobs_env_begin(env, "b1-blocked");
+    knobs_env_t *env) {
+    bool setup = knobs_env_begin(env, "b1-blocked");
     char blocker[600];
     snprintf(blocker, sizeof(blocker), "%s/_config.db", env->cache);
     bool blocked = setup && cbm_mkdir_p(blocker, 0700);
@@ -6626,9 +6675,86 @@ static int daemon_host_runtime_knobs_refuse_an_unopenable_config_database_body(
 }
 
 TEST(daemon_host_runtime_knobs_refuse_an_unopenable_config_database) {
-    b1_knobs_env_t env = {0};
+    knobs_env_t env = {0};
     int rc = daemon_host_runtime_knobs_refuse_an_unopenable_config_database_body(&env);
-    b1_knobs_env_end(&env);
+    knobs_env_end(&env);
+    return rc;
+}
+
+/* C8: the connection cap is resolved at the same startup read as the B1 knobs
+ * and with the same one-shot precedence — an explicit CBM_MAX_CLIENTS outranks
+ * max_clients in _config.db, which outranks CBM_DAEMON_MAX_CLIENTS_DEFAULT. A
+ * stored value the reader refuses is not honoured either, and the operator is
+ * told which text was rejected instead of being left to wonder why the daemon
+ * is not using it. */
+static int daemon_host_resolves_the_connection_cap_from_config_env_and_default_body(
+    knobs_env_t *env) {
+    bool setup = knobs_env_begin(env, "c8-clients");
+    cbm_config_t *cfg = setup ? cbm_config_open(env->cache) : NULL;
+    env->config = cfg;
+    bool seeded = cfg != NULL && cbm_config_set(cfg, CBM_CONFIG_MAX_CLIENTS, "64") == 0;
+
+    cbm_mem_reset_for_tests();
+    cbm_mem_set_configured_budget_mb(0);
+
+    /* Config layer, no environment. */
+    cbm_daemon_host_runtime_knobs_t knobs = {0};
+    bool loaded = setup && seeded && cbm_daemon_host_runtime_knobs_load_for_test(&knobs);
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(seeded);
+    ASSERT_TRUE(loaded);
+    ASSERT_EQ(knobs.max_clients, 64);
+    ASSERT_EQ(knobs.max_clients_source, CBM_DAEMON_MAX_CLIENTS_SOURCE_CONFIG);
+
+    /* An explicit CBM_MAX_CLIENTS outranks it. */
+    ASSERT_EQ(cbm_setenv("CBM_MAX_CLIENTS", "32", 1), 0);
+    knobs = (cbm_daemon_host_runtime_knobs_t){0};
+    ASSERT_TRUE(cbm_daemon_host_runtime_knobs_load_for_test(&knobs));
+    ASSERT_EQ(knobs.max_clients, 32);
+    ASSERT_EQ(knobs.max_clients_source, CBM_DAEMON_MAX_CLIENTS_SOURCE_ENV);
+
+    /* The env layer is interpreted by the cap's own rule, so a value it clamps
+     * is clamped to the same number here rather than re-read into another. */
+    ASSERT_EQ(cbm_setenv("CBM_MAX_CLIENTS", "9999", 1), 0);
+    knobs = (cbm_daemon_host_runtime_knobs_t){0};
+    ASSERT_TRUE(cbm_daemon_host_runtime_knobs_load_for_test(&knobs));
+    ASSERT_EQ(knobs.max_clients, CBM_DAEMON_MAX_CLIENTS_LIMIT);
+    ASSERT_EQ(knobs.max_clients_source, CBM_DAEMON_MAX_CLIENTS_SOURCE_ENV);
+
+    /* Neither layer: the compiled default. */
+    ASSERT_EQ(cbm_config_delete(cfg, CBM_CONFIG_MAX_CLIENTS), 0);
+    ASSERT_EQ(cbm_unsetenv("CBM_MAX_CLIENTS"), 0);
+    knobs = (cbm_daemon_host_runtime_knobs_t){0};
+    ASSERT_TRUE(cbm_daemon_host_runtime_knobs_load_for_test(&knobs));
+    ASSERT_EQ(knobs.max_clients, CBM_DAEMON_MAX_CLIENTS_DEFAULT);
+    ASSERT_EQ(knobs.max_clients_source, CBM_DAEMON_MAX_CLIENTS_SOURCE_DEFAULT);
+
+    /* A hand edit `config set` would have refused: the default takes over and
+     * the warning names both the rejected text and the value used instead. */
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MAX_CLIENTS, "not-a-number"), 0);
+    knobs_env_capture_log(env);
+    knobs = (cbm_daemon_host_runtime_knobs_t){0};
+    bool loaded_invalid = cbm_daemon_host_runtime_knobs_load_for_test(&knobs);
+    knobs_env_restore_log(env);
+
+    ASSERT_TRUE(loaded_invalid);
+    ASSERT_EQ(knobs.max_clients, CBM_DAEMON_MAX_CLIENTS_DEFAULT);
+    ASSERT_EQ(knobs.max_clients_source, CBM_DAEMON_MAX_CLIENTS_SOURCE_DEFAULT);
+    const char *warned = strstr(knobs_log_capture, "daemon.max_clients.config_invalid");
+    ASSERT_TRUE(warned != NULL);
+    ASSERT_TRUE(strstr(warned, "not-a-number") != NULL);
+    ASSERT_TRUE(strstr(warned, "128") != NULL);
+
+    PASS();
+}
+
+TEST(daemon_host_resolves_the_connection_cap_from_config_env_and_default) {
+    knobs_env_t env = {0};
+    int rc = daemon_host_resolves_the_connection_cap_from_config_env_and_default_body(&env);
+    knobs_env_end(&env);
+    cbm_mem_reset_for_tests();
+    cbm_mem_set_configured_budget_mb(0);
+    cbm_mem_init(0.5);
     return rc;
 }
 
@@ -6703,4 +6829,5 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_host_reads_runtime_config_before_fixing_the_memory_ceiling);
     RUN_TEST(daemon_host_pins_workers_from_config_without_overwriting_env);
     RUN_TEST(daemon_host_runtime_knobs_refuse_an_unopenable_config_database);
+    RUN_TEST(daemon_host_resolves_the_connection_cap_from_config_env_and_default);
 }

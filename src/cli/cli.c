@@ -7665,7 +7665,11 @@ static bool config_parse_bounded_uint(const char *value, size_t maximum, size_t 
  * so an over-long value or one whose bytes contain an embedded NUL is rejected
  * instead of validating as its visible prefix (the cbm_config_get() 4 KiB TLS
  * buffer would happily hand "7\0x" to a parser as "7"). */
-static bool config_get_exact(cbm_config_t *cfg, const char *key, char *out, size_t out_size) {
+static bool config_get_exact(cbm_config_t *cfg, const char *key, char *out, size_t out_size,
+                             bool *out_present) {
+    if (out_present) {
+        *out_present = false;
+    }
     if (!cfg || !key || !out || out_size == 0) {
         return false;
     }
@@ -7677,6 +7681,12 @@ static bool config_get_exact(cbm_config_t *cfg, const char *key, char *out, size
     sqlite3_bind_text(stmt, SQL_PARAM_1, key, SQL_NUL_TERM, cbm_sqlite_transient);
     bool exact = false;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
+        /* A row is a row even when its bytes cannot be read back verbatim:
+         * that distinction is what lets a reader report a hand-edited value
+         * instead of looking like an unset key. */
+        if (out_present) {
+            *out_present = true;
+        }
         const unsigned char *value = sqlite3_column_text(stmt, 0);
         int bytes = sqlite3_column_bytes(stmt, 0);
         if (value && bytes > 0 && (size_t)bytes < out_size) {
@@ -7739,7 +7749,7 @@ size_t cbm_config_index_memory_budget_mb(cbm_config_t *cfg) {
     }
     char value[CONFIG_VALUE_MAX_BYTES + 1];
     size_t budget_mb = 0;
-    if (!config_get_exact(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, value, sizeof(value)) ||
+    if (!config_get_exact(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, value, sizeof(value), NULL) ||
         !cbm_config_parse_index_memory_budget_mb(value, config_index_memory_budget_ram_mb(),
                                                  &budget_mb)) {
         return 0;
@@ -7753,11 +7763,62 @@ size_t cbm_config_index_workers(cbm_config_t *cfg) {
     }
     char value[CONFIG_VALUE_MAX_BYTES + 1];
     size_t workers = 0;
-    if (!config_get_exact(cfg, CBM_CONFIG_INDEX_WORKERS, value, sizeof(value)) ||
+    if (!config_get_exact(cfg, CBM_CONFIG_INDEX_WORKERS, value, sizeof(value), NULL) ||
         !cbm_config_parse_index_workers(value, cbm_system_info().total_cores, &workers)) {
         return 0;
     }
     return workers;
+}
+
+/* C8: the durable connection cap. Same strict parse as the two keys above,
+ * with the env knob's own range as the bound. */
+bool cbm_config_parse_max_clients(const char *value, size_t *out_clients) {
+    if (!value || !out_clients) {
+        return false;
+    }
+    if (strcmp(value, CBM_CONFIG_MAX_CLIENTS_AUTO) == 0) {
+        *out_clients = 0;
+        return true;
+    }
+    size_t parsed = 0;
+    if (!config_parse_bounded_uint(value, CBM_CONFIG_MAX_CLIENTS_MAX, &parsed)) {
+        return false;
+    }
+    if (parsed < CBM_CONFIG_MAX_CLIENTS_MIN) {
+        return false;
+    }
+    *out_clients = parsed;
+    return true;
+}
+
+/* Unlike the two B1 readers, this one distinguishes a stored value it refuses
+ * from a key that is simply not set: the daemon warns about the first and
+ * falls back to CBM_DAEMON_MAX_CLIENTS_DEFAULT for both, and the operator is
+ * owed the difference. */
+cbm_config_max_clients_status_t cbm_config_max_clients(cbm_config_t *cfg, size_t *out_clients) {
+    if (out_clients) {
+        *out_clients = 0;
+    }
+    if (!cfg) {
+        return CBM_CONFIG_MAX_CLIENTS_UNSET;
+    }
+    char value[CONFIG_VALUE_MAX_BYTES + 1];
+    bool present = false;
+    if (!config_get_exact(cfg, CBM_CONFIG_MAX_CLIENTS, value, sizeof(value), &present)) {
+        return present ? CBM_CONFIG_MAX_CLIENTS_INVALID : CBM_CONFIG_MAX_CLIENTS_UNSET;
+    }
+    size_t clients = 0;
+    if (strcmp(value, CBM_CONFIG_MAX_CLIENTS_AUTO) != 0 &&
+        !cbm_config_parse_max_clients(value, &clients)) {
+        return CBM_CONFIG_MAX_CLIENTS_INVALID;
+    }
+    if (clients == 0) {
+        return CBM_CONFIG_MAX_CLIENTS_UNSET;
+    }
+    if (out_clients) {
+        *out_clients = clients;
+    }
+    return CBM_CONFIG_MAX_CLIENTS_SET;
 }
 
 bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t *policy,
@@ -7811,6 +7872,11 @@ static const config_key_def_t CONFIG_KEYS[] = {
      "Aggregate index memory budget in MiB (512..total RAM), or off; read at daemon start"},
     {CBM_CONFIG_INDEX_WORKERS, CBM_CONFIG_INDEX_WORKERS_AUTO,
      "Parallel workers per index process (1..online cores), or auto; read at daemon start"},
+    /* The 1..512 here is CBM_CONFIG_MAX_CLIENTS_MIN..CBM_CONFIG_MAX_CLIENTS_MAX
+     * (i.e. the range CBM_MAX_CLIENTS is clamped into); the `config set`
+     * refusal interpolates the live constants, this help text cannot. */
+    {CBM_CONFIG_MAX_CLIENTS, CBM_CONFIG_MAX_CLIENTS_AUTO,
+     "Concurrent client connections the daemon admits (1..512), or auto; read at daemon start"},
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
@@ -7850,9 +7916,12 @@ static bool config_key_is_session_root(const char *key) {
     return key && strcmp(key, CBM_CONFIG_SESSION_ROOT) == 0;
 }
 
-static bool config_key_is_index_budget(const char *key) {
+/* The three daemon-start runtime knobs share one validating writer, so one
+ * predicate decides which `config set` values are checked instead of stored. */
+static bool config_key_is_runtime_knob(const char *key) {
     return key && (strcmp(key, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB) == 0 ||
-                   strcmp(key, CBM_CONFIG_INDEX_WORKERS) == 0);
+                   strcmp(key, CBM_CONFIG_INDEX_WORKERS) == 0 ||
+                   strcmp(key, CBM_CONFIG_MAX_CLIENTS) == 0);
 }
 
 static int config_index_policy_write(cbm_config_t *config, const char *key, const char *value) {
@@ -7902,11 +7971,12 @@ static void config_session_root_read(cbm_config_t *cfg, char *out, size_t out_sz
                                     : CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL);
 }
 
-/* B1: validated write for the two runtime knobs. The upper bound is a property
- * of the machine (total RAM / online cores), so the refusal names both the rule
- * and the bound this host enforces — an "invalid value" alone sent operators
- * back to the source to learn the floor. */
-static int config_index_budget_write(cbm_config_t *config, const char *key, const char *value) {
+/* B1/C8: validated write for the three runtime knobs. Two of their upper
+ * bounds are a property of the machine (total RAM / online cores) and the
+ * third is the cap the env knob clamps into, so the refusal names both the
+ * rule and the bound this host enforces — an "invalid value" alone sent
+ * operators back to the source to learn the floor. */
+static int config_runtime_knob_write(cbm_config_t *config, const char *key, const char *value) {
     size_t parsed = 0;
     size_t total_ram_mb = config_index_memory_budget_ram_mb();
     bool valid = false;
@@ -7916,11 +7986,16 @@ static int config_index_budget_write(cbm_config_t *config, const char *key, cons
         (void)snprintf(error, sizeof(error), "%s must be %s or an integer from %u to %zu (MiB)",
                        key, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB_OFF,
                        CBM_CONFIG_INDEX_MEMORY_BUDGET_MB_MIN, total_ram_mb);
-    } else {
+    } else if (strcmp(key, CBM_CONFIG_INDEX_WORKERS) == 0) {
         valid = cbm_config_parse_index_workers(value, cbm_system_info().total_cores, &parsed);
         (void)snprintf(error, sizeof(error), "%s must be %s or an integer from %u to %d", key,
                        CBM_CONFIG_INDEX_WORKERS_AUTO, CBM_CONFIG_INDEX_WORKERS_MIN,
                        cbm_system_info().total_cores);
+    } else {
+        valid = cbm_config_parse_max_clients(value, &parsed);
+        (void)snprintf(error, sizeof(error), "%s must be %s or an integer from %u to %u", key,
+                       CBM_CONFIG_MAX_CLIENTS_AUTO, CBM_CONFIG_MAX_CLIENTS_MIN,
+                       (unsigned)CBM_CONFIG_MAX_CLIENTS_MAX);
     }
     if (!valid) {
         (void)fprintf(stderr, "error: %s\n", error);
@@ -8097,9 +8172,9 @@ int cbm_cmd_config(int argc, char **argv) {
             if (config_key_is_index_policy(key)) {
                 writer_speaks = true;
                 set_rc = config_index_policy_write(cfg, key, value);
-            } else if (config_key_is_index_budget(key)) {
+            } else if (config_key_is_runtime_knob(key)) {
                 writer_speaks = true;
-                set_rc = config_index_budget_write(cfg, key, value);
+                set_rc = config_runtime_knob_write(cfg, key, value);
             } else if (config_key_is_session_root(key)) {
                 writer_speaks = true;
                 set_rc = config_session_root_write(cfg, key, value);

@@ -11,6 +11,7 @@
 #include "daemon/daemon.h"
 #include "daemon/ipc.h"
 #include "daemon/service.h"
+#include "foundation/limits.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -55,15 +56,20 @@
 #define CBM_DAEMON_CONTROL_REQUEST_SIZE 65U
 #define CBM_DAEMON_CONTROL_CLIENT_CAP 8U
 /* B1 grew the status response with the daemon's budget observability
- * (memory_budget_bytes, index_workers, budget_source). The 121-byte layout is
- * frozen: a requester whose build differs from the daemon's still receives
- * exactly those bytes, because `daemon status` is the probe meant to keep
- * working across build skew. A same-build requester gets the 132-byte layout,
- * which appends u64 memory_budget_bytes @121, u16 index_workers @129 (0 =
- * auto), u8 budget_source @131 — all network byte order. Clients accept
- * either length and report the snapshot only when the long form arrived. */
+ * (memory_budget_bytes, index_workers, budget_source), and C8 grew it again
+ * with the connection cap and its admission telemetry (max_clients,
+ * max_clients_source, connections_peak, capacity_rejected). The 121-byte
+ * layout is frozen: a requester whose build differs from the daemon's still
+ * receives exactly those bytes, because `daemon status` is the probe meant to
+ * keep working across build skew. A same-build requester gets the full
+ * layout, which appends u64 memory_budget_bytes @121, u16 index_workers @129
+ * (0 = auto), u8 budget_source @131 (the B1 block, ending at 132), then u32
+ * connections_peak @132, u64 capacity_rejected @136, u32 max_clients @144 and
+ * u8 max_clients_source @148 — all network byte order. Clients accept any of
+ * the three lengths and report each block only when its bytes arrived. */
 #define CBM_DAEMON_STATUS_RESPONSE_SIZE 121U
-#define CBM_DAEMON_STATUS_RESPONSE_FULL_SIZE 132U
+#define CBM_DAEMON_STATUS_RESPONSE_BUDGET_SIZE 132U
+#define CBM_DAEMON_STATUS_RESPONSE_FULL_SIZE 149U
 #define CBM_DAEMON_STOP_RESPONSE_SIZE 40U
 #define CBM_DAEMON_RUNTIME_PROJECT_KEY_MAX 4096U
 #define CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX (CBM_DAEMON_MAX_FRAME_SIZE - 16U)
@@ -224,6 +230,10 @@ typedef struct {
      * completed HELLO. request_timeout_ms bounds every unauthenticated slot
      * and therefore must be finite, not CBM_DAEMON_IPC_WAIT_FOREVER. */
     uint32_t max_clients;
+    /* C8: which layer of the precedence chain chose that cap — reported by
+     * `daemon status` alongside it, so an operator can tell a cap they set
+     * from one the daemon settled on. */
+    cbm_daemon_max_clients_source_t max_clients_source;
     uint64_t lease_timeout_ms;
     uint32_t request_timeout_ms;
     /* Bounds cooperative stop and retained participant-guard cleanup. Must be
@@ -318,12 +328,20 @@ typedef struct {
      * name a zombie generation instead of reporting bare "not running". */
     uint64_t muted_endpoint_holder_pid;
     /* B1 budget observability. Present only when the daemon answered with the
-     * same-build (132-byte) status layout; a cross-build daemon answers with
-     * the frozen 121-byte layout and these stay zero. */
+     * same-build status layout; a cross-build daemon answers with the frozen
+     * 121-byte layout and these stay zero. */
     bool has_budget_status;
     uint64_t memory_budget_bytes;
     uint32_t index_workers; /* 0 = auto */
     cbm_daemon_budget_source_t budget_source;
+    /* C8 connection-cap observability, same rule and one layout further out:
+     * it arrives only with the full status layout, so a daemon that answered
+     * with the B1 block alone leaves these zero. */
+    bool has_capacity_status;
+    uint32_t max_clients;
+    cbm_daemon_max_clients_source_t max_clients_source;
+    uint32_t connections_peak;
+    uint64_t capacity_rejected;
 } cbm_daemon_runtime_status_t;
 
 typedef struct {

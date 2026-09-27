@@ -634,6 +634,50 @@ void cbm_daemon_host_set_config_open_probe_for_test(cbm_daemon_host_config_open_
     g_host_config_open_probe_context = context;
 }
 
+/* C8: the connection cap, resolved once at startup — an explicit CBM_MAX_CLIENTS
+ * outranks max_clients in _config.db, which outranks the compiled default.
+ *
+ * The env layer is deliberately interpreted by the cap's own rule
+ * (cbm_daemon_max_clients) rather than re-parsed here: a value that rule would
+ * clamp or WARN-drop must keep exactly that behaviour, not gain a second and
+ * subtly different reading of the same variable. Presence is probed the way the
+ * cap itself reads it (raw getenv, non-empty), so "set" means precisely what it
+ * means to cbm_daemon_max_clients() — an empty CBM_MAX_CLIENTS is not set and
+ * falls through to the config layer. */
+static uint32_t host_resolve_max_clients(cbm_config_t *config,
+                                         cbm_daemon_max_clients_source_t *source_out) {
+    const char *env_clients = getenv("CBM_MAX_CLIENTS");
+    if (env_clients && env_clients[0]) {
+        if (source_out) {
+            *source_out = CBM_DAEMON_MAX_CLIENTS_SOURCE_ENV;
+        }
+        return (uint32_t)cbm_daemon_max_clients();
+    }
+
+    size_t configured = 0;
+    cbm_config_max_clients_status_t status = cbm_config_max_clients(config, &configured);
+    if (status == CBM_CONFIG_MAX_CLIENTS_SET) {
+        if (source_out) {
+            *source_out = CBM_DAEMON_MAX_CLIENTS_SOURCE_CONFIG;
+        }
+        return (uint32_t)configured;
+    }
+    if (status == CBM_CONFIG_MAX_CLIENTS_INVALID) {
+        /* A hand edit `config set` would have refused. Say which text was
+         * rejected and what took its place, like the env layer does. */
+        char shown[CBM_SZ_32];
+        char fallback[CBM_SZ_32];
+        const char *stored = cbm_config_get(config, CBM_CONFIG_MAX_CLIENTS, "");
+        (void)snprintf(shown, sizeof(shown), "%s", stored ? stored : "");
+        (void)snprintf(fallback, sizeof(fallback), "%d", CBM_DAEMON_MAX_CLIENTS_DEFAULT);
+        cbm_log_warn("daemon.max_clients.config_invalid", "value", shown, "using", fallback);
+    }
+    if (source_out) {
+        *source_out = CBM_DAEMON_MAX_CLIENTS_SOURCE_DEFAULT;
+    }
+    return (uint32_t)CBM_DAEMON_MAX_CLIENTS_DEFAULT;
+}
+
 static bool host_runtime_knobs_load(cbm_daemon_host_runtime_knobs_t *knobs,
                                     cbm_config_t **config_out) {
     if (!knobs || !config_out) {
@@ -642,6 +686,8 @@ static bool host_runtime_knobs_load(cbm_daemon_host_runtime_knobs_t *knobs,
     *config_out = NULL;
     memset(knobs, 0, sizeof(*knobs));
     (void)snprintf(knobs->index_workers_text, sizeof(knobs->index_workers_text), "auto");
+    knobs->max_clients = (uint32_t)CBM_DAEMON_MAX_CLIENTS_DEFAULT;
+    knobs->max_clients_source = CBM_DAEMON_MAX_CLIENTS_SOURCE_DEFAULT;
 
     const char *cache = cbm_resolve_cache_dir();
     if (!cache || !cache[0]) {
@@ -692,6 +738,10 @@ static bool host_runtime_knobs_load(cbm_daemon_host_runtime_knobs_t *knobs,
                            parsed);
         }
     }
+    /* C8: the connection cap, with the same one-shot precedence as the two
+     * knobs above. */
+    knobs->max_clients = host_resolve_max_clients(config, &knobs->max_clients_source);
+
     *config_out = config;
     return true;
 }
@@ -1277,9 +1327,10 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     }
     cbm_daemon_runtime_application_callbacks_t callbacks =
         cbm_daemon_application_runtime_callbacks(host.application);
-    /* Resolved once here, so the descriptor limit is raised for the cap this
-     * generation will actually run with rather than for a compiled-in guess. */
-    uint32_t max_clients = (uint32_t)cbm_daemon_max_clients();
+    /* Resolved by the startup read above, so the descriptor limit is raised
+     * for the cap this generation will actually run with rather than for a
+     * compiled-in guess. */
+    uint32_t max_clients = knobs.max_clients;
     host_prepare_descriptor_limit(max_clients);
     cbm_daemon_runtime_service_config_t runtime_config = {
         .endpoint = config->endpoint,
@@ -1287,6 +1338,7 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
         .conflict_log_path = conflict_log,
         .conflict_log_cap_bytes = HOST_CONFLICT_LOG_CAP,
         .max_clients = max_clients,
+        .max_clients_source = knobs.max_clients_source,
         .lease_timeout_ms = HOST_LEASE_TIMEOUT_MS,
         .request_timeout_ms = HOST_REQUEST_TIMEOUT_MS,
         .shutdown_timeout_ms = HOST_RUNTIME_SHUTDOWN_MS,
@@ -1343,6 +1395,7 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     char memory_budget[32];
     char physical_job_limit[32];
     char worker_memory_budget[32];
+    char max_clients_text[32];
     (void)snprintf(process_id, sizeof(process_id), "%llu",
                    (unsigned long long)host_current_process_id());
     (void)snprintf(memory_budget, sizeof(memory_budget), "%zu", cbm_mem_budget());
@@ -1350,13 +1403,18 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
                    cbm_daemon_application_physical_job_limit(host.application));
     (void)snprintf(worker_memory_budget, sizeof(worker_memory_budget), "%zu",
                    cbm_daemon_application_worker_memory_budget_bytes(host.application));
+    (void)snprintf(max_clients_text, sizeof(max_clients_text), "%u", knobs.max_clients);
     cbm_log_info("daemon.start", "version", config->identity.semantic_version, "pid", process_id,
                  "cache_fingerprint",
                  config->identity.cache_fingerprint ? config->identity.cache_fingerprint
                                                     : "unavailable",
                  "memory_budget_bytes", memory_budget, "physical_job_limit", physical_job_limit,
                  "worker_memory_budget_bytes", worker_memory_budget, "budget_source",
-                 cbm_mem_budget_source(), "index_workers", knobs.index_workers_text);
+                 cbm_mem_budget_source(), "index_workers", knobs.index_workers_text,
+                 /* C8: the cap this generation admits and which layer chose
+                  * it — the same values `daemon status` reports. */
+                 "max_clients", max_clients_text, "max_clients_source",
+                 cbm_daemon_max_clients_source_name(knobs.max_clients_source));
     if (!host_wait_for_lifetime(service, config->stop_requested, &host, config->permanent)) {
         host_force_terminate("runtime");
     }

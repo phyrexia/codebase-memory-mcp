@@ -75,4 +75,20 @@ enum {
  * Read fresh on each call, like the other limits here. */
 int cbm_daemon_max_clients(void);
 
+/* Where the cap a daemon generation runs with came from: the three layers of
+ * the precedence chain, consulted in this order — an explicit CBM_MAX_CLIENTS,
+ * then max_clients in _config.db, then CBM_DAEMON_MAX_CLIENTS_DEFAULT. This
+ * lives beside the knob rather than in the daemon's wire types because the
+ * config key's range (CLI), the resolution (daemon host) and the report
+ * (`daemon status`) all describe this one limit. */
+typedef enum {
+    CBM_DAEMON_MAX_CLIENTS_SOURCE_DEFAULT = 0,
+    CBM_DAEMON_MAX_CLIENTS_SOURCE_CONFIG = 1,
+    CBM_DAEMON_MAX_CLIENTS_SOURCE_ENV = 2,
+} cbm_daemon_max_clients_source_t;
+
+/* "default" | "config" | "env" — the daemon.start / `daemon status` spelling
+ * of the enum. */
+const char *cbm_daemon_max_clients_source_name(cbm_daemon_max_clients_source_t source);
+
 #endif /* CBM_LIMITS_H */
