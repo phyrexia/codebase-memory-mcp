@@ -2162,7 +2162,7 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
                              const cbm_http_req_t *req, bool *route_known) {
     *route_known = true;
     if (!request_passes_http_security(srv, c, req)) {
-        /* Refused before routing: only the API surface (/rpc, /api/*) is a
+        /* Refused before routing: only the API surface (/rpc and the /api/ prefix) is a
          * known route here, so hostile-host probes stay out of the errors. */
         *route_known = route_is_protected(req->path);
         return;

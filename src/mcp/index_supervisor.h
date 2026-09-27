@@ -22,6 +22,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdatomic.h>
 
 #include "foundation/subprocess.h" /* cbm_proc_outcome_t */
