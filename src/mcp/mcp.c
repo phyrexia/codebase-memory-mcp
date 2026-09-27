@@ -1008,6 +1008,18 @@ int cbm_mcp_tool_count(void) {
     return TOOL_COUNT;
 }
 
+bool cbm_mcp_tool_is_known(const char *tool_name) {
+    if (!tool_name) {
+        return false;
+    }
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        if (strcmp(TOOLS[i].name, tool_name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const char *cbm_mcp_tool_name(int index) {
     if (index < 0 || index >= TOOL_COUNT) {
         return NULL;
@@ -18263,7 +18275,8 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         }
         long long request_dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
                                    ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, tool_name, is_err, request_dur_us);
+        cbm_log_mcp_request(req.method, tool_name,
+                            is_err ? CBM_MCP_REQUEST_ERROR : CBM_MCP_REQUEST_OK, request_dur_us);
         request_logged = true;
 
         free(tool_name);
@@ -18283,7 +18296,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
         long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
                            ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        cbm_log_mcp_request(req.method, NULL, CBM_MCP_REQUEST_UNSUPPORTED, dur_us);
         cbm_mcp_server_request_scope_end(srv);
         cbm_jsonrpc_request_free(&req);
         return err;
@@ -18300,7 +18313,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
         long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
                            ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        cbm_log_mcp_request(req.method, NULL, CBM_MCP_REQUEST_ERROR, dur_us);
         free(request_error_json);
         cbm_mcp_server_request_scope_end(srv);
         cbm_jsonrpc_request_free(&req);
@@ -18312,7 +18325,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
         long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
                            ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, false, dur_us);
+        cbm_log_mcp_request(req.method, NULL, CBM_MCP_REQUEST_OK, dur_us);
     }
 
     cbm_jsonrpc_response_t resp = {

@@ -207,7 +207,7 @@ TEST(log_operational_helpers) {
     cbm_log_set_level(CBM_LOG_DEBUG);
     cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
     capture_start();
-    cbm_log_mcp_request("tools/call", "search_graph", false, 1250);
+    cbm_log_mcp_request("tools/call", "search_graph", CBM_MCP_REQUEST_OK, 1250);
     cbm_log_http_request("graph_ui", "GET", "/api/layout", 200, 7, 0, 42);
     const char *output = capture_end();
     cbm_log_set_level(CBM_LOG_INFO);
@@ -220,6 +220,39 @@ TEST(log_operational_helpers) {
     ASSERT(cbm_str_contains_raw(output, "method=GET"));
     ASSERT(cbm_str_contains_raw(output, "path=/api/layout"));
     ASSERT(cbm_str_contains_raw(output, "status=200"));
+    PASS();
+}
+
+/* C9: an unimplemented JSON-RPC method is a client probe (server/discover et
+ * al.), not a service failure. It must log at info with status=unsupported —
+ * it used to warn with status=error, and one such method accounted for 6279
+ * of 6282 warn lines in the daemon log. */
+TEST(log_mcp_request_unsupported_method_is_info_not_warn) {
+    CBMLogLevel saved = cbm_log_get_level();
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_level(CBM_LOG_WARN);
+    capture_start();
+    cbm_log_mcp_request("server/discover", NULL, CBM_MCP_REQUEST_UNSUPPORTED, 1000);
+    const char *at_warn = capture_end();
+    bool silent_at_warn = strstr(at_warn, "mcp.request") == NULL;
+
+    cbm_log_set_level(CBM_LOG_INFO);
+    capture_start();
+    cbm_log_mcp_request("server/discover", NULL, CBM_MCP_REQUEST_UNSUPPORTED, 1000);
+    cbm_log_mcp_request("tools/call", "search_graph", CBM_MCP_REQUEST_ERROR, 1000);
+    const char *output = capture_end();
+    cbm_log_set_level(saved);
+
+    bool unsupported_named = cbm_str_contains_raw(output, "level=info") &&
+                             cbm_str_contains_raw(output, "msg=mcp.request") &&
+                             cbm_str_contains_raw(output, "method=server/discover") &&
+                             cbm_str_contains_raw(output, "status=unsupported");
+    /* A real failure keeps its warning: only the level differs. */
+    bool error_still_warns = cbm_str_contains_raw(output, "level=warn") &&
+                             cbm_str_contains_raw(output, "status=error");
+    ASSERT_TRUE(silent_at_warn);
+    ASSERT_TRUE(unsupported_named);
+    ASSERT_TRUE(error_still_warns);
     PASS();
 }
 
@@ -335,6 +368,7 @@ SUITE(log) {
     RUN_TEST(log_text_sanitizes_control_chars);
     RUN_TEST(log_sink_tee_keeps_stderr);
     RUN_TEST(log_operational_helpers);
+    RUN_TEST(log_mcp_request_unsupported_method_is_info_not_warn);
     RUN_TEST(log_format_from_env);
     RUN_TEST(log_format_unset_keeps_current);
     RUN_TEST(log_level_from_env_textual);

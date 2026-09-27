@@ -991,6 +991,108 @@ TEST(ui_server_unknown_path_404) {
     PASS();
 }
 
+/* C2: request metrics must separate probe noise from service errors.
+ * Monitoring probes (/favicon.ico, /health), stale asset URLs and any other
+ * unknown route 404 on routes this server does not define: they are served
+ * requests, not errors, and their names fold so unbounded probe variety
+ * cannot mint metrics slots. A 4xx on a real route, a 5xx anywhere and
+ * unparsable requests stay errors. */
+typedef struct {
+    int count;
+    bool overflow;
+    char names[8][64];
+    bool errors[8];
+} th_metrics_sink_t;
+
+static void th_metrics_record(void *context, const char *name, uint64_t dur_us, bool is_error) {
+    th_metrics_sink_t *sink = context;
+    (void)dur_us;
+    if (!sink || sink->count >= (int)(sizeof(sink->names) / sizeof(sink->names[0]))) {
+        if (sink) {
+            sink->overflow = true;
+        }
+        return;
+    }
+    snprintf(sink->names[sink->count], sizeof(sink->names[0]), "%s", name ? name : "");
+    sink->errors[sink->count] = is_error;
+    sink->count++;
+}
+
+TEST(ui_server_metrics_fold_probe_noise_and_keep_real_errors) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    /* A directory where the project DB belongs cannot be opened as a store:
+     * the handler's 500 path, exercised without mocking anything. */
+    char broken_db[1024];
+    ui_delete_db_path(&fx, "ui-metrics-500", broken_db, sizeof(broken_db));
+    bool fixture_ready = th_mkdir_p(broken_db) == 0;
+
+    th_metrics_sink_t sink;
+    memset(&sink, 0, sizeof(sink));
+    th_server_t ts;
+    memset(&ts, 0, sizeof(ts));
+    bool server_ready = fixture_ready && (ts.srv = cbm_http_server_new(0)) != NULL;
+    if (server_ready) {
+        cbm_http_server_set_metrics_sink(ts.srv, th_metrics_record, &sink);
+        server_ready = th_server_thread_start(&ts.tid, ts.srv) == 0;
+    }
+    int port = server_ready ? cbm_http_server_port(ts.srv) : -1;
+    char resp[4096];
+    bool probe_404 = false;
+    bool health_404 = false;
+    bool config_200 = false;
+    bool rpc_400 = false;
+    bool server_500 = false;
+    bool malformed = false;
+    if (server_ready) {
+        int n = th_http(port, "GET /favicon.ico HTTP/1.1\r\n\r\n", resp, sizeof(resp));
+        probe_404 = n > 0 && th_status(resp) == 404;
+        n = th_http(port, "GET /health HTTP/1.1\r\n\r\n", resp, sizeof(resp));
+        health_404 = n > 0 && th_status(resp) == 404;
+        n = th_http(port, "GET /api/ui-config HTTP/1.1\r\n\r\n", resp, sizeof(resp));
+        config_200 = n > 0 && th_status(resp) == 200;
+        n = th_http(port, "POST /rpc HTTP/1.1\r\nContent-Length: 0\r\n\r\n", resp, sizeof(resp));
+        rpc_400 = n > 0 && th_status(resp) == 400;
+        n = th_http(port, "GET /api/repo-info?project=ui-metrics-500 HTTP/1.1\r\n\r\n", resp,
+                    sizeof(resp));
+        server_500 = n > 0 && th_status(resp) == 500;
+        n = th_http_raw(port, "not http at all\r\n\r\n", resp, sizeof(resp));
+        malformed = n > 0 && th_status(resp) >= 400;
+    }
+    if (server_ready) {
+        th_server_stop(&ts);
+    }
+    ui_delete_fixture_cleanup(&fx);
+
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_TRUE(server_ready);
+    ASSERT_TRUE(probe_404);
+    ASSERT_TRUE(health_404);
+    ASSERT_TRUE(config_200);
+    ASSERT_TRUE(rpc_400);
+    ASSERT_TRUE(server_500);
+    ASSERT_TRUE(malformed);
+    ASSERT_FALSE(sink.overflow);
+    ASSERT_EQ(sink.count, 6);
+    /* Unknown-route probes: counted, folded, never errors. */
+    ASSERT_STR_EQ(sink.names[0], "_other");
+    ASSERT_FALSE(sink.errors[0]);
+    ASSERT_STR_EQ(sink.names[1], "_other");
+    ASSERT_FALSE(sink.errors[1]);
+    /* A known route keeps its name. */
+    ASSERT_STR_EQ(sink.names[2], "/api/ui-config");
+    ASSERT_FALSE(sink.errors[2]);
+    /* 4xx on a known route and 5xx anywhere are errors. */
+    ASSERT_STR_EQ(sink.names[3], "/rpc");
+    ASSERT_TRUE(sink.errors[3]);
+    ASSERT_STR_EQ(sink.names[4], "/api/repo-info");
+    ASSERT_TRUE(sink.errors[4]);
+    /* Unparsable requests keep their label and stay errors. */
+    ASSERT_STR_EQ(sink.names[5], "_malformed");
+    ASSERT_TRUE(sink.errors[5]);
+    PASS();
+}
+
 /* Security regression: process IDs are not cancellation capabilities. The UI
  * must never expose an endpoint that accepts an arbitrary PID and reaches an
  * OS process-termination API (the former Windows path accepted every PID but
@@ -2798,6 +2900,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_readiness_proof_is_exact_and_generation_bound);
     RUN_TEST(ui_server_rejects_non_loopback_host);
     RUN_TEST(ui_server_unknown_path_404);
+    RUN_TEST(ui_server_metrics_fold_probe_noise_and_keep_real_errors);
     RUN_TEST(ui_server_process_kill_route_is_unavailable);
     RUN_TEST(ui_server_routes_indexing_through_joinable_daemon_executor);
     RUN_TEST(ui_server_free_never_joins_active_index_worker);

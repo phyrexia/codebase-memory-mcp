@@ -2154,10 +2154,19 @@ static bool request_passes_http_security(cbm_http_server_t *srv, cbm_http_conn_t
     return true;
 }
 
+/* Fills `route_known`: true when a route this server defines produced the
+ * reply, false when the request fell through to the generic 404. The metrics
+ * sink needs the distinction to tell a broken call on a real route (error)
+ * from probe noise for something we do not serve (counted, not an error). */
 static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
-                             const cbm_http_req_t *req) {
-    if (!request_passes_http_security(srv, c, req))
+                             const cbm_http_req_t *req, bool *route_known) {
+    *route_known = true;
+    if (!request_passes_http_security(srv, c, req)) {
+        /* Refused before routing: only the API surface (/rpc and the /api/ prefix) is a
+         * known route here, so hostile-host probes stay out of the errors. */
+        *route_known = route_is_protected(req->path);
         return;
+    }
 
     bool is_get = strcmp(req->method, "GET") == 0;
     bool is_post = strcmp(req->method, "POST") == 0;
@@ -2289,6 +2298,7 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
 
     cbm_http_replyf(c, 404, g_cors, "not found");
+    *route_known = false;
 }
 
 /* ── Public API ───────────────────────────────────────────────── */
@@ -2419,14 +2429,24 @@ void cbm_http_server_run(cbm_http_server_t *srv) {
                 cbm_httpd_conn_close(conn);
                 break;
             }
-            dispatch_request(srv, conn, &req);
+            bool route_known = false;
+            dispatch_request(srv, conn, &req, &route_known);
             cbm_log_http_request("graph_ui", req.method, req.path, cbm_http_conn_status(conn),
                                  (int64_t)(cbm_now_ms() - request_start_ms), req.body_len,
                                  cbm_http_conn_response_bytes(conn));
             if (srv->metrics_sink) {
-                srv->metrics_sink(srv->metrics_sink_context, req.path,
-                                  (cbm_now_ms() - request_start_ms) * 1000,
-                                  cbm_http_conn_status(conn) >= 400);
+                /* C2: probe noise is a served request, not a service error. A
+                 * 404 for a route this server does not define (/favicon.ico,
+                 * monitoring probes, stale asset URLs) is counted without an
+                 * error and folded to "_other", so unbounded probe variety
+                 * cannot mint metrics slots; 4xx errors only on routes we
+                 * serve, 5xx always. Unparsable requests keep their own
+                 * "_malformed" arm below. */
+                int status = cbm_http_conn_status(conn);
+                bool is_error = status >= 500 || (status >= 400 && route_known);
+                srv->metrics_sink(srv->metrics_sink_context,
+                                  route_known ? req.path : "_other",
+                                  (cbm_now_ms() - request_start_ms) * 1000, is_error);
             }
             cbm_http_req_free(&req);
         } else if (rc > 0) {

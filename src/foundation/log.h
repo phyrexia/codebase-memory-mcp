@@ -94,7 +94,18 @@ void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t va
 
 /* Operational event helpers. They deliberately avoid request bodies, headers,
  * arguments, and query strings. */
-void cbm_log_mcp_request(const char *method, const char *tool_name, bool is_error,
+
+/* How one JSON-RPC request ended, as the `status` field records it. Only
+ * ERROR is a failure of ours and gets a warning level; UNSUPPORTED is a
+ * client probing a method this server does not implement (server/discover et
+ * al.) and logs at info like OK, so probes cannot drown the log in warn lines. */
+typedef enum {
+    CBM_MCP_REQUEST_OK = 0,
+    CBM_MCP_REQUEST_ERROR,
+    CBM_MCP_REQUEST_UNSUPPORTED,
+} CBMMcpRequestStatus;
+
+void cbm_log_mcp_request(const char *method, const char *tool_name, CBMMcpRequestStatus status,
                          int64_t duration_us);
 void cbm_log_http_request(const char *component, const char *method, const char *path, int status,
                           int64_t duration_ms, size_t request_bytes, size_t response_bytes);

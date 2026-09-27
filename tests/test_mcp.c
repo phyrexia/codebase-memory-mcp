@@ -2250,6 +2250,35 @@ TEST(server_handle_unknown_method) {
     PASS();
 }
 
+/* C9: the methods clients probe but this server does not implement
+ * (server/discover et al.) must land as info/status=unsupported, never as
+ * warn/status=error. */
+TEST(server_handle_unknown_method_logs_unsupported_at_info) {
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel prev_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"server/discover\"}");
+    bool rejected = resp != NULL && strstr(resp, "-32601") != NULL;
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(prev_level);
+
+    bool unsupported = strstr(mcp_log_buf, "msg=mcp.request") != NULL &&
+                       strstr(mcp_log_buf, "method=server/discover") != NULL &&
+                       strstr(mcp_log_buf, "status=unsupported") != NULL &&
+                       strstr(mcp_log_buf, "status=error") == NULL;
+    ASSERT_TRUE(rejected);
+    ASSERT_TRUE(unsupported);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  TOOL HANDLERS (via server_handle)
  * ══════════════════════════════════════════════════════════════════ */
@@ -21781,6 +21810,7 @@ SUITE(mcp) {
     RUN_TEST(server_handle_prompts_get_validates_arguments);
     RUN_TEST(server_handle_logs_request_without_params);
     RUN_TEST(server_handle_unknown_method);
+    RUN_TEST(server_handle_unknown_method_logs_unsupported_at_info);
 
     /* Server handle — edge cases */
     RUN_TEST(server_handle_invalid_json);

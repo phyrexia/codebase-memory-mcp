@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h> /* time(NULL): the rotation clock the mtime epoch expects */
 
 enum {
     INDEX_SUPERVISOR_TEST_PATH_CAP = 1024,
@@ -941,8 +942,99 @@ TEST(index_supervisor_job_memory_limit_has_floor_headroom_and_no_overflow) {
     PASS();
 }
 
+/* C9: <cache>/logs accumulates one .worker-log-* per physical worker attempt
+ * (only clean runs delete theirs): 6503 were on disk at audit time. Rotation
+ * keeps the young (inside the retention window) and the recent floor, and
+ * unlinks the rest. `now_unix_s` comes from the caller — Unix time, the same
+ * epoch as the file mtimes — so the test ages files by handing rotation a
+ * future wall clock instead of touching any clock. */
+static bool worker_logs_seed(const char *dir, int count) {
+    for (int i = 0; i < count; i++) {
+        char path[INDEX_SUPERVISOR_TEST_PATH_CAP];
+        (void)snprintf(path, sizeof(path), "%s/.worker-log-t%05d", dir, i);
+        if (th_write_file(path, "log") != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int worker_logs_count(const char *dir) {
+    cbm_dir_t *stream = cbm_opendir(dir);
+    if (!stream) {
+        return -1;
+    }
+    int files = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(stream)) != NULL) {
+        if (entry->is_dir || strncmp(entry->name, ".worker-log-", 12) != 0) {
+            continue;
+        }
+        files++;
+    }
+    cbm_closedir(stream);
+    return files;
+}
+
+TEST(index_supervisor_worker_logs_rotate_keeps_young_and_recent) {
+    /* 260 logs: past both the retention window and the recent floor. */
+    char old_dir[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(old_dir, sizeof(old_dir), "%s/cbm-worker-logs-old-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(old_dir));
+    bool seeded = worker_logs_seed(old_dir, 260);
+    char response_path[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(response_path, sizeof(response_path), "%s/.worker-response-keep", old_dir);
+    char note_path[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(note_path, sizeof(note_path), "%s/notes.txt", old_dir);
+    char subdir[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(subdir, sizeof(subdir), "%s/.worker-log-sub", old_dir);
+    bool extras = seeded && th_write_file(response_path, "keep") == 0 &&
+                  th_write_file(note_path, "note") == 0 && th_mkdir_p(subdir) == 0;
+
+    const int64_t later = (int64_t)time(NULL) + (int64_t)20 * 24 * 3600;
+    size_t removed = extras ? cbm_index_worker_logs_rotate(old_dir, later) : 1;
+    int left = worker_logs_count(old_dir);
+    bool extras_kept =
+        cbm_file_exists(response_path) && cbm_file_exists(note_path) && cbm_is_dir(subdir);
+    (void)th_rmtree(old_dir);
+
+    /* Fresh logs are inside the retention window: nothing may go. */
+    char young_dir[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(young_dir, sizeof(young_dir), "%s/cbm-worker-logs-young-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(young_dir));
+    bool young_seeded = worker_logs_seed(young_dir, 3);
+    size_t young_removed =
+        young_seeded ? cbm_index_worker_logs_rotate(young_dir, (int64_t)time(NULL)) : 1;
+    int young_left = worker_logs_count(young_dir);
+    (void)th_rmtree(young_dir);
+
+    /* Old but inside the recent floor: the floor exists so a small set of
+     * post-mortem logs is never emptied out. */
+    char floor_dir[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(floor_dir, sizeof(floor_dir), "%s/cbm-worker-logs-floor-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(floor_dir));
+    bool floor_seeded = worker_logs_seed(floor_dir, 3);
+    size_t floor_removed =
+        floor_seeded ? cbm_index_worker_logs_rotate(floor_dir, later) : 1;
+    int floor_left = worker_logs_count(floor_dir);
+    (void)th_rmtree(floor_dir);
+
+    ASSERT_TRUE(extras);
+    ASSERT_EQ(removed, 4);
+    ASSERT_EQ(left, 256);
+    ASSERT_TRUE(extras_kept);
+    ASSERT_TRUE(young_seeded);
+    ASSERT_EQ(young_removed, 0);
+    ASSERT_EQ(young_left, 3);
+    ASSERT_TRUE(floor_seeded);
+    ASSERT_EQ(floor_removed, 0);
+    ASSERT_EQ(floor_left, 3);
+    PASS();
+}
+
 SUITE(index_supervisor) {
     RUN_TEST(index_supervisor_job_memory_limit_has_floor_headroom_and_no_overflow);
+    RUN_TEST(index_supervisor_worker_logs_rotate_keeps_young_and_recent);
     RUN_TEST(index_supervisor_worker_argv_requires_exact_build_bound_grammar);
     RUN_TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached);
     RUN_TEST(index_supervisor_sync_wrapper_forwards_cancel_and_drains_tree);

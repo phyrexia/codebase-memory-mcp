@@ -173,11 +173,27 @@ struct cbm_daemon_application_mutation {
     cbm_daemon_application_mutation_t *next;
 };
 
+/* Metric `name` is a bounded catalog label, not free text: tool names arrive
+ * in client-controlled TOOL frames and tools/call arguments (field evidence:
+ * one row recorded a CLI flag, name='--quiet'), and hook payloads can invent
+ * event names. Names outside the catalog fold to "_other" at the producer so
+ * garbage cannot mint metrics slots. NULL keeps flowing as "no name". */
+static const char *metrics_tool_name(const char *name) {
+    return (!name || cbm_mcp_tool_is_known(name)) ? name : "_other";
+}
+
+/* Hook labels: the event that fired, "hook" for a payload with no event at
+ * all (the pre-outcome fallback), and "_other" for anything invented. */
+static const char *metrics_hook_name(const cbm_hook_augment_outcome_t *outcome) {
+    const char *name = outcome->event[0] ? outcome->event : "hook";
+    return (cbm_hook_augment_event_is_known(name) || strcmp(name, "hook") == 0) ? name : "_other";
+}
+
 /* Bridges cbm_mcp_server tool-call measurements into the accumulator. */
 static void application_metrics_sink(void *context, const char *source, const char *tool,
                                      const char *project, uint64_t dur_us, bool is_error) {
-    cbm_daemon_application_metrics_record((cbm_daemon_application_t *)context, source, tool,
-                                          project, dur_us, is_error);
+    cbm_daemon_application_metrics_record((cbm_daemon_application_t *)context, source,
+                                          metrics_tool_name(tool), project, dur_us, is_error);
 }
 
 typedef struct {
@@ -2677,7 +2693,7 @@ static cbm_daemon_runtime_application_status_t application_tool_request(
     char *response = cbm_mcp_handle_tool(session->mcp, tool, args);
     bool tool_is_err = !response || strstr(response, "\"isError\":true") != NULL;
     const char *tool_project = cbm_mcp_server_session_project(session->mcp);
-    cbm_daemon_application_metrics_record(session->application, "cli", tool,
+    cbm_daemon_application_metrics_record(session->application, "cli", metrics_tool_name(tool),
                                           tool_project ? tool_project : "",
                                           (cbm_now_ms() - tool_t0_ms) * 1000, tool_is_err);
     free(tool);
@@ -2779,19 +2795,21 @@ static cbm_daemon_runtime_application_status_t application_request_dispatch(
             return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
         }
         uint64_t hook_t0_ms = cbm_now_ms();
+        cbm_hook_augment_outcome_t outcome = {.status = CBM_HOOK_AUGMENT_ERROR};
         char *response = cbm_hook_augment_process_for(session->mcp, input, session->hook_event,
-                                                      session->hook_dialect);
-        /* hook_event is an optional heap string: SET_CONTEXT leaves it NULL when
-         * the client sends no event (Claude Code's PreToolUse augment does), so
-         * it must be NULL-checked before indexing. Reading [0] off NULL segfaulted
-         * the daemon on every such hook — 11 crashes on 2026-08-13, all landing in
-         * this dispatch. The tool path below already guards its project the same way. */
-        const char *hook_metric_name =
-            (session->hook_event && session->hook_event[0]) ? session->hook_event : "hook";
+                                                      session->hook_dialect, &outcome);
+        /* The event that fired names the request (the forced --event wins,
+         * else the payload's hook_event_name), so augment traffic stops being
+         * filed under the generic "hook" label; a payload that names no event
+         * keeps it. Regression note: this used to index session->hook_event
+         * without a NULL check and segfaulted the daemon on eventless
+         * augment requests (11 crashes on 2026-08-13). */
+        const char *hook_metric_name = metrics_hook_name(&outcome);
         const char *hook_project = cbm_mcp_server_session_project(session->mcp);
         cbm_daemon_application_metrics_record(application, "hook", hook_metric_name,
                                               hook_project ? hook_project : "",
-                                              (cbm_now_ms() - hook_t0_ms) * 1000, response == NULL);
+                                              (cbm_now_ms() - hook_t0_ms) * 1000,
+                                              outcome.status == CBM_HOOK_AUGMENT_ERROR);
         free(input);
         if (response) {
             size_t response_length = strlen(response);

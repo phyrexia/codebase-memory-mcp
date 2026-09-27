@@ -72,6 +72,11 @@ const char *cbm_mcp_tool_input_schema(const char *tool_name);
 int cbm_mcp_tool_count(void);
 const char *cbm_mcp_tool_name(int index);
 
+/* True iff `tool_name` is a name from the registry tools/list advertises.
+ * Backs metric-name validation: request metrics are labelled with tool names,
+ * and a client-supplied string outside the catalog must not mint a slot. */
+bool cbm_mcp_tool_is_known(const char *tool_name);
+
 /* Tool metadata by name (static; do not free; NULL when unknown). Used by the
  * generated client adapters so they can emit descriptions and parameter
  * schemas without drifting from tools/list. */

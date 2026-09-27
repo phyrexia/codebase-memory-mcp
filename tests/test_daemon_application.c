@@ -368,6 +368,327 @@ TEST(daemon_application_metrics_record_flush_and_accumulate) {
     PASS();
 }
 
+/* C1: hook metrics used to record `is_error = (response == NULL)`, which
+ * filed healthy no-ops ("nothing to augment") as errors — 48,9 % of hook
+ * traffic and 97,8 % of every recorded error (T3 field evidence). A no-op is
+ * a served request: count grows, errors must not. */
+TEST(daemon_application_hook_noop_counts_request_without_error) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/dapp-hook-noop-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char root[APP_TEST_PATH_CAP];
+    (void)snprintf(root, sizeof(root), "%s/cbm-app-hook-noop-XXXXXX", cbm_tmpdir());
+    bool root_ok = cbm_mkdtemp(root) != NULL;
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    cbm_daemon_application_config_t app_cfg = {0};
+    app_cfg.config = cfg;
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&app_cfg);
+    ASSERT_NOT_NULL(application);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 307);
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    /* PreToolUse + Bash whose command is not a search: nothing to augment. */
+    const char *input = "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\","
+                        "\"tool_input\":{\"command\":\"ls -la\"}}";
+    uint8_t *hook = NULL;
+    uint32_t hook_length = 0;
+    bool encoded = root_ok && session &&
+                   app_test_context_request(root, root, &context, &context_length) &&
+                   app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_HOOK_AUGMENT, input, &hook,
+                                         &hook_length);
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    cbm_daemon_runtime_application_status_t context_status =
+        encoded ? app_test_request(&callbacks, session, context, context_length, &response,
+                                   &response_length)
+                : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(response);
+    response = NULL;
+    cbm_daemon_runtime_application_status_t hook_status =
+        context_status == CBM_DAEMON_RUNTIME_APPLICATION_OK
+            ? app_test_request(&callbacks, session, hook, hook_length, &response, &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool no_augmentation = response == NULL && response_length == 0;
+    free(response);
+    free(context);
+    free(hook);
+    cbm_daemon_application_metrics_flush(application);
+
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", tmpdir);
+    sqlite3 *db = NULL;
+    bool db_opened = sqlite3_open(dbpath, &db) == SQLITE_OK;
+    sqlite3_stmt *stmt = NULL;
+    bool query_prepared =
+        db_opened && sqlite3_prepare_v2(db,
+                                        "SELECT SUM(count), SUM(errors) FROM metrics_requests"
+                                        " WHERE source='hook'",
+                                        -1, &stmt, NULL) == SQLITE_OK;
+    bool row_read = query_prepared && sqlite3_step(stmt) == SQLITE_ROW;
+    int64_t hook_count = row_read ? sqlite3_column_int64(stmt, 0) : -1;
+    int64_t hook_errors = row_read ? sqlite3_column_int64(stmt, 1) : -1;
+    if (row_read) {
+        (void)sqlite3_step(stmt);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    if (session) {
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    cbm_config_close(cfg);
+    if (root_ok) {
+        (void)cbm_rmdir(root);
+    }
+    th_rmtree(tmpdir);
+
+    ASSERT_TRUE(root_ok);
+    ASSERT_TRUE(encoded);
+    ASSERT_EQ(context_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(hook_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(no_augmentation);
+    ASSERT_EQ(hook_count, 1);
+    ASSERT_EQ(hook_errors, 0);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
+/* Unreadable hook input is a real failure and must keep counting as one. */
+TEST(daemon_application_hook_unreadable_json_counts_as_error) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/dapp-hook-badjson-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char root[APP_TEST_PATH_CAP];
+    (void)snprintf(root, sizeof(root), "%s/cbm-app-hook-badjson-XXXXXX", cbm_tmpdir());
+    bool root_ok = cbm_mkdtemp(root) != NULL;
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    cbm_daemon_application_config_t app_cfg = {0};
+    app_cfg.config = cfg;
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&app_cfg);
+    ASSERT_NOT_NULL(application);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 308);
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    uint8_t *hook = NULL;
+    uint32_t hook_length = 0;
+    bool encoded = root_ok && session &&
+                   app_test_context_request(root, root, &context, &context_length) &&
+                   app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_HOOK_AUGMENT, "{\"cwd\":",
+                                         &hook, &hook_length);
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    cbm_daemon_runtime_application_status_t context_status =
+        encoded ? app_test_request(&callbacks, session, context, context_length, &response,
+                                   &response_length)
+                : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(response);
+    response = NULL;
+    cbm_daemon_runtime_application_status_t hook_status =
+        context_status == CBM_DAEMON_RUNTIME_APPLICATION_OK
+            ? app_test_request(&callbacks, session, hook, hook_length, &response, &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(response);
+    free(context);
+    free(hook);
+    cbm_daemon_application_metrics_flush(application);
+
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", tmpdir);
+    sqlite3 *db = NULL;
+    bool db_opened = sqlite3_open(dbpath, &db) == SQLITE_OK;
+    sqlite3_stmt *stmt = NULL;
+    bool query_prepared =
+        db_opened && sqlite3_prepare_v2(db,
+                                        "SELECT SUM(count), SUM(errors) FROM metrics_requests"
+                                        " WHERE source='hook'",
+                                        -1, &stmt, NULL) == SQLITE_OK;
+    bool row_read = query_prepared && sqlite3_step(stmt) == SQLITE_ROW;
+    int64_t hook_count = row_read ? sqlite3_column_int64(stmt, 0) : -1;
+    int64_t hook_errors = row_read ? sqlite3_column_int64(stmt, 1) : -1;
+    if (row_read) {
+        (void)sqlite3_step(stmt);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    if (session) {
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    cbm_config_close(cfg);
+    if (root_ok) {
+        (void)cbm_rmdir(root);
+    }
+    th_rmtree(tmpdir);
+
+    ASSERT_TRUE(root_ok);
+    ASSERT_TRUE(encoded);
+    ASSERT_EQ(context_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(hook_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(hook_count, 1);
+    ASSERT_EQ(hook_errors, 1);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
+/* C1: metric `name` is a bounded catalog label, not free text. A TOOL frame
+ * can carry a CLI argument as its tool name (field evidence: one row with
+ * name='--quiet'), and a hook payload can invent an event name; both must
+ * fold instead of minting slots. The hook metric must also name the event
+ * that fired instead of filing everything under "hook". */
+TEST(daemon_application_metric_names_come_from_the_catalogs) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/dapp-metrics-names-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char root[APP_TEST_PATH_CAP];
+    (void)snprintf(root, sizeof(root), "%s/cbm-app-metrics-names-XXXXXX", cbm_tmpdir());
+    bool root_ok = cbm_mkdtemp(root) != NULL;
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    cbm_daemon_application_config_t app_cfg = {0};
+    app_cfg.config = cfg;
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&app_cfg);
+    ASSERT_NOT_NULL(application);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 309);
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    uint8_t *tool_frame = NULL;
+    uint32_t tool_length = 0;
+    bool encoded = root_ok && session &&
+                   app_test_context_request(root, root, &context, &context_length) &&
+                   app_test_tool_request("--quiet", "{}", &tool_frame, &tool_length);
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    cbm_daemon_runtime_application_status_t context_status =
+        encoded ? app_test_request(&callbacks, session, context, context_length, &response,
+                                   &response_length)
+                : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(response);
+    response = NULL;
+    cbm_daemon_runtime_application_status_t tool_status =
+        context_status == CBM_DAEMON_RUNTIME_APPLICATION_OK
+            ? app_test_request(&callbacks, session, tool_frame, tool_length, &response,
+                               &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(response);
+    response = NULL;
+
+    /* A lifecycle payload names its event: the metric must use it. */
+    uint8_t *hook_frame = NULL;
+    uint32_t hook_length = 0;
+    bool hook_encoded =
+        tool_status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+        app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_HOOK_AUGMENT,
+                              "{\"hook_event_name\":\"SessionStart\"}", &hook_frame, &hook_length);
+    cbm_daemon_runtime_application_status_t hook_status =
+        hook_encoded ? app_test_request(&callbacks, session, hook_frame, hook_length, &response,
+                                        &response_length)
+                     : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(response);
+    response = NULL;
+
+    /* A payload that invents an event name folds instead of minting a slot. */
+    uint8_t *bogus_frame = NULL;
+    uint32_t bogus_length = 0;
+    bool bogus_encoded =
+        hook_status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+        app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_HOOK_AUGMENT,
+                              "{\"hook_event_name\":\"--quiet\",\"tool_name\":\"Bash\","
+                              "\"tool_input\":{\"command\":\"ls\"}}",
+                              &bogus_frame, &bogus_length);
+    cbm_daemon_runtime_application_status_t bogus_status =
+        bogus_encoded ? app_test_request(&callbacks, session, bogus_frame, bogus_length, &response,
+                                         &response_length)
+                      : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(response);
+    free(context);
+    free(tool_frame);
+    free(hook_frame);
+    free(bogus_frame);
+    cbm_daemon_application_metrics_flush(application);
+
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", tmpdir);
+    sqlite3 *db = NULL;
+    bool db_opened = sqlite3_open(dbpath, &db) == SQLITE_OK;
+    sqlite3_stmt *stmt = NULL;
+    bool folded_tool = db_opened &&
+                       sqlite3_prepare_v2(db,
+                                          "SELECT COUNT(*) FROM metrics_requests WHERE"
+                                          " source='cli' AND name='_other'",
+                                          -1, &stmt, NULL) == SQLITE_OK &&
+                       sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    bool leaked_tool = !(db_opened &&
+                         sqlite3_prepare_v2(db,
+                                            "SELECT COUNT(*) FROM metrics_requests WHERE"
+                                            " name='--quiet'",
+                                            -1, &stmt, NULL) == SQLITE_OK &&
+                         sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 0);
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    bool named_event = db_opened &&
+                       sqlite3_prepare_v2(db,
+                                          "SELECT COUNT(*) FROM metrics_requests WHERE"
+                                          " source='hook' AND name='SessionStart'",
+                                          -1, &stmt, NULL) == SQLITE_OK &&
+                       sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    bool folded_event = db_opened &&
+                        sqlite3_prepare_v2(db,
+                                           "SELECT COUNT(*) FROM metrics_requests WHERE"
+                                           " source='hook' AND name='_other'",
+                                           -1, &stmt, NULL) == SQLITE_OK &&
+                        sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    if (session) {
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    cbm_config_close(cfg);
+    if (root_ok) {
+        (void)cbm_rmdir(root);
+    }
+    th_rmtree(tmpdir);
+
+    ASSERT_TRUE(root_ok);
+    ASSERT_TRUE(encoded);
+    ASSERT_EQ(context_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(tool_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(hook_encoded);
+    ASSERT_EQ(hook_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(bogus_encoded);
+    ASSERT_EQ(bogus_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(folded_tool);
+    ASSERT_FALSE(leaked_tool);
+    ASSERT_TRUE(named_event);
+    ASSERT_TRUE(folded_event);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
 TEST(daemon_application_metrics_saturation_preserves_per_source_totals) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/dapp-metrics-saturation-XXXXXX");
@@ -6121,6 +6442,9 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_over_budget_response_passes_through_without_recovery);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
     RUN_TEST(daemon_application_metrics_record_flush_and_accumulate);
+    RUN_TEST(daemon_application_hook_noop_counts_request_without_error);
+    RUN_TEST(daemon_application_hook_unreadable_json_counts_as_error);
+    RUN_TEST(daemon_application_metric_names_come_from_the_catalogs);
     RUN_TEST(daemon_application_metrics_saturation_preserves_per_source_totals);
     RUN_TEST(daemon_application_metrics_saturation_preserves_unrepresented_source);
     RUN_TEST(daemon_application_metrics_failed_flush_restores_into_saturated_accumulator);

@@ -11,6 +11,7 @@ This page documents the configuration files that `codebase-memory-mcp` reads or 
 | CLI-managed runtime settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db` | SQLite | Written by `codebase-memory-mcp config set/reset`. The same database also holds additive `metrics_requests` hourly counters, flushed once a minute, retained for 90 days, served at `GET /api/metrics`, and shown in the UI **Control** tab. |
 | UI settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/config.json` | JSON | Stores `ui_enabled` and `ui_port`. |
 | Daemon operation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/cbm-daemon.log` | Structured log | Durable daemon lifecycle, watcher/indexing, UI, resource, and error events. |
+| Index worker logs | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/.worker-log-*` | Structured log | One per physical index worker attempt; kept after failed runs for post-mortem. Rotated when the next attempt starts: logs newer than 14 days, and the 256 newest whatever their age, stay; the rest are unlinked. |
 | Admission conflict log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/daemon-conflicts.ndjson` | NDJSON | Exact-build, ABI, and canonical-cache conflicts. |
 | Activation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/activation-events.ndjson` | NDJSON | Install/update/uninstall activation progress and outcomes. |
 
