@@ -492,6 +492,28 @@ bool cbm_config_watcher_enabled(cbm_config_t *cfg);
  * return 2. Read by the daemon host once per generation. */
 size_t cbm_config_max_index_jobs(cbm_config_t *cfg);
 
+/* Where detect_session looks for the session root: `git_toplevel` (default)
+ * binds the session to the repository root of the cwd, `cwd` keeps the
+ * historical behavior of using the working directory itself. */
+#define CBM_CONFIG_SESSION_ROOT "session_root"
+#define CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL "git_toplevel"
+#define CBM_CONFIG_SESSION_ROOT_CWD "cwd"
+
+typedef enum {
+    CBM_SESSION_ROOT_GIT_TOPLEVEL = 0,
+    CBM_SESSION_ROOT_CWD = 1,
+} cbm_session_root_mode_t;
+
+/* Strict reader, same contract as cbm_config_max_index_jobs: only the two
+ * documented literals are accepted, so a truncated, suffixed or otherwise
+ * malformed stored value can never half-match a mode. Anything else (and a NULL
+ * cfg) reads as the default. */
+cbm_session_root_mode_t cbm_config_session_root(cbm_config_t *cfg);
+
+/* Whether a value is one of the two accepted `session_root` literals. Used by
+ * `config set`, which rejects anything else instead of storing it. */
+bool cbm_config_session_root_value_valid(const char *value);
+
 /* ── Binary activation safety ─────────────────────────────────── */
 
 typedef void *cbm_cli_activation_lock_t;

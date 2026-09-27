@@ -18609,6 +18609,126 @@ TEST(index_repository_cli_name_override_issue823) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  B3 — `name` override duplicating an already-indexed root
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* A `name` override is public API, but silently minting a second project for a
+ * root that is already indexed is what produced the duplicated project
+ * databases the fleet review found. When the override disagrees with the name
+ * derived from repo_path AND another project already owns that root_path, the
+ * result must name the project it aliased (`alias_of`); a call without the
+ * override must not grow the field. */
+#define INDEX_ALIAS_OTHER_PROJECT "zz-existing-alias-project"
+#define INDEX_ALIAS_OVERRIDE_NAME "custom-alias-project"
+
+typedef struct {
+    bool setup_ok;
+    char *response; /* MCP tool result, heap-owned by the caller */
+} index_alias_probe_t;
+
+static index_alias_probe_t index_alias_probe(bool with_override) {
+    index_alias_probe_t out = {0};
+    char base[CBM_SZ_1K];
+    char cache[CBM_SZ_1K];
+    snprintf(base, sizeof(base), "%s/cbm-idxalias-base-XXXXXX", cbm_tmpdir());
+    snprintf(cache, sizeof(cache), "%s/cbm-idxalias-cache-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(base) || !cbm_mkdtemp(cache)) {
+        th_rmtree(base);
+        th_rmtree(cache);
+        return out;
+    }
+
+    char repo[CBM_SZ_1K];
+    char source[CBM_SZ_1K];
+    snprintf(repo, sizeof(repo), "%s/repo", base);
+    snprintf(source, sizeof(source), "%s/main.py", repo);
+    if (th_write_file(source, "def alias_probe():\n    return 1\n") != 0) {
+        th_rmtree(base);
+        th_rmtree(cache);
+        return out;
+    }
+
+    /* The project that already owns this root under a different name. Stored in
+     * the canonical form index_repository compares against. */
+    char repo_root[CBM_SZ_1K];
+    if (!cbm_canonical_path(repo, repo_root, sizeof(repo_root))) {
+        snprintf(repo_root, sizeof(repo_root), "%s", repo);
+    }
+    cbm_normalize_path_sep(repo_root);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_supervisor = getenv("CBM_INDEX_SUPERVISOR");
+    char *saved_supervisor_copy = saved_supervisor ? strdup(saved_supervisor) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    cbm_store_t *owner = cbm_store_open(INDEX_ALIAS_OTHER_PROJECT);
+    bool owner_placed = owner && cbm_store_upsert_project(owner, INDEX_ALIAS_OTHER_PROJECT,
+                                                          repo_root) == CBM_STORE_OK;
+    cbm_store_close(owner);
+
+    cbm_mcp_server_t *srv = owner_placed ? cbm_mcp_server_new(NULL) : NULL;
+    if (srv) {
+        char args[CBM_SZ_2K];
+        snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"%s}", repo,
+                 with_override ? ",\"name\":\"" INDEX_ALIAS_OVERRIDE_NAME "\"" : "");
+        out.response = cbm_mcp_handle_tool(srv, "index_repository", args);
+        out.setup_ok = out.response != NULL;
+    }
+    cbm_mcp_server_free(srv);
+
+    cleanup_project_db(cache, INDEX_ALIAS_OTHER_PROJECT);
+    cleanup_project_db(cache, INDEX_ALIAS_OVERRIDE_NAME);
+    char *derived = cbm_project_name_from_path(repo);
+    if (derived) {
+        cleanup_project_db(cache, derived);
+        free(derived);
+    }
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    if (saved_supervisor_copy) {
+        cbm_setenv("CBM_INDEX_SUPERVISOR", saved_supervisor_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    }
+    free(saved_supervisor_copy);
+    th_rmtree(base);
+    th_rmtree(cache);
+    return out;
+}
+
+TEST(index_repository_name_override_reports_alias_of_existing_root) {
+    index_alias_probe_t probe = index_alias_probe(true);
+    ASSERT_TRUE(probe.setup_ok);
+    ASSERT_NOT_NULL(probe.response);
+    yyjson_doc *doc = budget_result_doc(probe.response);
+    ASSERT_NOT_NULL(doc);
+    const char *project = budget_doc_str(doc, "project");
+    const char *alias = budget_doc_str(doc, "alias_of");
+    ASSERT_NOT_NULL(project);
+    ASSERT_STR_EQ(project, INDEX_ALIAS_OVERRIDE_NAME);
+    ASSERT_NOT_NULL(alias);
+    ASSERT_STR_EQ(alias, INDEX_ALIAS_OTHER_PROJECT);
+    yyjson_doc_free(doc);
+    free(probe.response);
+    PASS();
+}
+
+TEST(index_repository_without_name_override_omits_alias_of) {
+    index_alias_probe_t probe = index_alias_probe(false);
+    ASSERT_TRUE(probe.setup_ok);
+    ASSERT_NOT_NULL(probe.response);
+    yyjson_doc *doc = budget_result_doc(probe.response);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_NOT_NULL(budget_doc_str(doc, "project"));
+    ASSERT_NULL(budget_doc_str(doc, "alias_of"));
+    yyjson_doc_free(doc);
+    free(probe.response);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  #845 — supervisor gate must not wrap embedders of cbm_mcp_handle_tool
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -19810,6 +19930,183 @@ TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
         PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
     }
     ASSERT_EQ(count, 0);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ *  Session root detection — git toplevel vs cwd
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* detect_session may root the session at the repository toplevel instead of the
+ * session's cwd, so a session started inside a subdirectory binds to the project
+ * that is actually indexed. Four cases: a repo subdirectory roots at the
+ * toplevel; a repository rooted AT $HOME falls back to the cwd (never root a
+ * session at the whole user profile); no repository keeps the cwd; and
+ * `session_root=cwd` keeps the historical behavior. The probe drives a real
+ * `initialize`, the only caller of detect_session. */
+typedef struct {
+    bool git_repo;            /* `git init` the repo root */
+    bool repo_root_is_home;   /* the repo root doubles as a fake $HOME */
+    const char *config_value; /* `session_root` value, or NULL for the default */
+} detect_session_case_t;
+
+typedef struct {
+    bool setup_ok;
+    char detected[CBM_SZ_1K];  /* session root detect_session picked */
+    char cwd[CBM_SZ_1K];       /* canonical session cwd (the subdirectory) */
+    char repo_root[CBM_SZ_1K]; /* canonical repository root */
+    char log[CBM_SZ_4K];       /* log lines emitted while detecting */
+} detect_session_result_t;
+
+static char detect_session_log[CBM_SZ_4K];
+
+static void detect_session_capture_log(const char *line) {
+    size_t used = strlen(detect_session_log);
+    if (used + 1 < sizeof(detect_session_log)) {
+        (void)snprintf(detect_session_log + used, sizeof(detect_session_log) - used, "%s\n",
+                       line ? line : "");
+    }
+}
+
+static void detect_session_probe(const detect_session_case_t *probe,
+                                 detect_session_result_t *out) {
+    memset(out, 0, sizeof(*out));
+    char cache[CBM_SZ_1K];
+    char base[CBM_SZ_1K];
+    snprintf(cache, sizeof(cache), "%s/cbm-sessroot-cache-XXXXXX", cbm_tmpdir());
+    snprintf(base, sizeof(base), "%s/cbm-sessroot-base-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(cache) || !cbm_mkdtemp(base)) {
+        th_rmtree(cache);
+        th_rmtree(base);
+        return;
+    }
+
+    char sub[CBM_SZ_1K];
+    snprintf(sub, sizeof(sub), "%s/sub", base);
+    if (th_mkdir_p(sub) != 0) {
+        th_rmtree(cache);
+        th_rmtree(base);
+        return;
+    }
+
+    if (probe->git_repo) {
+        const char *const init_args[] = {"init", "-q", NULL};
+        if (mcp_test_git(base, init_args) != 0) {
+            th_rmtree(cache);
+            th_rmtree(base);
+            return;
+        }
+    }
+
+    /* Expected roots are compared canonically: getcwd() and git both report
+     * resolved paths, so a symlinked TMPDIR must not fail the assertions. */
+    if (!cbm_canonical_path(sub, out->cwd, sizeof(out->cwd)) ||
+        !cbm_canonical_path(base, out->repo_root, sizeof(out->repo_root))) {
+        th_rmtree(cache);
+        th_rmtree(base);
+        return;
+    }
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_home = getenv("HOME");
+    char *saved_home_copy = saved_home ? strdup(saved_home) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    if (probe->repo_root_is_home) {
+        cbm_setenv("HOME", base, 1);
+    }
+
+    char old_cwd[CBM_SZ_1K];
+    if (cbm_getcwd(old_cwd, sizeof(old_cwd)) && cbm_chdir(sub) == 0) {
+        cbm_config_t *cfg = cbm_config_open(cache);
+        cbm_mcp_server_t *srv = cfg ? cbm_mcp_server_new(NULL) : NULL;
+        if (cfg && srv) {
+            if (probe->config_value) {
+                cbm_config_set(cfg, CBM_CONFIG_SESSION_ROOT, probe->config_value);
+            }
+            cbm_mcp_server_set_config(srv, cfg);
+            detect_session_log[0] = '\0';
+            CBMLogLevel prev_level = cbm_log_get_level();
+            cbm_log_set_level(CBM_LOG_INFO);
+            cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+            cbm_log_set_sink_ex(detect_session_capture_log, CBM_LOG_SINK_REPLACE);
+            char *resp = cbm_mcp_server_handle(
+                srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+            cbm_log_set_sink(NULL);
+            cbm_log_set_level(prev_level);
+            free(resp);
+            snprintf(out->detected, sizeof(out->detected), "%s", cbm_mcp_server_session_root(srv));
+            snprintf(out->log, sizeof(out->log), "%s", detect_session_log);
+            out->setup_ok = true;
+        }
+        if (srv) {
+            cbm_mcp_server_free(srv);
+        }
+        if (cfg) {
+            cbm_config_close(cfg);
+        }
+        (void)cbm_chdir(old_cwd);
+    }
+
+    if (saved_home_copy) {
+        cbm_setenv("HOME", saved_home_copy, 1);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    free(saved_home_copy);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    th_rmtree(base);
+}
+
+TEST(detect_session_prefers_git_toplevel_from_subdirectory) {
+    detect_session_case_t probe = {.git_repo = true};
+    detect_session_result_t out;
+    detect_session_probe(&probe, &out);
+    if (!out.setup_ok) {
+        PASS(); /* fixture setup failed (tmpdir/cwd/git unavailable) — skip */
+    }
+    ASSERT_STR_EQ(out.detected, out.repo_root);
+    ASSERT_STR_NEQ(out.detected, out.cwd);
+    ASSERT_NOT_NULL(strstr(out.log, "msg=session.root.git_toplevel"));
+    PASS();
+}
+
+TEST(detect_session_repo_at_home_falls_back_to_cwd) {
+    detect_session_case_t probe = {.git_repo = true, .repo_root_is_home = true};
+    detect_session_result_t out;
+    detect_session_probe(&probe, &out);
+    if (!out.setup_ok) {
+        PASS();
+    }
+    ASSERT_STR_EQ(out.detected, out.cwd);
+    ASSERT_NOT_NULL(strstr(out.log, "msg=session.root.cwd"));
+    PASS();
+}
+
+TEST(detect_session_without_git_keeps_cwd) {
+    detect_session_case_t probe = {.git_repo = false};
+    detect_session_result_t out;
+    detect_session_probe(&probe, &out);
+    if (!out.setup_ok) {
+        PASS();
+    }
+    ASSERT_STR_EQ(out.detected, out.cwd);
+    ASSERT_NOT_NULL(strstr(out.log, "msg=session.root.cwd"));
+    PASS();
+}
+
+TEST(detect_session_session_root_cwd_keeps_previous_behavior) {
+    detect_session_case_t probe = {
+        .git_repo = true, .config_value = CBM_CONFIG_SESSION_ROOT_CWD};
+    detect_session_result_t out;
+    detect_session_probe(&probe, &out);
+    if (!out.setup_ok) {
+        PASS();
+    }
+    ASSERT_STR_EQ(out.detected, out.cwd);
+    ASSERT_NOT_NULL(strstr(out.log, "msg=session.root.cwd"));
     PASS();
 }
 
@@ -21335,6 +21632,8 @@ SUITE(mcp) {
     RUN_TEST(index_repository_relative_path_uses_explicit_session_root);
     RUN_TEST(index_repository_supervisor_uses_canonical_session_path);
     RUN_TEST(index_repository_cli_name_override_issue823);
+    RUN_TEST(index_repository_name_override_reports_alias_of_existing_root);
+    RUN_TEST(index_repository_without_name_override_omits_alias_of);
     RUN_TEST(index_repository_over_budget_reports_named_reason);
     RUN_TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery);
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
@@ -21416,6 +21715,10 @@ SUITE(mcp) {
     /* auto_watch gate (distilled from PR #625) */
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
+    RUN_TEST(detect_session_prefers_git_toplevel_from_subdirectory);
+    RUN_TEST(detect_session_repo_at_home_falls_back_to_cwd);
+    RUN_TEST(detect_session_without_git_keeps_cwd);
+    RUN_TEST(detect_session_session_root_cwd_keeps_previous_behavior);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
     /* ignore_worktrees gate */
     RUN_TEST(mcp_ignore_worktrees_gates_explicit_index_repository);

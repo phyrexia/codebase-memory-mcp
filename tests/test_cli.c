@@ -3649,6 +3649,12 @@ TEST(cli_skill_files_content) {
     ASSERT(strstr(sk[0].content, "Cypher") != NULL);
     ASSERT(strstr(sk[0].content, "15 MCP Tools") != NULL);
 
+    /* Indexing hygiene: cheap project listing, repo root as repo_path, no
+     * gratuitous `name` override, long-lived worktrees only. */
+    ASSERT(strstr(sk[0].content, "metadata_only: true") != NULL);
+    ASSERT(strstr(sk[0].content, "git rev-parse --show-toplevel") != NULL);
+    ASSERT(strstr(sk[0].content, "index_worktree") != NULL);
+
     /* Gotchas section */
     ASSERT(strstr(sk[0].content, "Gotchas") != NULL);
 
@@ -13856,6 +13862,11 @@ TEST(cli_agent_instructions_content) {
     ASSERT(strstr(instr, "must not call or claim MCP access") != NULL);
     ASSERT(strstr(instr, "# Codebase Memory\n") != NULL);
     ASSERT(strstr(instr, "## Codebase Knowledge Graph (codebase-memory-mcp)\n") != NULL);
+    /* Indexing hygiene mirrors the skill: cheap project listing, repo root as
+     * repo_path, no gratuitous `name` override, long-lived worktrees only. */
+    ASSERT(strstr(instr, "metadata_only: true") != NULL);
+    ASSERT(strstr(instr, "git rev-parse --show-toplevel") != NULL);
+    ASSERT(strstr(instr, "index_worktree") != NULL);
     PASS();
 }
 
@@ -15264,6 +15275,133 @@ TEST(cli_config_max_index_jobs_rejects_truncated_and_embedded_nul_values) {
     ASSERT_EQ(cbm_config_max_index_jobs(cfg), 2);
 
     cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_config_session_root_is_a_strict_enum) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-session-root-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    ASSERT_EQ(cbm_config_session_root(NULL), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_session_root(cfg), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+
+    /* Discoverable: `config list` and `config set` walk this table. */
+    bool listed = false;
+    for (size_t i = 0; i < cbm_cli_config_key_count_for_testing(); i++) {
+        const char *key = cbm_cli_config_key_at_for_testing(i);
+        listed = listed || (key && strcmp(key, CBM_CONFIG_SESSION_ROOT) == 0);
+    }
+    ASSERT_TRUE(listed);
+
+    ASSERT_TRUE(cbm_config_session_root_value_valid(CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL));
+    ASSERT_TRUE(cbm_config_session_root_value_valid(CBM_CONFIG_SESSION_ROOT_CWD));
+    ASSERT_FALSE(cbm_config_session_root_value_valid(NULL));
+    ASSERT_FALSE(cbm_config_session_root_value_valid("cwd "));
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SESSION_ROOT, CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL),
+              0);
+    ASSERT_EQ(cbm_config_session_root(cfg), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SESSION_ROOT, CBM_CONFIG_SESSION_ROOT_CWD), 0);
+    ASSERT_EQ(cbm_config_session_root(cfg), CBM_SESSION_ROOT_CWD);
+
+    /* Persisted: the value survives a reopen of the config store. */
+    cbm_config_close(cfg);
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_session_root(cfg), CBM_SESSION_ROOT_CWD);
+
+    /* Truncated, suffixed, padded, wrongly-cased and non-enum values never
+     * half-match a mode: they all read as the default. */
+    const char *invalid[] = {
+        "",         "c",             "cw",           "cwd ",        " cwd",    "cwd2",
+        "CWD",      "Cwd",           "git_tople",    "git_toplevel2", "git_toplevel ",
+        "GIT_TOPLEVEL", "Git_Toplevel", "git-toplevel", "git_toplevel\n", "auto",
+        "true",     "1",             "-",
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SESSION_ROOT, invalid[i]), 0);
+        ASSERT_EQ(cbm_config_session_root(cfg), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+    }
+
+    /* A stored value with an embedded NUL is not the literal either: the reader
+     * compares the stored BYTES, so a C-string copy cannot launder it. */
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", tmpdir);
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(dbpath, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(stmt, 1, CBM_CONFIG_SESSION_ROOT, -1, SQLITE_TRANSIENT), SQLITE_OK);
+    const char embedded_nul[] = {'c', 'w', 'd', '\0', 'x'};
+    ASSERT_EQ(sqlite3_bind_text(stmt, 2, embedded_nul, (int)sizeof(embedded_nul), SQLITE_TRANSIENT),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    ASSERT_EQ(cbm_config_session_root(cfg), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* `config set session_root` refuses a typo instead of storing a value the
+ * reader would then silently ignore, and `get`/`list` report the effective mode
+ * rather than whatever bytes are on disk. */
+TEST(cli_config_cmd_rejects_invalid_session_root) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-cfg-session-root-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char *saved_cache = NULL;
+    const char *prior = getenv("CBM_CACHE_DIR");
+    if (prior) {
+        saved_cache = strdup(prior);
+    }
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+
+    char out[512];
+    char *get_root[] = {"get", "session_root"};
+    ASSERT_EQ(cli_config_cmd_capture(2, get_root, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "git_toplevel\n");
+
+    char *set_truncated[] = {"set", "session_root", "git_tople"};
+    ASSERT_TRUE(cli_config_cmd_capture(3, set_truncated, out, sizeof(out)) != 0);
+    ASSERT_STR_EQ(out, "");
+    char *set_suffixed[] = {"set", "session_root", "cwd2"};
+    ASSERT_TRUE(cli_config_cmd_capture(3, set_suffixed, out, sizeof(out)) != 0);
+    char *set_uppercase[] = {"set", "session_root", "CWD"};
+    ASSERT_TRUE(cli_config_cmd_capture(3, set_uppercase, out, sizeof(out)) != 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_root, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "git_toplevel\n");
+
+    char *set_cwd[] = {"set", "session_root", "cwd"};
+    ASSERT_EQ(cli_config_cmd_capture(3, set_cwd, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "session_root = cwd\n");
+    ASSERT_EQ(cli_config_cmd_capture(2, get_root, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "cwd\n");
+
+    char *list_cmd[] = {"list"};
+    ASSERT_EQ(cli_config_cmd_capture(1, list_cmd, out, sizeof(out)), 0);
+    ASSERT_NOT_NULL(strstr(out, "session_root"));
+
+    char *reset_root[] = {"reset", "session_root"};
+    ASSERT_EQ(cli_config_cmd_capture(2, reset_root, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_root, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "git_toplevel\n");
+
+    if (saved_cache) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        free(saved_cache);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
     test_rmdir_r(tmpdir);
     PASS();
 }
@@ -16739,6 +16877,8 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_int);
     RUN_TEST(cli_config_max_index_jobs_is_discoverable_strict_bounded_and_persistent);
     RUN_TEST(cli_config_max_index_jobs_rejects_truncated_and_embedded_nul_values);
+    RUN_TEST(cli_config_session_root_is_a_strict_enum);
+    RUN_TEST(cli_config_cmd_rejects_invalid_session_root);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
     RUN_TEST(cli_config_watcher_enabled_default_and_persist);

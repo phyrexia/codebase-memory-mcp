@@ -92,6 +92,7 @@ Current keys:
 | `auto_watch` | `true` | Register the session's project with the background git watcher on connect. Set `false` to keep a session from registering its project (the watcher still runs for other projects). |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
 | `max_index_jobs` | `2` | Maximum concurrent distinct physical index jobs. Strict decimal range `1..16`; missing or invalid values use `2`. Read once when the daemon starts. |
+| `session_root` | `git_toplevel` | Where a session binds: `git_toplevel` resolves the working directory's repository root (`git rev-parse --show-toplevel`), `cwd` keeps the working directory itself. Only these two literals are accepted — a truncated, suffixed or otherwise malformed value is refused by `config set` and reads as the default. Read on every session connect. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
 
@@ -120,6 +121,13 @@ Current keys:
 > Disabling the watcher does not disable anything else: the daemon still starts,
 > `auto_index` still runs, and `index_repository` stays available for manual
 > reindexing.
+
+> **`session_root`.** `git_toplevel` makes a session started in a subdirectory bind to the
+> repository root — the same project `index_repository` creates from `repo_path` — instead of
+> looking for a per-subdirectory project. It is never applied when the resolved root is `/` or
+> your home directory, so a session is never rooted at the whole machine or the whole user
+> profile: those sessions keep the working directory. `config set session_root cwd` restores the
+> previous behavior.
 
 The two `index_max_*` settings are independent and disabled by default. They
 apply to explicit indexing, automatic indexing, and watcher re-indexing, but not
