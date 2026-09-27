@@ -87,6 +87,10 @@ extern void _mi_auto_process_init(void);
 static size_t g_budget;          /* budget in bytes */
 static atomic_int g_initialized; /* init guard */
 static atomic_int g_was_over;    /* pressure hysteresis */
+/* B1: durable budget layer staged from _config.db before the ceiling is
+ * fixed (0 = "off"), and the source label the resolved budget settled on. */
+static size_t g_configured_budget_mb;
+static const char *g_budget_source = "ram_fraction";
 
 #define MB_DIVISOR ((size_t)(CBM_SZ_1K * CBM_SZ_1K))
 
@@ -283,24 +287,62 @@ size_t cbm_mem_clamp_to_available(size_t budget, size_t available) {
     return budget < cap ? budget : cap;
 }
 
-cbm_mem_budget_t cbm_mem_resolve_budget_capped(size_t total_ram, double ram_fraction,
-                                               const char *budget_mb, size_t hard_cap_bytes) {
-    cbm_mem_budget_t result = cbm_mem_resolve_budget(total_ram, ram_fraction, budget_mb);
-    /* The parent already divided the aggregate budget (env override or
-     * ram_fraction) across job slots. That per-slot share is the hard cap:
-     * N workers × a per-worker absolute override would oversubscribe the host
-     * (#1654). A lower explicit value still wins. Keep CBM_MEM_BUDGET_MB as
-     * the source when the env discriminator fired so the ceiling is visible
-     * as the user's aggregate, not as a silent daemon_worker_cap rewrite. */
+/* Both user layers — an explicit CBM_MEM_BUDGET_MB and the durable
+ * index_memory_budget_mb config — are deliberate choices; a budget derived
+ * from RAM is not. */
+static bool mem_budget_source_is_explicit(const char *source) {
+    return source != NULL && (strcmp(source, "CBM_MEM_BUDGET_MB") == 0 ||
+                              strcmp(source, "config") == 0);
+}
+
+/* The parent already divided the aggregate budget (user override or
+ * ram_fraction) across job slots. That per-slot share is the hard cap:
+ * N workers × a per-worker absolute override would oversubscribe the host
+ * (#1654). A lower explicit value still wins. Keep the user's source label
+ * when it fired so the ceiling is visible as the user's aggregate, not as a
+ * silent daemon_worker_cap rewrite. */
+static cbm_mem_budget_t mem_apply_hard_cap(cbm_mem_budget_t result, size_t hard_cap_bytes) {
     if (hard_cap_bytes > 0 && (result.budget == 0 || result.budget > hard_cap_bytes)) {
-        bool explicit_override =
-            result.source != NULL && strcmp(result.source, "CBM_MEM_BUDGET_MB") == 0;
+        bool explicit_override = mem_budget_source_is_explicit(result.source);
         result.budget = hard_cap_bytes;
         if (!explicit_override) {
             result.source = "daemon_worker_cap";
         }
         result.hard_capped = true;
     }
+    return result;
+}
+
+cbm_mem_budget_t cbm_mem_resolve_budget_capped(size_t total_ram, double ram_fraction,
+                                               const char *budget_mb, size_t hard_cap_bytes) {
+    return mem_apply_hard_cap(cbm_mem_resolve_budget(total_ram, ram_fraction, budget_mb),
+                              hard_cap_bytes);
+}
+
+cbm_mem_budget_t cbm_mem_resolve_budget_layers(size_t total_ram, double ram_fraction,
+                                               const char *env_budget_mb,
+                                               size_t configured_budget_mb) {
+    cbm_mem_budget_t result;
+    bool env_invalid = false;
+    if (env_budget_mb != NULL && env_budget_mb[0] != '\0') {
+        result = cbm_mem_resolve_budget(total_ram, ram_fraction, env_budget_mb);
+        if (!result.invalid) {
+            return result;
+        }
+        /* A present-but-unparseable CBM_MEM_BUDGET_MB is a typo, not a
+         * deliberate choice: keep invalid=true so the caller warns, and fall
+         * through to the durable layer exactly like a missing value. */
+        env_invalid = true;
+    }
+    if (configured_budget_mb > 0) {
+        char configured[CBM_SZ_32];
+        (void)snprintf(configured, sizeof(configured), "%zu", configured_budget_mb);
+        result = cbm_mem_resolve_budget(total_ram, ram_fraction, configured);
+        result.source = "config";
+    } else {
+        result = cbm_mem_resolve_budget(total_ram, ram_fraction, NULL);
+    }
+    result.invalid = env_invalid;
     return result;
 }
 
@@ -446,13 +488,19 @@ void cbm_mem_init_with_cap(double ram_fraction, size_t hard_cap_bytes) {
      * (#363). Explicit override > implicit RAM/cgroup detection. The budget
      * math (fraction default, override, clamp-to-total) lives in the pure,
      * testable cbm_mem_resolve_budget(); this path only reads the env and
-     * emits the log/warn lines. */
+     * emits the log/warn lines.
+     *
+     * B1 adds the durable layer between the two: an explicit env value still
+     * wins, then the budget staged from _config.db (index_memory_budget_mb),
+     * then the RAM fraction. Both user layers are deliberate choices and skip
+     * the free-memory clamp below. */
     cbm_system_info_t info = cbm_system_info();
 
     char env_buf[CBM_SZ_32];
     const char *env = cbm_safe_getenv("CBM_MEM_BUDGET_MB", env_buf, sizeof(env_buf), NULL);
-    cbm_mem_budget_t resolved =
-        cbm_mem_resolve_budget_capped(info.total_ram, ram_fraction, env, hard_cap_bytes);
+    cbm_mem_budget_t resolved = mem_apply_hard_cap(
+        cbm_mem_resolve_budget_layers(info.total_ram, ram_fraction, env, g_configured_budget_mb),
+        hard_cap_bytes);
 
     /* A budget derived from total RAM is a plan made in ignorance of what the
      * machine is already doing. Clamp the DERIVED budget to what is actually
@@ -461,8 +509,7 @@ void cbm_mem_init_with_cap(double ram_fraction, size_t hard_cap_bytes) {
      * the failure it buys (the OS killing the worker) reads like a product bug
      * rather than a setting. */
     size_t available = cbm_system_available_ram();
-    bool explicit_budget =
-        resolved.source != NULL && strcmp(resolved.source, "CBM_MEM_BUDGET_MB") == 0;
+    bool explicit_budget = mem_budget_source_is_explicit(resolved.source);
     if (!explicit_budget) {
         size_t clamped = cbm_mem_clamp_to_available(resolved.budget, available);
         if (clamped < resolved.budget) {
@@ -486,15 +533,18 @@ void cbm_mem_init_with_cap(double ram_fraction, size_t hard_cap_bytes) {
                      "the budget is ever reached");
     }
     g_budget = resolved.budget;
+    g_budget_source = resolved.source != NULL ? resolved.source : "ram_fraction";
 
     /* The resolver is the single source of truth for the parse + clamp; this
      * path only surfaces its outcome as log lines. */
     if (resolved.invalid) {
-        cbm_log_warn("mem.budget.env.invalid", "value", env, "fallback", "ram_fraction");
+        cbm_log_warn("mem.budget.env.invalid", "value", env, "fallback", resolved.source);
     } else if (resolved.clamped) {
         char cap_mb[CBM_SZ_32];
+        char requested[CBM_SZ_32];
         snprintf(cap_mb, sizeof(cap_mb), "%zu", info.total_ram / MB_DIVISOR);
-        cbm_log_warn("mem.budget.clamped", "requested_mb", env, "cap_mb", cap_mb);
+        snprintf(requested, sizeof(requested), "%zu", g_configured_budget_mb);
+        cbm_log_warn("mem.budget.clamped", "requested_mb", env ? env : requested, "cap_mb", cap_mb);
     }
     if (resolved.hard_capped) {
         char cap_bytes[CBM_SZ_32];
@@ -576,6 +626,34 @@ size_t cbm_mem_budget(void) {
 
 void cbm_mem_set_budget_for_tests(size_t bytes) {
     g_budget = bytes;
+}
+
+void cbm_mem_reset_for_tests(void) {
+    g_configured_budget_mb = 0;
+    g_budget_source = "ram_fraction";
+    g_budget = 0;
+    atomic_store(&g_initialized, 0);
+}
+
+void cbm_mem_set_configured_budget_mb(size_t budget_mb) {
+    g_configured_budget_mb = budget_mb;
+}
+
+size_t cbm_mem_configured_budget_mb(void) {
+    return g_configured_budget_mb;
+}
+
+const char *cbm_mem_budget_source(void) {
+    if (g_budget_source == NULL) {
+        return "ram_fraction";
+    }
+    if (strcmp(g_budget_source, "CBM_MEM_BUDGET_MB") == 0) {
+        return "env";
+    }
+    if (strcmp(g_budget_source, "config") == 0) {
+        return "config";
+    }
+    return "ram_fraction";
 }
 
 size_t cbm_mem_allocator_committed(void) {

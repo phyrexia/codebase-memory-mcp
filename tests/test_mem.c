@@ -616,6 +616,123 @@ TEST(resolve_budget_override_overflow_total_unknown_caps) {
     PASS();
 }
 
+/* ── B1: budget layering — env > _config.db > ram_fraction ──────────
+ * cbm_mem_init is one-shot per process, so the layering is pinned twice: on
+ * the pure resolver (every branch), and on the real init path through
+ * cbm_mem_reset_for_tests (source attribution + the staged value surviving
+ * into cbm_mem_budget()). */
+
+TEST(resolve_budget_layers_env_over_config_over_fraction) {
+    size_t total = 8192 * CBM_TEST_MB;
+    size_t fraction_budget = 4096 * CBM_TEST_MB;
+
+    /* Nothing staged, nothing in env: the derived budget. */
+    cbm_mem_budget_t derived = cbm_mem_resolve_budget_layers(total, 0.5, NULL, 0);
+    ASSERT_EQ(derived.budget, fraction_budget);
+    ASSERT_STR_EQ(derived.source, "ram_fraction");
+    ASSERT_FALSE(derived.invalid);
+
+    /* The staged config budget is the user's deliberate choice, exactly like
+     * the env override it shadows. */
+    cbm_mem_budget_t configured = cbm_mem_resolve_budget_layers(total, 0.5, NULL, 1536);
+    ASSERT_EQ(configured.budget, 1536 * CBM_TEST_MB);
+    ASSERT_STR_EQ(configured.source, "config");
+    ASSERT_FALSE(configured.invalid);
+
+    /* An explicit env wins over the durable layer, in both directions. */
+    cbm_mem_budget_t env_below = cbm_mem_resolve_budget_layers(total, 0.5, "1024", 1536);
+    ASSERT_EQ(env_below.budget, 1024 * CBM_TEST_MB);
+    ASSERT_STR_EQ(env_below.source, "CBM_MEM_BUDGET_MB");
+    ASSERT_FALSE(env_below.invalid);
+    cbm_mem_budget_t env_above = cbm_mem_resolve_budget_layers(total, 0.5, "2048", 1536);
+    ASSERT_EQ(env_above.budget, 2048 * CBM_TEST_MB);
+    ASSERT_STR_EQ(env_above.source, "CBM_MEM_BUDGET_MB");
+
+    /* An empty env value is "not set", not an explicit choice. */
+    cbm_mem_budget_t empty_env = cbm_mem_resolve_budget_layers(total, 0.5, "", 1536);
+    ASSERT_EQ(empty_env.budget, 1536 * CBM_TEST_MB);
+    ASSERT_STR_EQ(empty_env.source, "config");
+
+    /* A typo in env warns (invalid=true) and falls through to the durable
+     * layer instead of dropping straight to the RAM fraction. */
+    cbm_mem_budget_t typo = cbm_mem_resolve_budget_layers(total, 0.5, "8GB", 1536);
+    ASSERT_EQ(typo.budget, 1536 * CBM_TEST_MB);
+    ASSERT_STR_EQ(typo.source, "config");
+    ASSERT_TRUE(typo.invalid);
+
+    /* No durable layer to fall through to: the typo lands on the fraction and
+     * keeps the warning. */
+    cbm_mem_budget_t typo_only = cbm_mem_resolve_budget_layers(total, 0.5, "8GB", 0);
+    ASSERT_EQ(typo_only.budget, fraction_budget);
+    ASSERT_STR_EQ(typo_only.source, "ram_fraction");
+    ASSERT_TRUE(typo_only.invalid);
+
+    /* A staged value beyond physical RAM clamps to total, like any override. */
+    cbm_mem_budget_t huge = cbm_mem_resolve_budget_layers(total, 0.5, NULL, 100000);
+    ASSERT_EQ(huge.budget, total);
+    ASSERT_TRUE(huge.clamped);
+    ASSERT_STR_EQ(huge.source, "config");
+    PASS();
+}
+
+TEST(mem_init_uses_staged_config_budget_and_reports_config_source) {
+    char *saved_env = NULL;
+    const char *prior = getenv("CBM_MEM_BUDGET_MB");
+    if (prior) {
+        saved_env = strdup(prior);
+    }
+    cbm_unsetenv("CBM_MEM_BUDGET_MB");
+
+    /* ADR §3.B test (1): seeded config, no env → the configured budget, and
+     * budget_source reports "config". */
+    cbm_mem_reset_for_tests();
+    cbm_mem_set_configured_budget_mb(1536);
+    cbm_mem_init(0.5);
+    ASSERT_EQ(cbm_mem_budget(), 1536 * CBM_TEST_MB);
+    ASSERT_STR_EQ(cbm_mem_budget_source(), "config");
+    ASSERT_EQ(cbm_mem_configured_budget_mb(), 1536);
+
+    /* Restore the state an ordinary cbm_mem_init(0.5) leaves behind. */
+    cbm_mem_reset_for_tests();
+    cbm_mem_set_configured_budget_mb(0);
+    cbm_mem_init(0.5);
+    ASSERT_STR_EQ(cbm_mem_budget_source(), "ram_fraction");
+
+    if (saved_env) {
+        cbm_setenv("CBM_MEM_BUDGET_MB", saved_env, 1);
+        free(saved_env);
+    }
+    PASS();
+}
+
+TEST(mem_init_env_beats_staged_config_budget) {
+    char *saved_env = NULL;
+    const char *prior = getenv("CBM_MEM_BUDGET_MB");
+    if (prior) {
+        saved_env = strdup(prior);
+    }
+    cbm_setenv("CBM_MEM_BUDGET_MB", "2048", 1);
+
+    /* ADR §3.B test (1), second half: with env present it wins and the source
+     * reports "env". */
+    cbm_mem_reset_for_tests();
+    cbm_mem_set_configured_budget_mb(1536);
+    cbm_mem_init(0.5);
+    ASSERT_EQ(cbm_mem_budget(), 2048 * CBM_TEST_MB);
+    ASSERT_STR_EQ(cbm_mem_budget_source(), "env");
+
+    cbm_mem_reset_for_tests();
+    cbm_mem_set_configured_budget_mb(0);
+    if (saved_env) {
+        cbm_setenv("CBM_MEM_BUDGET_MB", saved_env, 1);
+        free(saved_env);
+    } else {
+        cbm_unsetenv("CBM_MEM_BUDGET_MB");
+    }
+    cbm_mem_init(0.5);
+    PASS();
+}
+
 #undef CBM_TEST_MB
 
 /* ── Arena integration tests ──────────────────────────────────── */
@@ -1806,4 +1923,10 @@ SUITE(mem) {
     RUN_TEST(mem_system_available_ram_is_within_total);
     RUN_TEST(mem_system_under_pressure_is_a_pure_threshold);
     RUN_TEST(mem_over_budget_follows_the_charged_reading);
+    /* B1 layering last: these drive the real init path through
+     * cbm_mem_reset_for_tests() and restore the canonical 0.5-fraction state
+     * before returning. */
+    RUN_TEST(resolve_budget_layers_env_over_config_over_fraction);
+    RUN_TEST(mem_init_uses_staged_config_budget_and_reports_config_source);
+    RUN_TEST(mem_init_env_beats_staged_config_budget);
 }
