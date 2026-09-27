@@ -2543,6 +2543,21 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
             printf("  budget_source: unavailable\n");
             printf("  index_workers: unavailable\n");
         }
+        /* C8: the cap this generation admits, the layer that chose it, and the
+         * admission record kept since it started. A build-skew daemon answers
+         * with the frozen layout, where none of these exist. */
+        if (status.has_capacity_status) {
+            printf("  max_clients: %u\n", status.max_clients);
+            printf("  max_clients_source: %s\n",
+                   cbm_daemon_max_clients_source_name(status.max_clients_source));
+            printf("  connections_peak: %u\n", status.connections_peak);
+            printf("  capacity_rejected: %llu\n", (unsigned long long)status.capacity_rejected);
+        } else {
+            printf("  max_clients: unavailable\n");
+            printf("  max_clients_source: unavailable\n");
+            printf("  connections_peak: unavailable\n");
+            printf("  capacity_rejected: unavailable\n");
+        }
         if (status.stopping) {
             printf("  state: stopping\n");
         }

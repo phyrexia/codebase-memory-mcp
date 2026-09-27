@@ -246,6 +246,9 @@ struct cbm_daemon_runtime_service {
     bool permanent;
     /* B1: reported by `daemon status` (and logged by daemon.start). */
     cbm_daemon_runtime_budget_status_t budget_status;
+    /* C8: which layer of the precedence chain chose worker_capacity. Written
+     * once before the accept thread starts and reported by `daemon status`. */
+    cbm_daemon_max_clients_source_t max_clients_source;
 
     cbm_thread_t accept_thread;
     bool accept_thread_started;
@@ -1808,6 +1811,26 @@ static void runtime_worker_handle_status(cbm_daemon_runtime_worker_t *worker,
             response[129U] = (uint8_t)(workers >> 8);
             response[130U] = (uint8_t)(workers & 0xFFU);
             response[131U] = (uint8_t)budget.budget_source;
+            /* C8 connection capacity @132: u32 connections_peak, u64
+             * capacity_rejected, u32 max_clients, u8 max_clients_source. The
+             * admission record the cap keeps, so "was this cap ever hit?" is
+             * answerable from `daemon status` instead of by sampling the live
+             * count and mostly landing in a trough. */
+            uint64_t peak_raw = (uint64_t)service->peak_connections;
+            uint32_t peak = peak_raw > UINT32_MAX ? UINT32_MAX : (uint32_t)peak_raw;
+            for (size_t index = 0; index < 4U; index++) {
+                response[132U + index] = (uint8_t)(peak >> (24U - index * 8U));
+            }
+            uint64_t rejections = service->capacity_rejections;
+            for (size_t index = 0; index < 8U; index++) {
+                response[136U + index] = (uint8_t)(rejections >> (56U - index * 8U));
+            }
+            uint64_t capacity_raw = (uint64_t)service->worker_capacity;
+            uint32_t capacity = capacity_raw > UINT32_MAX ? UINT32_MAX : (uint32_t)capacity_raw;
+            for (size_t index = 0; index < 4U; index++) {
+                response[144U + index] = (uint8_t)(capacity >> (24U - index * 8U));
+            }
+            response[148U] = (uint8_t)service->max_clients_source;
             response_length = CBM_DAEMON_STATUS_RESPONSE_FULL_SIZE;
         }
         cbm_mutex_unlock(&service->mutex);
@@ -2664,6 +2687,7 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     service->application = config->application;
     service->permanent = config->permanent;
     service->budget_status = config->budget_status;
+    service->max_clients_source = config->max_clients_source;
     service->state = CBM_DAEMON_RUNTIME_SERVICE_STARTING;
 
     if (!service->workers || !service->coordinator || !service->conflict_log_path ||
@@ -2703,13 +2727,15 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     service->accept_thread_started = true;
     /* The cap in force, stated once at start. Peak and rejection lines later
      * in the log are only readable against it, and it is the first thing to
-     * check when a client reports being turned away. */
+     * check when a client reports being turned away. The source says whether
+     * the operator set it or the daemon settled on it. */
     char capacity_text[32];
     char hard_cap_text[32];
     (void)snprintf(capacity_text, sizeof(capacity_text), "%zu", service->worker_capacity);
     (void)snprintf(hard_cap_text, sizeof(hard_cap_text), "%d", RUNTIME_MAX_CLIENTS_HARD);
     cbm_log_info("daemon.runtime.capacity", "max_clients", capacity_text, "hard_cap",
-                 hard_cap_text);
+                 hard_cap_text, "max_clients_source",
+                 cbm_daemon_max_clients_source_name(service->max_clients_source));
     return service;
 }
 
@@ -3197,9 +3223,10 @@ bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint
     status_out->build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE - 1U] = '\0';
     memcpy(status_out->semantic_version, payload + 109U, sizeof(status_out->semantic_version));
     status_out->semantic_version[sizeof(status_out->semantic_version) - 1U] = '\0';
-    /* B1 snapshot: present only in the same-build (long) layout. A cross-build
-     * daemon answers with the frozen layout and these fields stay zeroed. */
-    if (payload_length >= CBM_DAEMON_STATUS_RESPONSE_FULL_SIZE) {
+    /* B1/C8 snapshot: each block is present only when the layout that carries
+     * it arrived. A cross-build daemon answers with the frozen layout and
+     * everything here stays zeroed. */
+    if (payload_length >= CBM_DAEMON_STATUS_RESPONSE_BUDGET_SIZE) {
         status_out->memory_budget_bytes = runtime_control_read_u64(payload + 121U);
         status_out->index_workers =
             (uint32_t)(((uint32_t)payload[129] << 8) | (uint32_t)payload[130]);
@@ -3208,6 +3235,16 @@ bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint
                 ? (cbm_daemon_budget_source_t)payload[131]
                 : CBM_DAEMON_BUDGET_SOURCE_RAM_FRACTION;
         status_out->has_budget_status = true;
+    }
+    if (payload_length >= CBM_DAEMON_STATUS_RESPONSE_FULL_SIZE) {
+        status_out->connections_peak = runtime_control_read_u32(payload + 132U);
+        status_out->capacity_rejected = runtime_control_read_u64(payload + 136U);
+        status_out->max_clients = runtime_control_read_u32(payload + 144U);
+        status_out->max_clients_source =
+            payload[148] <= (uint8_t)CBM_DAEMON_MAX_CLIENTS_SOURCE_ENV
+                ? (cbm_daemon_max_clients_source_t)payload[148]
+                : CBM_DAEMON_MAX_CLIENTS_SOURCE_DEFAULT;
+        status_out->has_capacity_status = true;
     }
     free(payload);
     return true;
