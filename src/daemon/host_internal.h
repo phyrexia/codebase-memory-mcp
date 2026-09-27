@@ -8,6 +8,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "foundation/limits.h"
+
 struct cbm_daemon_ipc_endpoint;
 
 typedef bool (*cbm_daemon_host_cleanup_release_for_test_fn)(void *context);
@@ -28,13 +30,20 @@ _Noreturn void cbm_daemon_host_force_terminate_for_test(const char *component);
  * verbatim so tests can make the runtime config database unavailable. */
 bool cbm_daemon_host_state_prepare_for_test(const struct cbm_daemon_ipc_endpoint *endpoint);
 
-/* ── B1: durable runtime knobs read before the memory ceiling is fixed ── */
+/* ── B1/C8: durable runtime knobs read before the memory ceiling is fixed ── */
 
 typedef struct {
     size_t configured_budget_mb; /* index_memory_budget_mb as stored; 0 = off */
     size_t index_workers;        /* effective pinned workers; 0 = auto */
     char index_workers_text[32]; /* "auto" | decimal — the daemon.start field */
     bool workers_exported;       /* this startup wrote CBM_WORKERS */
+    /* C8: the connection cap this generation admits and where it came from
+     * (explicit CBM_MAX_CLIENTS > max_clients in _config.db > the compiled
+     * default). Resolved once here so the descriptor limit is raised for the
+     * cap that will actually run, and `daemon status` reports it as settled
+     * rather than re-resolving this process's config and environment. */
+    uint32_t max_clients;
+    cbm_daemon_max_clients_source_t max_clients_source;
 } cbm_daemon_host_runtime_knobs_t;
 
 /* Observation hook fired at the instant the startup read opens _config.db, so
