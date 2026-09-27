@@ -1644,22 +1644,45 @@ bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out,
 }
 #endif
 
+/* Record the outcome of one pass. Every exit of ha_process states which of
+ * the three cases it is: an early exit that forgets would silently miscount
+ * daemon request metrics again. */
+static void ha_outcome_set(cbm_hook_augment_outcome_t *outcome, cbm_hook_augment_status_t status,
+                           const char *event) {
+    if (!outcome) {
+        return;
+    }
+    outcome->status = status;
+    outcome->event[0] = '\0';
+    if (event && event[0]) {
+        snprintf(outcome->event, sizeof(outcome->event), "%s", event);
+    }
+}
+
 static char *ha_process(cbm_mcp_server_t *srv, const char *input_json, const char *forced_event,
-                        ha_lifecycle_dialect_t dialect) {
+                        ha_lifecycle_dialect_t dialect, cbm_hook_augment_outcome_t *outcome) {
     if (!srv || !input_json) {
+        ha_outcome_set(outcome, CBM_HOOK_AUGMENT_ERROR, forced_event);
         return NULL;
     }
     if (strlen(input_json) > HA_STDIN_CAP) {
+        /* Dropped on purpose by policy: over-budget input is not a failure. */
+        ha_outcome_set(outcome, CBM_HOOK_AUGMENT_NOOP, forced_event);
         return NULL;
     }
     yyjson_doc *doc = yyjson_read(input_json, strlen(input_json), 0);
     if (!doc) {
+        ha_outcome_set(outcome, CBM_HOOK_AUGMENT_ERROR, forced_event);
         return NULL;
     }
     yyjson_val *root = yyjson_doc_get_root(doc);
+    /* Same resolution rule as the lifecycle builder below: the forced --event
+     * wins, else the event the payload names. */
+    const char *resolved_event = forced_event ? forced_event : ha_hook_event_name(root);
 
     char *lifecycle = ha_lifecycle_json_from_root(srv, root, forced_event, dialect);
     if (lifecycle) {
+        ha_outcome_set(outcome, CBM_HOOK_AUGMENT_OK, resolved_event);
         yyjson_doc_free(doc);
         return lifecycle;
     }
@@ -1667,6 +1690,8 @@ static char *ha_process(cbm_mcp_server_t *srv, const char *input_json, const cha
     const char *tool = ha_obj_str(root, "tool_name");
     bool coverage = false;
     if (!ha_tool_event_supported(dialect, event, tool, &coverage)) {
+        /* Event/tool pairs this binary never augments are the common case. */
+        ha_outcome_set(outcome, CBM_HOOK_AUGMENT_NOOP, resolved_event);
         yyjson_doc_free(doc);
         return NULL;
     }
@@ -1682,10 +1707,14 @@ static char *ha_process(cbm_mcp_server_t *srv, const char *input_json, const cha
             if (note) {
                 char *output = ha_build_event_json(event, note);
                 free(note);
+                ha_outcome_set(outcome, output ? CBM_HOOK_AUGMENT_OK : CBM_HOOK_AUGMENT_ERROR,
+                               resolved_event);
                 yyjson_doc_free(doc);
                 return output;
             }
         }
+        /* Nothing wrong with the read: nothing to warn about. */
+        ha_outcome_set(outcome, CBM_HOOK_AUGMENT_NOOP, resolved_event);
         yyjson_doc_free(doc);
         return NULL;
     }
@@ -1695,6 +1724,8 @@ static char *ha_process(cbm_mcp_server_t *srv, const char *input_json, const cha
     if (strcmp(tool, "Bash") == 0) {
         const char *cmd = ha_obj_str(tin, "command");
         if (!ha_parse_bash_search_pattern(cmd, bash_pattern, sizeof(bash_pattern))) {
+            /* Not a search command: nothing to look up. */
+            ha_outcome_set(outcome, CBM_HOOK_AUGMENT_NOOP, resolved_event);
             yyjson_doc_free(doc);
             return NULL;
         }
@@ -1704,6 +1735,8 @@ static char *ha_process(cbm_mcp_server_t *srv, const char *input_json, const cha
     }
     char token[HA_MAX_TOKEN + 1];
     if (!ha_extract_token(pattern, token, sizeof(token))) {
+        /* No queryable token: nothing to look up. */
+        ha_outcome_set(outcome, CBM_HOOK_AUGMENT_NOOP, resolved_event);
         yyjson_doc_free(doc);
         return NULL;
     }
@@ -1711,19 +1744,28 @@ static char *ha_process(cbm_mcp_server_t *srv, const char *input_json, const cha
     char cwdbuf[4096];
     const char *cwd = ha_normalized_cwd_with_server(root, srv, cwdbuf, sizeof(cwdbuf));
     if (!cwd) {
+        ha_outcome_set(outcome, CBM_HOOK_AUGMENT_ERROR, resolved_event);
         yyjson_doc_free(doc);
         return NULL;
     }
 
     char *ctx = ha_resolve_and_query(srv, cwd, token);
-    char *output = ctx ? ha_build_event_json(event, ctx) : NULL;
+    cbm_hook_augment_status_t status = CBM_HOOK_AUGMENT_NOOP;
+    char *output = NULL;
+    if (ctx) {
+        /* A token the graph knows must produce output; failing to build it is
+         * a real failure, while a token the graph lacks is a healthy no-op. */
+        output = ha_build_event_json(event, ctx);
+        status = output ? CBM_HOOK_AUGMENT_OK : CBM_HOOK_AUGMENT_ERROR;
+    }
     free(ctx);
+    ha_outcome_set(outcome, status, resolved_event);
     yyjson_doc_free(doc);
     return output;
 }
 
 char *cbm_hook_augment_process(cbm_mcp_server_t *srv, const char *input_json) {
-    return cbm_hook_augment_process_for(srv, input_json, NULL, NULL);
+    return cbm_hook_augment_process_for(srv, input_json, NULL, NULL, NULL);
 }
 
 bool cbm_hook_augment_invocation_supported(const char *forced_event, const char *dialect_name) {
@@ -1735,14 +1777,23 @@ bool cbm_hook_augment_invocation_supported(const char *forced_event, const char 
 }
 
 char *cbm_hook_augment_process_for(cbm_mcp_server_t *srv, const char *input_json,
-                                   const char *forced_event, const char *dialect_name) {
+                                   const char *forced_event, const char *dialect_name,
+                                   cbm_hook_augment_outcome_t *outcome) {
     ha_lifecycle_dialect_t dialect = HA_DIALECT_EVENT;
-    if (!srv || !input_json ||
-        (dialect_name && dialect_name[0] && !ha_dialect_from_name(dialect_name, &dialect)) ||
-        !ha_invocation_supported(dialect, forced_event)) {
+    if (!srv || !input_json) {
+        ha_outcome_set(outcome, CBM_HOOK_AUGMENT_ERROR, forced_event);
         return NULL;
     }
-    return ha_process(srv, input_json, forced_event, dialect);
+    if (dialect_name && dialect_name[0] && !ha_dialect_from_name(dialect_name, &dialect)) {
+        ha_outcome_set(outcome, CBM_HOOK_AUGMENT_ERROR, forced_event);
+        return NULL;
+    }
+    if (!ha_invocation_supported(dialect, forced_event)) {
+        /* An event/dialect pair with no augmentation for it: not a failure. */
+        ha_outcome_set(outcome, CBM_HOOK_AUGMENT_NOOP, forced_event);
+        return NULL;
+    }
+    return ha_process(srv, input_json, forced_event, dialect, outcome);
 }
 
 /* TRUE iff `input` is an un-forced PreToolUse Bash event whose command can
@@ -1809,7 +1860,7 @@ int cbm_cmd_hook_augment(int argc, char **argv) {
         return 0;
     }
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    char *output = srv ? ha_process(srv, input, forced_event, dialect) : NULL;
+    char *output = srv ? ha_process(srv, input, forced_event, dialect, NULL) : NULL;
     if (output) {
         fputs(output, stdout);
     }

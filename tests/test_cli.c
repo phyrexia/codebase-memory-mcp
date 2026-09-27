@@ -12235,6 +12235,99 @@ TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter) {
     PASS();
 }
 
+/* C1: daemon request metrics classify hook traffic from this outcome. A NULL
+ * output alone cannot tell "nothing to augment" (the overwhelming majority of
+ * hook traffic) from a failed pass, so each early exit states which it is. */
+TEST(cli_hook_augment_outcome_noop_is_not_an_error) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_hook_augment_outcome_t outcome;
+
+    /* A Bash call that is not a search. */
+    char *output = cbm_hook_augment_process_for(
+        srv, "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\","
+             "\"tool_input\":{\"command\":\"ls -la\"}}",
+        NULL, NULL, &outcome);
+    bool bash_noop = output == NULL && outcome.status == CBM_HOOK_AUGMENT_NOOP;
+    free(output);
+
+    /* A tool this binary never augments. */
+    output = cbm_hook_augment_process_for(
+        srv, "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Write\","
+             "\"tool_input\":{\"file_path\":\"/tmp/x\"}}",
+        NULL, NULL, &outcome);
+    bool tool_noop = output == NULL && outcome.status == CBM_HOOK_AUGMENT_NOOP;
+    free(output);
+
+    /* An event/dialect pair with no augmentation for it. */
+    output = cbm_hook_augment_process_for(srv, "{}", "PostToolUse", "copilot", &outcome);
+    bool event_noop = output == NULL && outcome.status == CBM_HOOK_AUGMENT_NOOP;
+    free(output);
+
+    /* Payloads over the hook stdin budget are dropped on purpose, not failed. */
+    char *oversized = (char *)malloc(256 * 1024 + 16);
+    ASSERT_NOT_NULL(oversized);
+    memset(oversized, 'x', 256 * 1024 + 15);
+    oversized[256 * 1024 + 15] = '\0';
+    output = cbm_hook_augment_process_for(srv, oversized, NULL, NULL, &outcome);
+    bool oversize_noop = output == NULL && outcome.status == CBM_HOOK_AUGMENT_NOOP;
+    free(output);
+    free(oversized);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(bash_noop);
+    ASSERT_TRUE(tool_noop);
+    ASSERT_TRUE(event_noop);
+    ASSERT_TRUE(oversize_noop);
+    PASS();
+}
+
+TEST(cli_hook_augment_outcome_reports_error_and_real_event) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_hook_augment_outcome_t outcome;
+
+    /* Unreadable input JSON is a real failure, not "nothing to augment". */
+    char *output = cbm_hook_augment_process_for(srv, "{\"cwd\":", NULL, NULL, &outcome);
+    bool unreadable = output == NULL && outcome.status == CBM_HOOK_AUGMENT_ERROR;
+    free(output);
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    char *project = cbm_project_name_from_path("/tmp/hookproj");
+    ASSERT_NOT_NULL(project);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, "/tmp/hookproj");
+    char qualified_name[256];
+    snprintf(qualified_name, sizeof(qualified_name), "%s.mod.someIndexedSymbol", project);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "someIndexedSymbol",
+                       .qualified_name = qualified_name,
+                       .file_path = "mod.py",
+                       .start_line = 1,
+                       .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    const char *input = "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\","
+                        "\"cwd\":\"/tmp/hookproj\",\"tool_input\":{"
+                        "\"command\":\"rg -n someIndexedSymbol .\"}}";
+    output = cbm_hook_augment_process_for(srv, input, NULL, NULL, &outcome);
+    bool augmented = output != NULL && strstr(output, "someIndexedSymbol") != NULL &&
+                     outcome.status == CBM_HOOK_AUGMENT_OK;
+    /* The event that fired travels with the outcome so daemon metrics can
+     * name the request instead of filing everything under "hook". */
+    bool event_named = strcmp(outcome.event, "PreToolUse") == 0;
+    free(output);
+    cbm_mcp_server_free(srv);
+    free(project);
+
+    ASSERT_TRUE(unreadable);
+    ASSERT_TRUE(augmented);
+    ASSERT_TRUE(event_named);
+    PASS();
+}
+
 TEST(cli_hook_augment_bash_pattern_extractor) {
     char out[256];
 
@@ -16629,6 +16722,8 @@ SUITE(cli) {
 #endif
     RUN_TEST(cli_hook_augment_context_tracks_search_json_shape);
     RUN_TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter);
+    RUN_TEST(cli_hook_augment_outcome_noop_is_not_an_error);
+    RUN_TEST(cli_hook_augment_outcome_reports_error_and_real_event);
     RUN_TEST(cli_hook_augment_bash_pattern_extractor);
     RUN_TEST(cli_hook_augment_coverage_requests_machine_json);
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);

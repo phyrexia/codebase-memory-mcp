@@ -615,8 +615,29 @@ char *cbm_hook_augment_process(cbm_mcp_server_t *srv, const char *input_json);
  * may be NULL for the ordinary event dialect. Unsupported combinations fail
  * open with NULL, matching the direct hook command. */
 bool cbm_hook_augment_invocation_supported(const char *forced_event, const char *dialect_name);
+
+/* What one hook-augment pass produced. NULL output alone cannot tell a
+ * healthy "nothing to augment" (the common case) from a failed pass, and
+ * daemon request metrics must count only the latter as an error. */
+typedef enum {
+    CBM_HOOK_AUGMENT_OK = 0, /* produced augmentation output */
+    CBM_HOOK_AUGMENT_NOOP,   /* served request with nothing to augment */
+    CBM_HOOK_AUGMENT_ERROR,  /* malformed input or unresolvable context */
+} cbm_hook_augment_status_t;
+
+enum { CBM_HOOK_AUGMENT_EVENT_CAP = 48 };
+
+/* `event` carries the hook event the pass resolved (forced --event wins, the
+ * same rule the lifecycle builder uses), empty when the payload names none —
+ * so callers can record the event that fired instead of a generic label. */
+typedef struct {
+    cbm_hook_augment_status_t status;
+    char event[CBM_HOOK_AUGMENT_EVENT_CAP];
+} cbm_hook_augment_outcome_t;
+
 char *cbm_hook_augment_process_for(cbm_mcp_server_t *srv, const char *input_json,
-                                   const char *forced_event, const char *dialect_name);
+                                   const char *forced_event, const char *dialect_name,
+                                   cbm_hook_augment_outcome_t *outcome);
 
 /* True for an absolute path the augmenter can walk up: POSIX "/..." or a
  * Windows drive root — "X:/..." or a bare "X:" (callers normalize '\\' to '/'

@@ -2779,8 +2779,9 @@ static cbm_daemon_runtime_application_status_t application_request_dispatch(
             return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
         }
         uint64_t hook_t0_ms = cbm_now_ms();
+        cbm_hook_augment_outcome_t outcome = {.status = CBM_HOOK_AUGMENT_ERROR};
         char *response = cbm_hook_augment_process_for(session->mcp, input, session->hook_event,
-                                                      session->hook_dialect);
+                                                      session->hook_dialect, &outcome);
         /* hook_event is an optional heap string: SET_CONTEXT leaves it NULL when
          * the client sends no event (Claude Code's PreToolUse augment does), so
          * it must be NULL-checked before indexing. Reading [0] off NULL segfaulted
@@ -2791,7 +2792,8 @@ static cbm_daemon_runtime_application_status_t application_request_dispatch(
         const char *hook_project = cbm_mcp_server_session_project(session->mcp);
         cbm_daemon_application_metrics_record(application, "hook", hook_metric_name,
                                               hook_project ? hook_project : "",
-                                              (cbm_now_ms() - hook_t0_ms) * 1000, response == NULL);
+                                              (cbm_now_ms() - hook_t0_ms) * 1000,
+                                              outcome.status == CBM_HOOK_AUGMENT_ERROR);
         free(input);
         if (response) {
             size_t response_length = strlen(response);
