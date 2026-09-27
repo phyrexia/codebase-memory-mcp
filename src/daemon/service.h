@@ -58,7 +58,11 @@ typedef struct {
 bool cbm_daemon_rendezvous_key(char out[CBM_DAEMON_KEY_SIZE]);
 
 /* SHA-256 of the exact executable bytes, encoded as 64 lowercase hex
- * characters plus NUL. This is captured once at process startup. */
+ * characters plus NUL. This is captured once at process startup. With
+ * build_fingerprint_cache=true the hash may be served from a sidecar that was
+ * validated against the executable's (device, inode, size, mtime_ns) identity;
+ * the SHA-256 remains the value compared between peers — the cache only
+ * skips recomputing it. */
 bool cbm_daemon_build_fingerprint_file(const char *path,
                                        char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 

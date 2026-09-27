@@ -7544,6 +7544,37 @@ size_t cbm_config_max_index_jobs(cbm_config_t *cfg) {
     return result;
 }
 
+bool cbm_config_build_fingerprint_cache(cbm_config_t *cfg) {
+    if (!cfg) {
+        return false;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cfg->db, "SELECT value FROM config WHERE key = ?", SQL_NUL_TERM, &stmt,
+                           NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, SQL_PARAM_1, CBM_CONFIG_BUILD_FINGERPRINT_CACHE, SQL_NUL_TERM,
+                      cbm_sqlite_transient);
+
+    bool result = false;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        /* Compare raw bytes by length: a SQLite TEXT value can carry an
+         * embedded NUL, so strlen-style comparison would happily accept
+         * "true\0junk". Only the exact stored bytes "true" enable the cache;
+         * "false" and every malformed spelling (empty, "TRUE", "true ",
+         * "1", "on", truncated, overlong, embedded NUL) fall through to the
+         * fail-closed default: caching off. */
+        const unsigned char *value = sqlite3_column_text(stmt, 0);
+        int value_bytes = sqlite3_column_bytes(stmt, 0);
+        if (value && value_bytes == 4 && memcmp(value, "true", 4) == 0) {
+            result = true;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
 bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t *policy,
                                   char *error, size_t error_size) {
     if (!cfg || !policy) {
@@ -7587,6 +7618,8 @@ static const config_key_def_t CONFIG_KEYS[] = {
      "Run the background watcher thread (auto-reindex); false to disable"},
     {CBM_CONFIG_MAX_INDEX_JOBS, "2",
      "Maximum concurrent physical index jobs (1-16; invalid values use 2)"},
+    {CBM_CONFIG_BUILD_FINGERPRINT_CACHE, "false",
+     "Cache the executable SHA-256 by (dev, ino, size, mtime); true rehashes only on change"},
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
@@ -7778,6 +7811,14 @@ int cbm_cmd_config(int argc, char **argv) {
             } else {
                 rc = CLI_TRUE;
             }
+        } else if (strcmp(argv[CLI_SKIP_ONE], CBM_CONFIG_BUILD_FINGERPRINT_CACHE) == 0 &&
+                   strcmp(argv[CLI_PAIR_LEN], "true") != 0 &&
+                   strcmp(argv[CLI_PAIR_LEN], "false") != 0) {
+            /* Strict on write, mirroring the strict reader's exact "true" /
+             * "false" vocabulary: a value the reader would silently turn off
+             * must not be accepted into the store as if it were valid. */
+            (void)fprintf(stderr, "error: %s must be true or false\n", argv[CLI_SKIP_ONE]);
+            rc = CLI_TRUE;
         } else {
             int set_rc =
                 config_key_is_index_policy(argv[CLI_SKIP_ONE])

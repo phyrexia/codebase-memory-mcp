@@ -473,6 +473,7 @@ bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t
 #define CBM_CONFIG_MAX_INDEX_JOBS_DEFAULT 2U
 #define CBM_CONFIG_MAX_INDEX_JOBS_MIN 1U
 #define CBM_CONFIG_MAX_INDEX_JOBS_MAX 16U
+#define CBM_CONFIG_BUILD_FINGERPRINT_CACHE "build_fingerprint_cache"
 /* #1558: the graph UI's loopback listener. Stored in the UI config file rather
  * than the key-value store, but surfaced through `config` so it is findable. */
 #define CBM_CONFIG_UI_ENABLED "ui_enabled"
@@ -491,6 +492,13 @@ bool cbm_config_watcher_enabled(cbm_config_t *cfg);
  * digits whose value is in 1..16 are accepted. Missing or malformed values
  * return 2. Read by the daemon host once per generation. */
 size_t cbm_config_max_index_jobs(cbm_config_t *cfg);
+
+/* Strict build-fingerprint cache opt-in (default false). Only the exact stored
+ * bytes "true" and "false" are accepted — compared by byte length so a TEXT
+ * value with an embedded NUL cannot sneak past — and every other value (empty,
+ * other spellings, trailing bytes, truncated or overlong text) fails closed to
+ * false: a malformed value can never enable caching. NULL-safe (false). */
+bool cbm_config_build_fingerprint_cache(cbm_config_t *cfg);
 
 /* ── Binary activation safety ─────────────────────────────────── */
 
