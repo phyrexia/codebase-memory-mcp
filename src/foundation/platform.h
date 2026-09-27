@@ -131,6 +131,12 @@ size_t cbm_fs_free_bytes(const char *path);
  * initial=false: max(1, perf_cores-1) (leave headroom for user apps) */
 int cbm_default_worker_count(bool initial);
 
+/* Upper bound of the CBM_WORKERS env override, as enforced by
+ * cbm_default_worker_count. Exported so the daemon's index_workers layer can
+ * tell whether an inherited CBM_WORKERS is a value the workers will actually
+ * honor. */
+#define CBM_WORKERS_MAX 256
+
 /* ── Environment variables ──────────────────────────────────────── */
 
 /* Thread-safe getenv: copies the value into a caller-provided buffer.

@@ -13,6 +13,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
+#include "foundation/constants.h"
 #include "foundation/diagnostics.h"
 #include "foundation/log.h"
 #include "foundation/mem.h"
@@ -603,7 +604,106 @@ static void host_state_free(host_state_t *host) {
     cbm_secure_zero(host->ui_readiness_secret, sizeof(host->ui_readiness_secret));
 }
 
-static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint_t *endpoint) {
+/* ── B1: durable runtime knobs, read before the memory ceiling is fixed ──
+ *
+ * cbm_mem_init_with_cap resolves the memory ceiling exactly once, so the
+ * config layer (index_memory_budget_mb) has to be staged BEFORE it runs. The
+ * order in cbm_daemon_host_run is therefore: cbm_alloc_init (first statement
+ * of main, which binds SQLite to mimalloc) → cohort/IPC/lifetime → this
+ * read → cbm_mem_init_with_cap → host_state_prepare (which reuses the handle
+ * opened here). Opening _config.db on this side of the ceiling is safe and
+ * accounted: every SQLite allocation goes through cbm_sqlite_malloc and is
+ * charged to the budget by cbm_mem_charged() regardless of when it happened. */
+
+static cbm_daemon_host_config_open_probe_fn g_host_config_open_probe;
+static void *g_host_config_open_probe_context;
+
+void cbm_daemon_host_set_config_open_probe_for_test(cbm_daemon_host_config_open_probe_fn probe,
+                                                    void *context) {
+    g_host_config_open_probe = probe;
+    g_host_config_open_probe_context = context;
+}
+
+static bool host_runtime_knobs_load(cbm_daemon_host_runtime_knobs_t *knobs,
+                                    cbm_config_t **config_out) {
+    if (!knobs || !config_out) {
+        return false;
+    }
+    *config_out = NULL;
+    memset(knobs, 0, sizeof(*knobs));
+    (void)snprintf(knobs->index_workers_text, sizeof(knobs->index_workers_text), "auto");
+
+    const char *cache = cbm_resolve_cache_dir();
+    if (!cache || !cache[0]) {
+        cbm_log_error("daemon.runtime_config_open_failed", "reason", "cache_dir_unavailable");
+        return false;
+    }
+    if (g_host_config_open_probe != NULL) {
+        g_host_config_open_probe(g_host_config_open_probe_context);
+    }
+    cbm_config_t *config = cbm_config_open(cache);
+    if (!config) {
+        cbm_log_error("daemon.runtime_config_open_failed", "reason", "config_db_unavailable");
+        return false;
+    }
+
+    /* Memory: staged for the resolver (explicit CBM_MEM_BUDGET_MB still wins;
+     * see cbm_mem_resolve_budget_layers). */
+    knobs->configured_budget_mb = cbm_config_index_memory_budget_mb(config);
+    cbm_mem_set_configured_budget_mb(knobs->configured_budget_mb);
+
+    /* Workers: every index worker reads CBM_WORKERS from its own environment
+     * and inherits the daemon's, so the daemon pins it here. An existing
+     * CBM_WORKERS is the user's explicit choice and is never overwritten
+     * (cbm_setenv with overwrite=0), exactly as an explicit CBM_MEM_BUDGET_MB
+     * outranks index_memory_budget_mb. */
+    char env_buf[CBM_SZ_32];
+    size_t workers = cbm_config_index_workers(config);
+    const char *env_workers = cbm_safe_getenv("CBM_WORKERS", env_buf, sizeof(env_buf), NULL);
+    if (workers > 0 && env_workers == NULL) {
+        char text[CBM_SZ_32];
+        (void)snprintf(text, sizeof(text), "%zu", workers);
+        knobs->workers_exported = cbm_setenv("CBM_WORKERS", text, 0) == 0;
+        env_workers = cbm_safe_getenv("CBM_WORKERS", env_buf, sizeof(env_buf), NULL);
+    }
+
+    /* What is reported is what the workers will read back: an inherited
+     * CBM_WORKERS in cbm_default_worker_count's accepted range pins them, and
+     * everything else (unset, malformed, out of range) is auto-detection —
+     * the same fallback the workers themselves take. The parse deliberately
+     * mirrors cbm_default_worker_count (strtol, 1..CBM_WORKERS_MAX, lenient
+     * about trailing garbage) so this never reports a value the workers would
+     * not use. */
+    if (env_workers != NULL) {
+        long parsed = strtol(env_workers, NULL, 10);
+        if (parsed >= 1 && parsed <= CBM_WORKERS_MAX) {
+            knobs->index_workers = (size_t)parsed;
+            (void)snprintf(knobs->index_workers_text, sizeof(knobs->index_workers_text), "%ld",
+                           parsed);
+        }
+    }
+    *config_out = config;
+    return true;
+}
+
+bool cbm_daemon_host_runtime_knobs_load_for_test(cbm_daemon_host_runtime_knobs_t *knobs) {
+    cbm_config_t *config = NULL;
+    cbm_daemon_host_runtime_knobs_t loaded = {0};
+    bool loaded_ok = host_runtime_knobs_load(&loaded, &config);
+    if (loaded_ok && knobs != NULL) {
+        *knobs = loaded;
+    }
+    cbm_config_close(config);
+    return loaded_ok;
+}
+
+static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint_t *endpoint,
+                               cbm_config_t *runtime_config) {
+    /* Takes ownership of `runtime_config` from the first statement, so every
+     * failure path frees it through host_state_free. NULL means "open it here"
+     * (the focused test seam); the production path hands over the handle that
+     * the B1 startup read opened before the memory ceiling was fixed. */
+    host->runtime_config = runtime_config;
     host->http_ops = &g_host_http_default_ops;
     host->http_assets_available = CBM_EMBEDDED_FILE_COUNT > 0;
     if (!cbm_secure_random(host->ui_readiness_secret, sizeof(host->ui_readiness_secret))) {
@@ -611,15 +711,17 @@ static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint
         return false;
     }
     size_t aggregate_memory_budget_bytes = cbm_mem_budget();
-    const char *cache = cbm_resolve_cache_dir();
-    if (!cache || !cache[0]) {
-        cbm_log_error("daemon.runtime_config_open_failed", "reason", "cache_dir_unavailable");
-        return false;
-    }
-    host->runtime_config = cbm_config_open(cache);
     if (!host->runtime_config) {
-        cbm_log_error("daemon.runtime_config_open_failed", "reason", "config_db_unavailable");
-        return false;
+        const char *cache = cbm_resolve_cache_dir();
+        if (!cache || !cache[0]) {
+            cbm_log_error("daemon.runtime_config_open_failed", "reason", "cache_dir_unavailable");
+            return false;
+        }
+        host->runtime_config = cbm_config_open(cache);
+        if (!host->runtime_config) {
+            cbm_log_error("daemon.runtime_config_open_failed", "reason", "config_db_unavailable");
+            return false;
+        }
     }
     size_t max_index_jobs = cbm_config_max_index_jobs(host->runtime_config);
     host->project_locks = cbm_project_lock_manager_new(endpoint);
@@ -667,7 +769,7 @@ bool cbm_daemon_host_state_prepare_for_test(const cbm_daemon_ipc_endpoint_t *end
         return false;
     }
     host_state_t host = {0};
-    bool prepared = host_state_prepare(&host, endpoint);
+    bool prepared = host_state_prepare(&host, endpoint, NULL);
     host_state_free(&host);
     return prepared;
 }
@@ -1064,13 +1166,27 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
         host_log_close();
         return -1;
     }
+    /* B1: read the durable runtime knobs BEFORE the ceiling is fixed —
+     * cbm_mem_init resolves the budget once, with the config layer staged by
+     * this read (explicit CBM_MEM_BUDGET_MB still wins over it). The handle it
+     * opens is reused below for watcher_enabled/max_index_jobs. */
+    cbm_daemon_host_runtime_knobs_t knobs = {0};
+    cbm_config_t *runtime_config = NULL;
+    if (!host_runtime_knobs_load(&knobs, &runtime_config)) {
+        cbm_log_error("daemon.start_failed", "component", "application");
+        host_log_close();
+        cbm_daemon_ipc_lifetime_reservation_release(lifetime_reservation);
+        host_participant_guard_close(&participant_guard);
+        host_cohort_close(&cohort_lease, &cohort_manager);
+        return -1;
+    }
     cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
     cbm_http_server_set_binary_path(config->executable_path);
     cbm_index_supervisor_mark_host();
 
     host_state_t host = {0};
     host.permanent = config->permanent;
-    if (!host_state_prepare(&host, config->endpoint)) {
+    if (!host_state_prepare(&host, config->endpoint, runtime_config)) {
         cbm_log_error("daemon.start_failed", "component", "application");
         host_state_free(&host);
         host_log_close();
@@ -1150,7 +1266,8 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
                  config->identity.cache_fingerprint ? config->identity.cache_fingerprint
                                                     : "unavailable",
                  "memory_budget_bytes", memory_budget, "physical_job_limit", physical_job_limit,
-                 "worker_memory_budget_bytes", worker_memory_budget);
+                 "worker_memory_budget_bytes", worker_memory_budget, "budget_source",
+                 cbm_mem_budget_source(), "index_workers", knobs.index_workers_text);
     if (!host_wait_for_lifetime(service, config->stop_requested, &host, config->permanent)) {
         host_force_terminate("runtime");
     }
