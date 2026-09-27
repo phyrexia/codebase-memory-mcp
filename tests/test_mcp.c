@@ -22,6 +22,7 @@
 #include <mcp/mcp_internal.h>
 #include <pipeline/pipeline.h>
 #include <store/store.h>
+#include <store/project_registry.h>
 #include <watcher/watcher.h>
 #include <yyjson/yyjson.h>
 #include <ctype.h>
@@ -5423,8 +5424,7 @@ TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct) {
 
 /* The stored project root is dynamic identity, not a display-sized field.
  * Keep a syntactically valid segmented path beyond 1 KiB intact in both wire
- * encodings; the default detail also routes that same value through branch
- * discovery before emission. */
+ * encodings. */
 TEST(tool_list_projects_preserves_root_beyond_one_kib) {
     char cache[256];
     snprintf(cache, sizeof(cache), "%s/cbm-list-long-root-XXXXXX", cbm_tmpdir());
@@ -5503,6 +5503,347 @@ TEST(tool_list_projects_preserves_root_beyond_one_kib) {
     cleanup_project_db(cache, db_file);
     cbm_rmdir(cache);
     free(long_root);
+    PASS();
+}
+
+/* C5 fixture: a project DB carrying exactly the `projects` schema ff3b9f27
+ * shipped — no node_count/edge_count — plus nodes/edges rows to count. Built
+ * with raw SQL, so no writable open of the new binary can migrate it before
+ * the test asks for that step. */
+static bool c5_make_pre_count_columns_db(const char *dir, const char *filename, const char *project,
+                                         const char *root, int nodes, int edges) {
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s", dir, filename);
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK) {
+        if (db) {
+            sqlite3_close(db);
+        }
+        return false;
+    }
+    const char *ddl =
+        "CREATE TABLE projects(name TEXT PRIMARY KEY,indexed_at TEXT NOT NULL,"
+        "root_path TEXT NOT NULL);"
+        "CREATE TABLE nodes(id INTEGER PRIMARY KEY AUTOINCREMENT,project TEXT NOT NULL,"
+        "label TEXT NOT NULL,name TEXT NOT NULL,qualified_name TEXT NOT NULL,"
+        "file_path TEXT DEFAULT '',start_line INTEGER DEFAULT 0,end_line INTEGER DEFAULT 0,"
+        "properties TEXT DEFAULT '{}',UNIQUE(project,qualified_name));"
+        "CREATE TABLE edges(id INTEGER PRIMARY KEY AUTOINCREMENT,project TEXT NOT NULL,"
+        "source_id INTEGER NOT NULL,target_id INTEGER NOT NULL,type TEXT NOT NULL,"
+        "properties TEXT DEFAULT '{}',"
+        "url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),"
+        "local_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS'"
+        " THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),"
+        "UNIQUE(source_id,target_id,type,local_name_gen));";
+    bool ok = sqlite3_exec(db, ddl, NULL, NULL, NULL) == SQLITE_OK;
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "INSERT INTO projects(name,indexed_at,root_path) VALUES('%s',"
+             "'2026-09-27T00:00:00Z','%s');",
+             project, root);
+    ok = ok && sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
+    for (int i = 0; i < nodes && ok; i++) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO nodes(project,label,name,qualified_name) "
+                 "VALUES('%s','Function','fn%d','%s.fn%d');",
+                 project, i, project, i);
+        ok = sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
+    }
+    for (int i = 0; i < edges && ok; i++) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO edges(project,source_id,target_id,type) VALUES('%s',1,%d,'CALLS');",
+                 project, i + 2);
+        ok = sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
+    }
+    sqlite3_close(db);
+    return ok;
+}
+
+/* One list_projects call as JSON, parsed. Caller frees the doc. */
+static yyjson_doc *c5_list_projects_json(cbm_mcp_server_t *srv, const char *args) {
+    char *response = cbm_mcp_handle_tool(srv, "list_projects", args);
+    char *text = response ? extract_text_content(response) : NULL;
+    yyjson_doc *doc = text ? yyjson_read(text, strlen(text), 0) : NULL;
+    free(text);
+    free(response);
+    return doc;
+}
+
+static yyjson_val *c5_first_project(yyjson_doc *doc) {
+    yyjson_val *projects = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "projects") : NULL;
+    return projects ? yyjson_arr_get_first(projects) : NULL;
+}
+
+/* C5 (mandatory): a DB whose `projects` table predates node_count/edge_count,
+ * opened READ-ONLY by the new binary, must answer list_projects with and
+ * without include_details and report `stats_source: computed`; a writable open
+ * migrates it (columns exist but are NULL -> still computed); a publish stamps
+ * the totals and the next listing serves them as `stored`. The schema probe
+ * runs once per DB generation, never once per call. */
+TEST(tool_list_projects_legacy_counts_fall_back_and_store_on_publish) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-c5-counts-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "legacy-c5";
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/legacy-c5.db", cache);
+    ASSERT_TRUE(c5_make_pre_count_columns_db(cache, "legacy-c5.db", project, "/tmp/legacy-c5", 3, 2));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_projects_count_column_probes_reset_for_test();
+
+    /* (1) Read-only legacy file: both projections answer and report computed. */
+    yyjson_doc *doc = c5_list_projects_json(srv, "{\"limit\":50,\"format\":\"json\"}");
+    yyjson_val *first = c5_first_project(doc);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(yyjson_obj_get(first, "name"));
+    ASSERT_NULL(yyjson_obj_get(first, "nodes")); /* lean projection stays lean */
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "stats_source")), "computed");
+    yyjson_doc_free(doc);
+
+    doc = c5_list_projects_json(
+        srv, "{\"limit\":50,\"format\":\"json\",\"include_details\":true}");
+    first = c5_first_project(doc);
+    ASSERT_NOT_NULL(first);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "stats_source")), "computed");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(first, "nodes")), 3);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(first, "edges")), 2);
+    yyjson_doc_free(doc);
+    ASSERT_EQ(cbm_store_projects_count_column_probes_for_test(), 1);
+
+    /* (2) Warm listing: identity and counts come from the registry. */
+    for (int round = 0; round < 2; round++) {
+        doc = c5_list_projects_json(
+            srv, "{\"limit\":50,\"format\":\"json\",\"include_details\":true}");
+        first = c5_first_project(doc);
+        ASSERT_NOT_NULL(first);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "stats_source")), "computed");
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(first, "nodes")), 3);
+        yyjson_doc_free(doc);
+    }
+    ASSERT_EQ(cbm_store_projects_count_column_probes_for_test(), 1);
+
+    /* (3) A writable open runs the migration: the columns exist but are NULL,
+     * which still means "unknown" and still falls back to COUNT(*). */
+    cbm_store_t *writable = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(writable);
+    cbm_store_close(writable);
+    doc = c5_list_projects_json(
+        srv, "{\"limit\":50,\"format\":\"json\",\"include_details\":true}");
+    first = c5_first_project(doc);
+    ASSERT_NOT_NULL(first);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "stats_source")), "computed");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(first, "nodes")), 3);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(first, "edges")), 2);
+    yyjson_doc_free(doc);
+    ASSERT_EQ(cbm_store_projects_count_column_probes_for_test(), 2); /* new generation */
+
+    /* (4) Publishing stamps the totals: stored, and equal to COUNT(*). */
+    writable = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(writable);
+    ASSERT_EQ(cbm_store_persist_project_counts(writable, project), CBM_STORE_OK);
+    cbm_store_close(writable);
+    doc = c5_list_projects_json(
+        srv, "{\"limit\":50,\"format\":\"json\",\"include_details\":true}");
+    first = c5_first_project(doc);
+    ASSERT_NOT_NULL(first);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "stats_source")), "stored");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(first, "nodes")), 3);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(first, "edges")), 2);
+    yyjson_doc_free(doc);
+    ASSERT_EQ(cbm_store_projects_count_column_probes_for_test(), 3);
+
+    /* metadata_only stays the upstream-minimal projection. */
+    doc = c5_list_projects_json(srv, "{\"limit\":50,\"format\":\"json\",\"metadata_only\":true}");
+    first = c5_first_project(doc);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(yyjson_obj_get(first, "name"));
+    ASSERT_NOT_NULL(yyjson_obj_get(first, "root_path"));
+    ASSERT_NULL(yyjson_obj_get(first, "stats_source"));
+    ASSERT_NULL(yyjson_obj_get(first, "nodes"));
+    yyjson_doc_free(doc);
+
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_unlink(db_path);
+    cbm_rmdir(cache);
+    PASS();
+}
+
+/* C5: identity is read once per (size, mtime) generation and re-read when the
+ * file changes or a publish invalidates the entry. */
+TEST(tool_list_projects_registry_reuses_identity_until_generation_changes) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-c5-registry-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/registry-c5.db", cache);
+    ASSERT_TRUE(c5_make_pre_count_columns_db(cache, "registry-c5.db", "registry-c5",
+                                             "/tmp/registry-c5", 2, 1));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_projects_count_column_probes_reset_for_test();
+
+    yyjson_doc *doc = c5_list_projects_json(srv, "{\"limit\":50,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(c5_first_project(doc));
+    yyjson_doc_free(doc);
+    ASSERT_EQ(cbm_store_projects_count_column_probes_for_test(), 1);
+
+    doc = c5_list_projects_json(srv, "{\"limit\":50,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(c5_first_project(doc));
+    yyjson_doc_free(doc);
+    ASSERT_EQ(cbm_store_projects_count_column_probes_for_test(), 1);
+
+    /* (size, mtime) invalidation: a rewritten file is a new generation. */
+    cbm_store_t *writable = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(writable);
+    ASSERT_EQ(cbm_store_upsert_project(writable, "registry-c5", "/tmp/registry-c5-moved"),
+              CBM_STORE_OK);
+    cbm_store_close(writable);
+    doc = c5_list_projects_json(srv, "{\"limit\":50,\"format\":\"json\"}");
+    {
+        yyjson_val *first = c5_first_project(doc);
+        ASSERT_NOT_NULL(first);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "root_path")), "/tmp/registry-c5-moved");
+    }
+    yyjson_doc_free(doc);
+    ASSERT_EQ(cbm_store_projects_count_column_probes_for_test(), 2);
+
+    /* Publish invalidation: the hook drops the entry even when the caller did
+     * not observe a change yet. */
+    cbm_project_registry_invalidate(db_path);
+    doc = c5_list_projects_json(srv, "{\"limit\":50,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(c5_first_project(doc));
+    yyjson_doc_free(doc);
+    ASSERT_EQ(cbm_store_projects_count_column_probes_for_test(), 3);
+
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_unlink(db_path);
+    cbm_rmdir(cache);
+    PASS();
+}
+
+/* C5 cost criterion: listing ~120 projects must average under 100 ms. The
+ * assertion is on the warm mean — what a session pays once the daemon has read
+ * each generation — and the numbers are printed so a qf-infra run records
+ * them. The details projection keeps one git process per listed project (the
+ * ADR gates it behind include_details, and C10 tells callers not to ask for
+ * it at session start), so it is reported, not asserted. */
+TEST(tool_list_projects_mean_latency_with_120_projects) {
+    enum { C5_BENCH_PROJECTS = 120, C5_BENCH_ROUNDS = 5 };
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-c5-bench-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    for (int i = 0; i < C5_BENCH_PROJECTS; i++) {
+        char name[64];
+        char root[128];
+        char db_path[512];
+        snprintf(name, sizeof(name), "bench-project-%03d", i);
+        snprintf(root, sizeof(root), "/tmp/bench-project-%03d", i);
+        snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, name);
+        cbm_store_t *store = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(cbm_store_upsert_project(store, name, root), CBM_STORE_OK);
+        int64_t bench_nodes[2] = {0};
+        for (int n = 0; n < 2; n++) {
+            char qn[96];
+            snprintf(qn, sizeof(qn), "%s.fn%d", name, n);
+            cbm_node_t node = {.project = name,
+                               .label = "Function",
+                               .name = qn,
+                               .qualified_name = qn,
+                               .file_path = "src/main.c",
+                               .start_line = n + 1,
+                               .end_line = n + 1};
+            bench_nodes[n] = cbm_store_upsert_node(store, &node);
+            ASSERT_GT(bench_nodes[n], 0);
+        }
+        cbm_edge_t edge = {.project = name,
+                           .source_id = bench_nodes[0],
+                           .target_id = bench_nodes[1],
+                           .type = "CALLS",
+                           .properties_json = "{}"};
+        ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+        ASSERT_EQ(cbm_store_persist_project_counts(store, name), CBM_STORE_OK);
+        cbm_store_close(store);
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    yyjson_doc *doc = c5_list_projects_json(srv, "{\"limit\":500,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(c5_first_project(doc));
+    yyjson_doc_free(doc);
+
+    struct timespec t0;
+    struct timespec t1;
+    double lean_ms = 0.0;
+    double metadata_ms = 0.0;
+    double details_ms = 0.0;
+    for (int round = 0; round < C5_BENCH_ROUNDS; round++) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
+        doc = c5_list_projects_json(srv, "{\"limit\":500,\"format\":\"json\"}");
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
+        ASSERT_NOT_NULL(c5_first_project(doc));
+        yyjson_doc_free(doc);
+        lean_ms += (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+                   (double)(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
+        doc = c5_list_projects_json(
+            srv, "{\"limit\":500,\"format\":\"json\",\"metadata_only\":true}");
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
+        ASSERT_NOT_NULL(c5_first_project(doc));
+        yyjson_doc_free(doc);
+        metadata_ms += (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+                       (double)(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
+        doc = c5_list_projects_json(srv, "{\"limit\":50,\"format\":\"json\","
+                                         "\"include_details\":true}");
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
+        ASSERT_NOT_NULL(c5_first_project(doc));
+        yyjson_doc_free(doc);
+        details_ms += (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+                      (double)(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+    }
+    lean_ms /= C5_BENCH_ROUNDS;
+    metadata_ms /= C5_BENCH_ROUNDS;
+    details_ms /= C5_BENCH_ROUNDS;
+    printf("[c5-bench] projects=%d rounds=%d lean_mean_ms=%.3f metadata_mean_ms=%.3f "
+           "details_mean_ms=%.3f\n",
+           C5_BENCH_PROJECTS, C5_BENCH_ROUNDS, lean_ms, metadata_ms, details_ms);
+
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    for (int i = 0; i < C5_BENCH_PROJECTS; i++) {
+        char name[64];
+        char db_path[512];
+        snprintf(name, sizeof(name), "bench-project-%03d.db", i);
+        snprintf(db_path, sizeof(db_path), "%s/%s", cache, name);
+        cbm_unlink(db_path);
+    }
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(lean_ms < 100.0);
+    ASSERT_TRUE(metadata_ms < 100.0);
     PASS();
 }
 
@@ -21496,6 +21837,9 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_prefix_directory_recovers_rows_beyond_raw_estimate);
     RUN_TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct);
     RUN_TEST(tool_list_projects_preserves_root_beyond_one_kib);
+    RUN_TEST(tool_list_projects_legacy_counts_fall_back_and_store_on_publish);
+    RUN_TEST(tool_list_projects_registry_reuses_identity_until_generation_changes);
+    RUN_TEST(tool_list_projects_mean_latency_with_120_projects);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
     RUN_TEST(tool_check_index_coverage_reports_truncation_marker_issue963);

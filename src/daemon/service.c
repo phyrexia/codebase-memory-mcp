@@ -10,7 +10,13 @@
 
 #include "foundation/sha256.h"
 
+#include "cli/cli.h"
+#include "foundation/compat.h"
+#include "foundation/compat_fs.h"
+#include "foundation/platform.h"
+
 #include <errno.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -319,6 +325,233 @@ static bool conflict_log_record(const cbm_daemon_conflict_t *conflict,
     return true;
 }
 
+/* ── Build-fingerprint cache (opt-in) ──────────────────────────────────────
+ *
+ * cbm_daemon_build_fingerprint_file hashes the full executable image (hundreds
+ * of MB in release builds), which dominates every one-shot CLI invocation. With
+ * build_fingerprint_cache=true the resulting SHA-256 is memoized in a sidecar
+ * under the resolved cache directory, revalidated against the executable's
+ * (device, inode, size, mtime_ns) identity before it can be reused.
+ *
+ * Version-cohort security. The fingerprint decides daemon admission by exact
+ * build, so the cache may only skip RECOMPUTING a hash that remains the single
+ * source of truth: a sidecar entry is used only when the identity tuple
+ * captured from the very handle being hashed matches exactly, the HELLO
+ * comparison keeps comparing exact hashes between peers, and any E/S failure
+ * falls back to hashing. Residual risk: an executable replaced in situ with the
+ * same size, a forged identical mtime_ns, and a filesystem that hands back a
+ * reused inode would be accepted as the previous build. Mitigations:
+ * nanosecond mtime precision plus size, device, and inode in the tuple; no
+ * usable inode means no cache at all (always hash); the sidecar lives in the
+ * account cache root and is never authoritative. None of this weakens the
+ * cohort against a malicious local attacker: such a client can simply lie
+ * about its fingerprint in the HELLO envelope. The cohort rejects accidental
+ * build mismatches between honest peers; it does not authenticate a hostile
+ * one.
+ *
+ * cbm_daemon_build_fingerprint_native_file is deliberately NOT cached (see
+ * service_internal.h): no stable pathname to name in a sidecar, and its callers
+ * already hash through a live kernel-bound handle. */
+
+enum { FINGERPRINT_CACHE_CAP = 512 };
+
+typedef struct {
+    uint64_t device;
+    uint64_t inode;
+    uint64_t size;
+    uint64_t mtime_ns;
+    bool has_inode;
+} fingerprint_file_identity_t;
+
+/* "cbm-fp-cache 1 " — the complete magic and format marker. */
+static const char FINGERPRINT_CACHE_MAGIC[] = "cbm-fp-cache 1 ";
+
+/* Resolved once per process (tristate) so the SQLite lookup cannot run on
+ * every fingerprint call. */
+static int g_fingerprint_cache_state; /* 0 unknown, >0 enabled, <0 disabled */
+static size_t g_fingerprint_hash_count; /* completed file hash computations */
+
+static bool fingerprint_cache_enabled(void) {
+    if (g_fingerprint_cache_state == 0) {
+        cbm_config_t *config = cbm_config_open(cbm_resolve_cache_dir());
+        bool enabled = config && cbm_config_build_fingerprint_cache(config);
+        cbm_config_close(config);
+        g_fingerprint_cache_state = enabled ? 1 : -1;
+    }
+    return g_fingerprint_cache_state > 0;
+}
+
+static uint64_t fingerprint_cache_writer_id(void) {
+    /* Only uniquifies the store's temp name across processes and crashed
+     * leftovers; correctness never depends on it. */
+#ifdef _WIN32
+    return (uint64_t)GetCurrentProcessId();
+#else
+    return (uint64_t)getpid();
+#endif
+}
+
+static uint64_t fingerprint_cache_name_hash(const char *path) {
+    /* FNV-1a 64 over the path bytes; lowercase hex names the sidecar. A
+     * collision costs one wasted rehash at worst — correctness rests on the
+     * stored identity tuple, never on the file name. */
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char *cursor = (const unsigned char *)path; *cursor; cursor++) {
+        hash ^= (uint64_t)*cursor;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static bool fingerprint_cache_path(const char *path, char out[DAEMON_SERVICE_PATH_CAP]) {
+    const char *cache = cbm_resolve_cache_dir();
+    if (!path || !out || !cache || !cache[0]) {
+        return false;
+    }
+    int written = snprintf(out, DAEMON_SERVICE_PATH_CAP,
+                           "%s/build-fingerprint.%016" PRIx64 ".cache", cache,
+                           fingerprint_cache_name_hash(path));
+    return written > 0 && written < DAEMON_SERVICE_PATH_CAP;
+}
+
+static bool fingerprint_cache_field(const char **cursor, const char *end, uint64_t *value_out) {
+    if (!cursor || !value_out) {
+        return false;
+    }
+    const char *p = *cursor;
+    if (p == end || *p < '0' || *p > '9') {
+        return false;
+    }
+    uint64_t value = 0;
+    while (p < end && *p >= '0' && *p <= '9') {
+        uint64_t digit = (uint64_t)(*p - '0');
+        if (value > (UINT64_MAX - digit) / UINT64_C(10)) {
+            return false;
+        }
+        value = value * UINT64_C(10) + digit;
+        p++;
+    }
+    *cursor = p;
+    *value_out = value;
+    return true;
+}
+
+/* Strict sidecar parse. The grammar is exactly
+ *   "cbm-fp-cache 1 <dev> <ino> <size> <mtime_ns> <64-lowercase-hex>\n"
+ * one line and nothing else: missing or extra fields, non-decimal numbers,
+ * short or non-lowercase hashes, bytes after the hash, and empty or >512-byte
+ * files are all rejected, so a damaged sidecar can only ever cost a rehash. */
+static bool fingerprint_cache_parse(const char *data, size_t length,
+                                    const fingerprint_file_identity_t *identity,
+                                    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    if (!data || !identity || !out || length <= sizeof(FINGERPRINT_CACHE_MAGIC) - 1 ||
+        length > FINGERPRINT_CACHE_CAP ||
+        memcmp(data, FINGERPRINT_CACHE_MAGIC, sizeof(FINGERPRINT_CACHE_MAGIC) - 1) != 0) {
+        return false;
+    }
+    const char *cursor = data + sizeof(FINGERPRINT_CACHE_MAGIC) - 1;
+    const char *end = data + length;
+    uint64_t fields[4];
+    for (size_t i = 0; i < 4; i++) {
+        if (!fingerprint_cache_field(&cursor, end, &fields[i]) || cursor == end ||
+            *cursor != ' ') {
+            return false;
+        }
+        cursor++;
+    }
+    if ((size_t)(end - cursor) != CBM_SHA256_HEX_LEN + 1) {
+        return false;
+    }
+    for (size_t i = 0; i < CBM_SHA256_HEX_LEN; i++) {
+        char ch = cursor[i];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
+            return false;
+        }
+    }
+    if (cursor[CBM_SHA256_HEX_LEN] != '\n' || fields[0] != identity->device ||
+        fields[1] != identity->inode || fields[2] != identity->size ||
+        fields[3] != identity->mtime_ns) {
+        return false;
+    }
+    memcpy(out, cursor, CBM_SHA256_HEX_LEN);
+    out[CBM_SHA256_HEX_LEN] = '\0';
+    return true;
+}
+
+static bool fingerprint_cache_lookup(const char *path, const fingerprint_file_identity_t *identity,
+                                     char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    if (!path || !identity || !identity->has_inode || !out || !fingerprint_cache_enabled()) {
+        return false;
+    }
+    char cache_path[DAEMON_SERVICE_PATH_CAP];
+    if (!fingerprint_cache_path(path, cache_path)) {
+        return false;
+    }
+    FILE *file = cbm_fopen(cache_path, "rb");
+    if (!file) {
+        return false;
+    }
+    char data[FINGERPRINT_CACHE_CAP + 1];
+    size_t length = fread(data, 1, sizeof(data), file);
+    bool complete = !ferror(file) && feof(file);
+    (void)fclose(file);
+    return complete && fingerprint_cache_parse(data, length, identity, out);
+}
+
+static void fingerprint_cache_store(const char *path, const fingerprint_file_identity_t *identity,
+                                    const char *fingerprint) {
+    if (!path || !identity || !identity->has_inode || !fingerprint ||
+        !fingerprint_cache_enabled()) {
+        return;
+    }
+    char cache_path[DAEMON_SERVICE_PATH_CAP];
+    if (!fingerprint_cache_path(path, cache_path)) {
+        return;
+    }
+    char tmp_path[DAEMON_SERVICE_PATH_CAP];
+    int written = snprintf(tmp_path, sizeof(tmp_path), "%s.%" PRIu64 ".tmp", cache_path,
+                           fingerprint_cache_writer_id());
+    if (written <= 0 || (size_t)written >= sizeof(tmp_path)) {
+        return;
+    }
+    char line[FINGERPRINT_CACHE_CAP];
+    int length = snprintf(line, sizeof(line),
+                          "%s%" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %s\n",
+                          FINGERPRINT_CACHE_MAGIC, identity->device, identity->inode,
+                          identity->size, identity->mtime_ns, fingerprint);
+    if (length <= 0 || (size_t)length >= sizeof(line)) {
+        return;
+    }
+    /* Atomic publish through a unique temp name; every E/S failure is ignored
+     * (no cache, no error) because the hash itself is the source of truth. */
+    FILE *file = cbm_fopen(tmp_path, "wb");
+    if (!file) {
+        return;
+    }
+    bool ok = fwrite(line, 1, (size_t)length, file) == (size_t)length;
+    ok = fclose(file) == 0 && ok;
+    if (ok && cbm_rename_replace(tmp_path, cache_path) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        (void)cbm_unlink(tmp_path);
+    }
+}
+
+#if defined(CBM_CLI_ENABLE_TEST_API)
+void cbm_daemon_build_fingerprint_cache_reset_for_test(void) {
+    g_fingerprint_cache_state = 0;
+}
+
+size_t cbm_daemon_build_fingerprint_hash_count_for_test(void) {
+    return g_fingerprint_hash_count;
+}
+
+void cbm_daemon_build_fingerprint_hash_count_reset_for_test(void) {
+    g_fingerprint_hash_count = 0;
+}
+#endif /* CBM_CLI_ENABLE_TEST_API */
+
 #ifndef _WIN32
 
 #include <fcntl.h>
@@ -352,6 +585,30 @@ static bool fd_regular(int fd, struct stat *status_out) {
     if (status_out) {
         *status_out = status;
     }
+    return true;
+}
+
+static bool fingerprint_identity_posix(int fd, fingerprint_file_identity_t *identity) {
+    struct stat status;
+    if (!identity || fstat(fd, &status) != 0 || status.st_size < 0) {
+        return false;
+    }
+#ifdef __APPLE__
+    int64_t seconds = (int64_t)status.st_mtimespec.tv_sec;
+    int64_t nanoseconds = (int64_t)status.st_mtimespec.tv_nsec;
+#else
+    int64_t seconds = (int64_t)status.st_mtim.tv_sec;
+    int64_t nanoseconds = (int64_t)status.st_mtim.tv_nsec;
+#endif
+    if (seconds < 0 || nanoseconds < 0) {
+        /* Pre-epoch stamps cannot round-trip through the cache format. */
+        return false;
+    }
+    identity->device = (uint64_t)status.st_dev;
+    identity->inode = (uint64_t)status.st_ino;
+    identity->size = (uint64_t)status.st_size;
+    identity->mtime_ns = (uint64_t)seconds * UINT64_C(1000000000) + (uint64_t)nanoseconds;
+    identity->has_inode = status.st_ino != 0;
     return true;
 }
 
@@ -400,6 +657,7 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
     cbm_sha256_final(&context, digest);
     digest_to_hex(digest, out);
+    g_fingerprint_hash_count++;
     return true;
 }
 
@@ -414,15 +672,24 @@ bool cbm_daemon_build_fingerprint_file(const char *path,
         return false;
     }
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    bool ok =
-        fd >= 0 && fd_cloexec(fd) && cbm_daemon_build_fingerprint_native_file((uintptr_t)fd, out);
+    bool ok = fd >= 0 && fd_cloexec(fd);
+    fingerprint_file_identity_t identity;
+    bool identified = ok && fingerprint_identity_posix(fd, &identity);
+    bool cached = ok && identified && fingerprint_cache_lookup(path, &identity, out);
+    if (ok && !cached) {
+        ok = cbm_daemon_build_fingerprint_native_file((uintptr_t)fd, out);
+    }
     if (fd >= 0 && close(fd) != 0) {
         ok = false;
     }
     if (!ok) {
         out[0] = '\0';
+        return false;
     }
-    return ok;
+    if (!cached && identified) {
+        fingerprint_cache_store(path, &identity, out);
+    }
+    return true;
 }
 
 typedef struct {
@@ -672,6 +939,29 @@ static bool windows_same_file_identity(const BY_HANDLE_FILE_INFORMATION *first,
            first->nFileIndexLow == second->nFileIndexLow;
 }
 
+static bool fingerprint_identity_windows(HANDLE file, fingerprint_file_identity_t *identity) {
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!identity || GetFileType(file) != FILE_TYPE_DISK ||
+        GetFileInformationByHandle(file, &info) == 0 ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+        return false;
+    }
+    /* ftLastWriteTime is 100ns ticks since 1601; the Unix epoch starts
+     * 116444736000000000 ticks later. */
+    uint64_t write_ticks = ((uint64_t)info.ftLastWriteTime.dwHighDateTime << 32) |
+                           (uint64_t)info.ftLastWriteTime.dwLowDateTime;
+    if (write_ticks < UINT64_C(116444736000000000)) {
+        /* Pre-Unix-epoch stamps cannot round-trip through the cache format. */
+        return false;
+    }
+    identity->device = (uint64_t)info.dwVolumeSerialNumber;
+    identity->inode = ((uint64_t)info.nFileIndexHigh << 32) | (uint64_t)info.nFileIndexLow;
+    identity->size = ((uint64_t)info.nFileSizeHigh << 32) | (uint64_t)info.nFileSizeLow;
+    identity->mtime_ns = (write_ticks - UINT64_C(116444736000000000)) * UINT64_C(100);
+    identity->has_inode = identity->inode != 0;
+    return true;
+}
+
 bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
                                               char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
     if (!out) {
@@ -727,6 +1017,7 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
     cbm_sha256_final(&context, digest);
     digest_to_hex(digest, out);
+    g_fingerprint_hash_count++;
     return true;
 }
 
@@ -748,15 +1039,24 @@ bool cbm_daemon_build_fingerprint_file(const char *path,
         CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                     FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     free(wide);
-    bool ok = file != INVALID_HANDLE_VALUE &&
-              cbm_daemon_build_fingerprint_native_file((uintptr_t)file, out);
+    fingerprint_file_identity_t identity;
+    bool ok = file != INVALID_HANDLE_VALUE;
+    bool identified = ok && fingerprint_identity_windows(file, &identity);
+    bool cached = ok && identified && fingerprint_cache_lookup(path, &identity, out);
+    if (ok && !cached) {
+        ok = cbm_daemon_build_fingerprint_native_file((uintptr_t)file, out);
+    }
     if (file != INVALID_HANDLE_VALUE && !CloseHandle(file)) {
         ok = false;
     }
     if (!ok) {
         out[0] = '\0';
+        return false;
     }
-    return ok;
+    if (!cached && identified) {
+        fingerprint_cache_store(path, &identity, out);
+    }
+    return true;
 }
 
 static bool windows_log_handle_valid(HANDLE file, LARGE_INTEGER *size_out) {

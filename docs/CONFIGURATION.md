@@ -95,7 +95,16 @@ Current keys:
 | `session_root` | `git_toplevel` | Where a session binds: `git_toplevel` resolves the working directory's repository root (`git rev-parse --show-toplevel`), `cwd` keeps the working directory itself. Only these two literals are accepted — a truncated, suffixed or otherwise malformed value is refused by `config set` and reads as the default. Read on every session connect. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
+| `build_fingerprint_cache` | `false` | Cache the executable's SHA-256 keyed by `(dev, ino, size, mtime_ns)` in the cache directory. `true` skips rehashing the binary on every one-shot CLI run; the cache is invalidated whenever the identity tuple changes. |
 
+> **`build_fingerprint_cache`.** Opt-in, off by default. The cached hash is only
+> a memo: it is used when the executable's `(dev, ino, size, mtime_ns)` identity
+> matches exactly, and the SHA-256 itself remains the value compared between
+> daemon peers, so a stale entry can never widen admission beyond what an exact
+> hash comparison allows. The setting is resolved once per process — each CLI
+> one-shot run picks a change up immediately; retire a running daemon to
+> re-read it there.
+>
 > **`watcher_enabled` vs `auto_watch`.** `watcher_enabled` controls whether the
 > watcher *subsystem* starts at all (the background poll thread). `auto_watch` is
 > narrower: it only controls whether a connecting session registers *its own*

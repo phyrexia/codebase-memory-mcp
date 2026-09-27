@@ -486,6 +486,59 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out);
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count);
 int cbm_store_delete_project(cbm_store_t *s, const char *name);
 
+/* Index of the single primary project row of a DB, ignoring internal shadow
+ * rows ("<name>::missed", #1044). Returns -1 when there is not exactly one. */
+int cbm_store_primary_project_index(const cbm_project_t *projects, int count);
+
+/* ── Persisted per-project row counts (C5) ─────────────────────────
+ *
+ * `projects.node_count` / `projects.edge_count` are stamped when a generation
+ * is published and are NULL whenever they are unknown (legacy DB, or a
+ * generation written by a binary that predates them). They exist so a listing
+ * can report node/edge totals without running COUNT(*) over every project DB. */
+typedef struct {
+    bool has_count_columns; /* schema probe result (columns exist at all) */
+    bool counts_stored;     /* columns exist and BOTH are NOT NULL for the row */
+    int64_t node_count;
+    int64_t edge_count;
+} cbm_project_stats_t;
+
+/* Best-effort probe for the C5 count columns on `projects`. Returns true only
+ * when the table exists and exposes BOTH node_count and edge_count. Read-only
+ * query opens skip init_schema, so false is expected on any DB whose last
+ * writable open predates the columns; those must keep reading and simply
+ * report unknown counts. Counted in the test seam below. */
+bool cbm_store_projects_has_count_columns(cbm_store_t *s);
+
+/* Read one project row plus its persisted counts in a single statement.
+ * `has_count_columns` MUST come from cbm_store_projects_has_count_columns() or
+ * from a cached probe result for this exact file generation: the reader never
+ * names the count columns without it (a legacy DB fails such a SELECT at
+ * prepare time with "no such column"). Two prepared statements, SQL_FULL with
+ * the count columns and SQL_LEGACY without them — the same pattern the
+ * BT-240 indexed_checkout_sha reader uses. */
+int cbm_store_get_project_stats(cbm_store_t *s, const char *name, bool has_count_columns,
+                                cbm_project_t *out, cbm_project_stats_t *stats);
+
+/* Stamp persisted counts for one project row (NULL -> value). Only meaningful
+ * on a writable store, where init_schema has already migrated the columns. */
+int cbm_store_set_project_counts(cbm_store_t *s, const char *name, int64_t node_count,
+                                 int64_t edge_count);
+
+/* Publish-time stamp: write the exact COUNT(*) totals of `project` into its
+ * row. Deriving the values from the freshly written tables (rather than from
+ * producer-side tallies) is what makes `stored` identical to what a later
+ * COUNT(*) would report. */
+int cbm_store_persist_project_counts(cbm_store_t *s, const char *project);
+
+#if defined(CBM_CLI_ENABLE_TEST_API)
+/* Test seam: how many times the C5 schema probe has actually queried the
+ * catalog. Lets a test prove the probe runs once per published generation,
+ * not once per list_projects call. */
+size_t cbm_store_projects_count_column_probes_for_test(void);
+void cbm_store_projects_count_column_probes_reset_for_test(void);
+#endif
+
 /* ── Node CRUD ──────────────────────────────────────────────────── */
 
 /* Upsert a single node. Returns node ID (>0) or CBM_STORE_ERR. */

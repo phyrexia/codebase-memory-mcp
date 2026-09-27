@@ -15406,6 +15406,111 @@ TEST(cli_config_cmd_rejects_invalid_session_root) {
     PASS();
 }
 
+TEST(cli_config_build_fingerprint_cache_is_strict_boolean_and_persistent) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-fp-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char *saved_cache = NULL;
+    const char *prior = getenv("CBM_CACHE_DIR");
+    if (prior) {
+        saved_cache = strdup(prior);
+    }
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+
+    bool listed = false;
+    for (size_t i = 0; i < cbm_cli_config_key_count_for_testing(); i++) {
+        const char *key = cbm_cli_config_key_at_for_testing(i);
+        listed = listed || (key && strcmp(key, CBM_CONFIG_BUILD_FINGERPRINT_CACHE) == 0);
+    }
+
+    ASSERT_FALSE(cbm_config_build_fingerprint_cache(NULL));
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    /* Missing key: the default is caching off. */
+    bool default_off = !cbm_config_build_fingerprint_cache(cfg);
+
+    /* The reader's vocabulary is exactly "true" and "false"; every other
+     * spelling fails closed to caching off. */
+    const char *invalid[] = {"", "TRUE", "True", "true ", " true", "t rue", "1", "on", "yes",
+                             "tru", "truejunk", "falsex", "true\n"};
+    bool strict_ok = true;
+    for (size_t i = 0; strict_ok && i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        strict_ok = cbm_config_set(cfg, CBM_CONFIG_BUILD_FINGERPRINT_CACHE, invalid[i]) == 0 &&
+                    !cbm_config_build_fingerprint_cache(cfg);
+    }
+    bool true_ok = strict_ok &&
+                   cbm_config_set(cfg, CBM_CONFIG_BUILD_FINGERPRINT_CACHE, "true") == 0 &&
+                   cbm_config_build_fingerprint_cache(cfg);
+    bool false_ok = true_ok &&
+                    cbm_config_set(cfg, CBM_CONFIG_BUILD_FINGERPRINT_CACHE, "false") == 0 &&
+                    !cbm_config_build_fingerprint_cache(cfg);
+
+    bool persisted = false_ok &&
+                     cbm_config_set(cfg, CBM_CONFIG_BUILD_FINGERPRINT_CACHE, "true") == 0;
+    cbm_config_close(cfg);
+    cfg = cbm_config_open(tmpdir);
+    persisted = persisted && cfg && cbm_config_build_fingerprint_cache(cfg);
+
+    /* A TEXT value with an embedded NUL is compared by byte length, never as
+     * a NUL-terminated prefix: "true\0junk" must not enable caching. */
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", tmpdir);
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    bool nul_ok = persisted && sqlite3_open(dbpath, &db) == SQLITE_OK &&
+                  sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                                     -1, &stmt, NULL) == SQLITE_OK &&
+                  sqlite3_bind_text(stmt, 1, CBM_CONFIG_BUILD_FINGERPRINT_CACHE, -1,
+                                    SQLITE_TRANSIENT) == SQLITE_OK;
+    const char embedded_nul[] = {'t', 'r', 'u', 'e', '\0', 'j', 'u', 'n', 'k'};
+    if (nul_ok) {
+        nul_ok = sqlite3_bind_text(stmt, 2, embedded_nul, (int)sizeof(embedded_nul),
+                                   SQLITE_TRANSIENT) == SQLITE_OK &&
+                 sqlite3_step(stmt) == SQLITE_DONE;
+    }
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
+    if (db) {
+        sqlite3_close(db);
+    }
+    bool embedded_rejected = nul_ok && !cbm_config_build_fingerprint_cache(cfg);
+    cbm_config_close(cfg);
+
+    /* Strict on write through `config set` as well: a spelling the reader
+     * would silently turn off must not be accepted as a valid value. */
+    char out[256];
+    char *set_true[] = {"set", CBM_CONFIG_BUILD_FINGERPRINT_CACHE, "true"};
+    char *set_upper[] = {"set", CBM_CONFIG_BUILD_FINGERPRINT_CACHE, "TRUE"};
+    int true_rc = cli_config_cmd_capture(3, set_true, out, sizeof(out));
+    int upper_rc = cli_config_cmd_capture(3, set_upper, out, sizeof(out));
+    cfg = cbm_config_open(tmpdir);
+    bool upper_rejected =
+        cfg && strcmp(cbm_config_get(cfg, CBM_CONFIG_BUILD_FINGERPRINT_CACHE, "missing"),
+                      "true") == 0;
+    cbm_config_close(cfg);
+
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        free(saved_cache);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(listed);
+    ASSERT_TRUE(default_off);
+    ASSERT_TRUE(strict_ok);
+    ASSERT_TRUE(true_ok);
+    ASSERT_TRUE(false_ok);
+    ASSERT_TRUE(persisted);
+    ASSERT_TRUE(embedded_rejected);
+    ASSERT_EQ(true_rc, 0);
+    ASSERT_TRUE(upper_rc != 0);
+    ASSERT_TRUE(upper_rejected);
+    PASS();
+}
+
 TEST(cli_config_delete) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -16879,6 +16984,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_max_index_jobs_rejects_truncated_and_embedded_nul_values);
     RUN_TEST(cli_config_session_root_is_a_strict_enum);
     RUN_TEST(cli_config_cmd_rejects_invalid_session_root);
+    RUN_TEST(cli_config_build_fingerprint_cache_is_strict_boolean_and_persistent);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
     RUN_TEST(cli_config_watcher_enabled_default_and_persist);

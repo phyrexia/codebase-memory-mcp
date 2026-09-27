@@ -56,6 +56,7 @@ enum {
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
 #include "store/store.h"
+#include "store/project_registry.h"
 #include <sqlite3.h>
 #include "cypher/cypher.h"
 #include "discover/discover.h"
@@ -2667,19 +2668,11 @@ static bool db_internal_project_name(const char *full_path, char *name_out, size
     int n = 0;
     bool ok = false;
     if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK) {
-        /* Ignore internal shadow projects ("<name>::missed" miss-graph rows):
-         * they share the db with the primary project and must not make it
-         * unresolvable — requiring n == 1 over ALL rows made every project
-         * with a miss graph vanish from list_projects and the UI (#1044). */
-        int primary = -1;
-        int primary_count = 0;
-        for (int i = 0; i < n; i++) {
-            if (projs[i].name && projs[i].name[0] && !strstr(projs[i].name, "::")) {
-                primary = i;
-                primary_count++;
-            }
-        }
-        if (primary_count == 1) {
+        /* Internal shadow projects ("<name>::missed" miss-graph rows) share the
+         * db with the primary project and must not make it unresolvable
+         * (#1044); the shared selector applies that rule in one place. */
+        int primary = cbm_store_primary_project_index(projs, n);
+        if (primary >= 0) {
             snprintf(name_out, name_sz, "%s", projs[primary].name);
             ok = true;
         }
@@ -2731,9 +2724,10 @@ typedef struct {
     char *db_file;
     char *branch;
     char *indexed_at;
-    int nodes;
-    int edges;
+    int64_t nodes;
+    int64_t edges;
     int64_t size_bytes;
+    bool counts_stored; /* totals come from the published row, not a COUNT(*) */
     bool populated;
 } mcp_project_record_t;
 
@@ -2769,11 +2763,11 @@ typedef enum {
     PROJECT_RECORD_OOM = -1,
 } project_record_status_t;
 
-/* Open a .db file briefly and collect sortable identity only. Counts and Git
- * context are populated after paging so a 50-row response does not repeat
- * heavyweight work for every database in the cache. */
+/* Collect sortable identity from the project registry. The registry opens the
+ * .db file only when it changed since the cached read (size + mtime), so a warm
+ * listing opens no SQLite file at all — the work this listing used to do for
+ * all ~120 databases on every call. Counts and Git context stay for the page. */
 static project_record_status_t read_project_record_identity(const char *dir_path, const char *name,
-                                                            int64_t size_bytes,
                                                             mcp_project_record_t *record) {
     memset(record, 0, sizeof(*record));
 
@@ -2783,51 +2777,31 @@ static project_record_status_t read_project_record_identity(const char *dir_path
     /* #704: key on the db's INTERNAL project name, not its filename. Node/edge
      * rows are tagged with the internal name, so a drifted filename (copied or
      * renamed db, legacy '.'-vs-'-' username twin) would otherwise report 0
-     * nodes/edges and be unresolvable. Skip ghost/empty/corrupt dbs entirely so
-     * they don't appear as resolvable projects. */
-    char project_name[CBM_SZ_1K];
-    cbm_store_t *pstore = NULL;
-    if (!db_internal_project_name(full_path, project_name, sizeof(project_name), &pstore)) {
+     * nodes/edges and be unresolvable. Ghost/empty/corrupt dbs are skipped
+     * entirely so they don't appear as resolvable projects. */
+    cbm_project_identity_t identity = {0};
+    cbm_project_registry_status_t status = cbm_project_registry_lookup(full_path, &identity);
+    if (status == CBM_PROJECT_REGISTRY_ABSENT) {
         return PROJECT_RECORD_SKIP; /* ghost / unreadable — not resolvable */
     }
+    if (status == CBM_PROJECT_REGISTRY_OOM) {
+        return PROJECT_RECORD_OOM;
+    }
 
-    record->name = heap_strdup(project_name);
+    /* Registry fields are heap-owned by the caller. Transfer the identity
+     * intact: it is the value used for sorting, output, and branch lookup. */
+    record->name = identity.name;
+    record->root_path = identity.root_path;
+    record->indexed_at = identity.indexed_at;
+    identity.name = NULL;
+    identity.root_path = NULL;
+    identity.indexed_at = NULL;
     record->db_file = heap_strdup(name);
-    record->size_bytes = size_bytes;
-    cbm_project_t proj = {0};
-    if (cbm_store_get_project(pstore, project_name, &proj) == CBM_STORE_OK) {
-        /* root_path is NOT NULL in the store schema, so a missing copy here is
-         * allocation failure rather than an empty identity. */
-        if (!proj.root_path) {
-            cbm_project_free_fields(&proj);
-            cbm_store_close(pstore);
-            project_record_clear(record);
-            return PROJECT_RECORD_OOM;
-        }
-        /* Store project fields are heap-owned by the caller. Transfer the root
-         * identity intact: it is the value used for sorting, output, and branch
-         * lookup, so routing it through a fixed buffer would silently change
-         * all three for long roots. */
-        record->root_path = (char *)proj.root_path;
-        proj.root_path = NULL;
-        /* Ours (9841ca46): list_projects exposes indexed_at so refresh
-         * tooling can compare it against the last commit without a second
-         * call per project. Optional: absent rows just omit the field. */
-        if (proj.indexed_at) {
-            record->indexed_at = heap_strdup(proj.indexed_at);
-            if (!record->indexed_at) {
-                cbm_project_free_fields(&proj);
-                cbm_store_close(pstore);
-                project_record_clear(record);
-                return PROJECT_RECORD_OOM;
-            }
-        }
-        cbm_project_free_fields(&proj);
-    }
-    cbm_store_close(pstore);
-    if (!record->root_path) {
-        record->root_path = heap_strdup("");
-    }
+    record->size_bytes = identity.size_bytes;
+    record->nodes = identity.node_count;
+    record->edges = identity.edge_count;
+    record->counts_stored = identity.counts_stored;
+    cbm_project_identity_clear(&identity);
     if (!record->name || !record->root_path || !record->db_file) {
         project_record_clear(record);
         return PROJECT_RECORD_OOM;
@@ -2838,10 +2812,12 @@ static project_record_status_t read_project_record_identity(const char *dir_path
 static bool populate_project_record(const char *dir_path, bool include_stats,
                                     mcp_project_record_t *record) {
     if (record->populated) {
-        record->populated = true;
         return true;
     }
-    if (include_stats) {
+    /* COUNT(*) only when the published row carries no totals to serve: it is a
+     * full index scan per project, which is exactly what this listing stopped
+     * doing on every call. */
+    if (include_stats && !record->counts_stored) {
         char full_path[CBM_SZ_2K];
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, record->db_file);
         cbm_store_t *pstore = cbm_store_open_path_query(full_path);
@@ -2852,11 +2828,11 @@ static bool populate_project_record(const char *dir_path, bool include_stats,
         record->edges = cbm_store_count_edges(pstore, record->name);
         cbm_store_close(pstore);
     }
-    /* Listing stays lean: only the branch (the one git fact that
-     * disambiguates same-repo projects). The 12-field git block — mostly
-     * null for non-git roots — cost ~10KB across a full cache and is one
-     * index_status call away for the project you actually care about. */
-    if (record->root_path[0]) {
+    /* Listing stays lean: the branch (the one git fact that disambiguates
+     * same-repo projects) is resolved only for the details projection, where
+     * it is worth a git process per project. The 12-field git block — mostly
+     * null for non-git roots — stays in index_status. */
+    if (include_stats && record->root_path[0]) {
         cbm_git_context_t gctx = {0};
         (void)cbm_git_context_resolve(record->root_path, &gctx);
         if (gctx.is_git && gctx.branch) {
@@ -2873,15 +2849,27 @@ static bool populate_project_record(const char *dir_path, bool include_stats,
 }
 
 static void add_project_record_json(yyjson_mut_doc *doc, yyjson_mut_val *arr,
-                                    const mcp_project_record_t *record, bool include_stats) {
+                                    const mcp_project_record_t *record, bool include_stats,
+                                    bool metadata_only) {
     yyjson_mut_val *p = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_strcpy(doc, p, "name", record->name);
     yyjson_mut_obj_add_strcpy(doc, p, "root_path", record->root_path);
     if (record->indexed_at) {
+        /* Ours (9841ca46): list_projects exposes indexed_at so refresh tooling
+         * can compare it against the last commit without a second call per
+         * project. Optional: absent rows just omit the field. */
         yyjson_mut_obj_add_strcpy(doc, p, "indexed_at", record->indexed_at);
     }
     if (record->branch) {
         yyjson_mut_obj_add_strcpy(doc, p, "branch", record->branch);
+    }
+    if (!metadata_only) {
+        /* Where this record's node/edge totals come from: "stored" = the
+         * published generation stamped them, "computed" = a live COUNT(*).
+         * Reported with and without stats so the migration to stored counts is
+         * visible without asking for the expensive projection. */
+        yyjson_mut_obj_add_strcpy(doc, p, "stats_source",
+                                  record->counts_stored ? "stored" : "computed");
     }
     if (include_stats) {
         yyjson_mut_obj_add_int(doc, p, "nodes", record->nodes);
@@ -2936,15 +2924,8 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         if (!is_project_db_file(name, len)) {
             continue;
         }
-        char full_path[CBM_SZ_2K];
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
-        int64_t size_bytes = cbm_file_size(full_path);
-        if (size_bytes < 0) {
-            continue;
-        }
         mcp_project_record_t record = {0};
-        project_record_status_t read_status =
-            read_project_record_identity(dir_path, name, size_bytes, &record);
+        project_record_status_t read_status = read_project_record_identity(dir_path, name, &record);
         if (read_status == PROJECT_RECORD_OOM) {
             oom = true;
             break;
@@ -3012,7 +2993,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_doc_set_root(doc, root);
         yyjson_mut_val *arr = yyjson_mut_arr(doc);
         for (int i = start; i < end; i++) {
-            add_project_record_json(doc, arr, &records[i], include_stats);
+            add_project_record_json(doc, arr, &records[i], include_stats, metadata_only);
         }
 
         yyjson_mut_obj_add_val(doc, root, "projects", arr);
@@ -3063,10 +3044,10 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
                 }
                 if (include_stats) {
                     size_t number_base = (size_t)row * 3U;
-                    snprintf(numbers[number_base], sizeof(numbers[number_base]), "%d",
-                             record->nodes);
-                    snprintf(numbers[number_base + 1U], sizeof(numbers[number_base + 1U]), "%d",
-                             record->edges);
+                    snprintf(numbers[number_base], sizeof(numbers[number_base]), "%lld",
+                             (long long)record->nodes);
+                    snprintf(numbers[number_base + 1U], sizeof(numbers[number_base + 1U]), "%lld",
+                             (long long)record->edges);
                     snprintf(numbers[number_base + 2U], sizeof(numbers[number_base + 2U]), "%lld",
                              (long long)record->size_bytes);
                     cells[base + 3U] = numbers[number_base];

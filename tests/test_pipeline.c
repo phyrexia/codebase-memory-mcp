@@ -5232,6 +5232,65 @@ TEST(pipeline_full_reindex_replaces_legacy_schema_without_quarantine) {
 }
 #endif
 
+/* C5: every published generation — full rebuild and the incremental routes
+ * that patch nodes/edges in place — must carry stored counts equal to the
+ * project's COUNT(*), so list_projects serves `stored` totals and never scans. */
+TEST(pipeline_publish_stamps_stored_project_counts) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_counts_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "fresh.py", "def Fresh():\n    return 1\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    char project[256] = {0};
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    int run_rc = cbm_pipeline_run(pipeline);
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+    ASSERT_EQ(run_rc, 0);
+
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(cbm_store_projects_has_count_columns(store));
+    cbm_project_t proj = {0};
+    cbm_project_stats_t stats = {0};
+    ASSERT_EQ(cbm_store_get_project_stats(store, project, true, &proj, &stats), CBM_STORE_OK);
+    ASSERT_TRUE(stats.counts_stored);
+    ASSERT_EQ(stats.node_count, cbm_store_count_nodes(store, project));
+    ASSERT_EQ(stats.edge_count, cbm_store_count_edges(store, project));
+    ASSERT_GT(stats.node_count, 0);
+    cbm_project_free_fields(&proj);
+    cbm_store_close(store);
+
+    /* A second generation keeps the contract after an incremental re-index of
+     * a body-only edit (the cheapest route, and the one that patches rows in
+     * place instead of rewriting every table). */
+    write_temp_file(tmp, "fresh.py", "def Fresh():\n    return 2\n");
+    pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    run_rc = cbm_pipeline_run(pipeline);
+    cbm_pipeline_free(pipeline);
+    ASSERT_EQ(run_rc, 0);
+
+    store = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(store);
+    proj = (cbm_project_t){0};
+    stats = (cbm_project_stats_t){0};
+    ASSERT_EQ(cbm_store_get_project_stats(store, project, true, &proj, &stats), CBM_STORE_OK);
+    ASSERT_TRUE(stats.counts_stored);
+    ASSERT_EQ(stats.node_count, cbm_store_count_nodes(store, project));
+    ASSERT_EQ(stats.edge_count, cbm_store_count_edges(store, project));
+    ASSERT_GT(stats.node_count, 0);
+    cbm_project_free_fields(&proj);
+    cbm_store_close(store);
+
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Re-indexing only a target whose qualified name survives a callable-to-value
  * edit must not restore the unchanged caller's stale inbound CALL_REFERENCE
  * snapshot. A fresh full index of the edited sources is the convergence oracle:
@@ -15364,6 +15423,8 @@ SUITE(pipeline) {
     /* File persistence */
     RUN_TEST(store_file_persistence);
     RUN_TEST(store_bulk_persistence);
+    /* C5: published generations carry stored row counts */
+    RUN_TEST(pipeline_publish_stamps_stored_project_counts);
     /* Integration: structure pass */
     RUN_TEST(pipeline_grpc_routes_cover_every_service_past_the_old_cap);
     RUN_TEST(pipeline_doclinks_edge_lands_in_store);
