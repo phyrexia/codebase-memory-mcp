@@ -70,6 +70,13 @@ size_t cbm_index_worker_memory_budget_bytes(void);
  * arg parser), and the header is written once. */
 void cbm_index_worker_log_begin(const char *args_json, const char *repo_path);
 
+/* Rotate the accumulated `.worker-log-*` files in `logs_dir` (one per physical
+ * worker attempt; only clean runs delete theirs): files newer than
+ * CBM_WORKER_LOG_RETENTION_DAYS or among the CBM_WORKER_LOG_KEEP_RECENT newest
+ * stay, the rest are unlinked. `now_ms` is the caller's clock (tests inject a
+ * future one to age files). Returns how many were removed. */
+size_t cbm_index_worker_logs_rotate(const char *logs_dir, int64_t now_ms);
+
 /* Capture the exact executable-image fingerprint once, during process startup
  * before any worker can be launched. Repeated calls return the original capture
  * and never re-hash a pathname that an installer may since have replaced. */

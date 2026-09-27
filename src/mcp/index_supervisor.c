@@ -565,6 +565,13 @@ static bool worker_cache_dir(char out[INDEX_WORKER_PATH_CAP]) {
     return true;
 }
 
+/* Join `<cache>/logs`, the directory of per-worker artifacts (.worker-log-*,
+ * .worker-response-*). False when the join overflows. */
+static bool worker_logs_dir(const char *cache_dir, char *out, size_t out_size) {
+    int written = snprintf(out, out_size, "%s/logs", cache_dir);
+    return written > 0 && written < (int)out_size;
+}
+
 static bool worker_unique_file(char *out, size_t out_size, const char *kind) {
     if (!out || out_size == 0 || !kind || !kind[0]) {
         return false;
@@ -574,8 +581,7 @@ static bool worker_unique_file(char *out, size_t out_size, const char *kind) {
     int written;
     if (have_cache) {
         char directory[INDEX_WORKER_PATH_CAP];
-        written = snprintf(directory, sizeof(directory), "%s/logs", cache_copy);
-        if (written <= 0 || written >= (int)sizeof(directory) ||
+        if (!worker_logs_dir(cache_copy, directory, sizeof(directory)) ||
             !cbm_mkdir_p_ex(directory, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
             return false;
         }
@@ -596,6 +602,110 @@ static bool worker_unique_file(char *out, size_t out_size, const char *kind) {
     }
     (void)worker_close(descriptor);
     return true;
+}
+
+/* ── Worker-log rotation ───────────────────────────────────────────
+ *
+ * Every physical worker attempt mints one `.worker-log-*` under <cache>/logs
+ * and only clean runs delete theirs, so failures pile up (6503 files were on
+ * disk at audit time). Rotation keeps what is still useful and unlinks the
+ * rest: anything inside CBM_WORKER_LOG_RETENTION_DAYS is recent enough to be
+ * the post-mortem evidence someone is looking for, and the
+ * CBM_WORKER_LOG_KEEP_RECENT newest always survive so a small set of logs is
+ * never emptied out. Only regular `.worker-log-*` files are ever unlinked. */
+enum {
+    /* Two weeks of worker evidence: the same window the ops-side ephemeral
+     * cleanup uses, in one place for the binary. */
+    CBM_WORKER_LOG_RETENTION_DAYS = 14,
+    /* Recent floor, whatever the window says. */
+    CBM_WORKER_LOG_KEEP_RECENT = 256,
+};
+
+typedef struct {
+    char *name;
+    int64_t mtime_ns;
+} worker_log_entry_t;
+
+static const char worker_log_prefix[] = ".worker-log-";
+
+static int worker_log_entry_newest_first(const void *left, const void *right) {
+    const worker_log_entry_t *a = (const worker_log_entry_t *)left;
+    const worker_log_entry_t *b = (const worker_log_entry_t *)right;
+    if (a->mtime_ns != b->mtime_ns) {
+        return a->mtime_ns > b->mtime_ns ? -1 : 1;
+    }
+    return strcmp(a->name, b->name);
+}
+
+size_t cbm_index_worker_logs_rotate(const char *logs_dir, int64_t now_ms) {
+    if (!logs_dir || !logs_dir[0]) {
+        return 0;
+    }
+    cbm_dir_t *dir = cbm_opendir(logs_dir);
+    if (!dir) {
+        return 0;
+    }
+    worker_log_entry_t *entries = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        if (strncmp(entry->name, worker_log_prefix, sizeof(worker_log_prefix) - 1) != 0) {
+            continue;
+        }
+        char path[INDEX_WORKER_PATH_CAP];
+        cbm_path_info_t info;
+        int written = snprintf(path, sizeof(path), "%s/%s", logs_dir, entry->name);
+        if (written <= 0 || written >= (int)sizeof(path) ||
+            cbm_path_info_utf8(path, &info) != CBM_PATH_INFO_OK || !info.is_regular ||
+            info.is_symlink) {
+            continue; /* a link or directory is never ours to unlink */
+        }
+        if (count == capacity) {
+            size_t next_capacity = capacity ? capacity * 2 : 32;
+            worker_log_entry_t *grown =
+                (worker_log_entry_t *)realloc(entries, next_capacity * sizeof(*entries));
+            if (!grown) {
+                break;
+            }
+            entries = grown;
+            capacity = next_capacity;
+        }
+        size_t name_length = strlen(entry->name);
+        char *copy = (char *)malloc(name_length + 1);
+        if (!copy) {
+            break;
+        }
+        memcpy(copy, entry->name, name_length + 1);
+        entries[count].name = copy;
+        entries[count].mtime_ns = info.mtime_ns;
+        count++;
+    }
+    cbm_closedir(dir);
+
+    /* Rank cut, not an mtime threshold: files minted in the same instant must
+     * still leave exactly (count - KEEP_RECENT) candidates behind the floor. */
+    if (count > 1) {
+        qsort(entries, count, sizeof(*entries), worker_log_entry_newest_first);
+    }
+    const int64_t window_ms = (int64_t)CBM_WORKER_LOG_RETENTION_DAYS * 24 * 3600 * 1000;
+    size_t removed = 0;
+    for (size_t i = 0; i < count; i++) {
+        bool young = now_ms - entries[i].mtime_ns / 1000000 <= window_ms;
+        if (i < (size_t)CBM_WORKER_LOG_KEEP_RECENT || young) {
+            continue;
+        }
+        char path[INDEX_WORKER_PATH_CAP];
+        int written = snprintf(path, sizeof(path), "%s/%s", logs_dir, entries[i].name);
+        if (written > 0 && written < (int)sizeof(path) && cbm_unlink(path) == 0) {
+            removed++;
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        free(entries[i].name);
+    }
+    free(entries);
+    return removed;
 }
 
 static bool worker_result_succeeded(const cbm_index_worker_result_t *result) {
@@ -715,6 +825,20 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
         (void)cbm_unlink(handle->log_path);
         free(handle);
         return -1;
+    }
+
+    /* One .worker-log-* per attempt accumulates here and only clean runs
+     * delete theirs: rotate on the way in, with this run's log among the
+     * newest. */
+    char cache_dir[INDEX_WORKER_PATH_CAP] = {0};
+    char logs_dir[INDEX_WORKER_PATH_CAP];
+    if (worker_cache_dir(cache_dir) && worker_logs_dir(cache_dir, logs_dir, sizeof(logs_dir))) {
+        size_t rotated = cbm_index_worker_logs_rotate(logs_dir, (int64_t)cbm_now_ms());
+        if (rotated > 0) {
+            char removed_text[CBM_SZ_32];
+            (void)snprintf(removed_text, sizeof(removed_text), "%zu", rotated);
+            cbm_log_info("index.worker_log_rotate", "removed", removed_text);
+        }
     }
 
     const char *argv[INDEX_WORKER_ARGV_CAP];

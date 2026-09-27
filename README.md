@@ -636,7 +636,7 @@ Every MCP tool can be invoked as a local, one-shot command. CLI tools neither st
 
 ### Request Metrics
 
-The daemon aggregates served requests from the `mcp`, `cli`, `hook`, `http`, and `index` sources into hourly RED buckets (rate, errors, and duration) per source, request name, and project. Counters accumulate in memory, flush once a minute to the additive `metrics_requests` table in `_config.db`, and are retained for 90 days. Query them at `GET /api/metrics?hours=N` on the UI port, or open the **Control** tab for the request-metrics views. The data remains local, and older databases open without a separate metrics store or destructive migration.
+The daemon aggregates served requests from the `mcp`, `cli`, `hook`, `http`, and `index` sources into hourly RED buckets (rate, errors, and duration) per source, request name, and project. An `error` is a real failure of the request, not probe noise: a hook request with nothing to augment and an HTTP 404 for a route the UI does not serve (monitoring probes, stale asset URLs) are requests without an error, and request names outside the tool/event catalogs fold to `_other`. Counters accumulate in memory, flush once a minute to the additive `metrics_requests` table in `_config.db`, and are retained for 90 days. Query them at `GET /api/metrics?hours=N` on the UI port, or open the **Control** tab for the request-metrics views. The data remains local, and older databases open without a separate metrics store or destructive migration.
 
 Commands that mutate graph data use shared OS-backed, per-project locks. This serializes conflicting work from CLI and MCP sessions on the same project while allowing unrelated projects to proceed independently.
 
