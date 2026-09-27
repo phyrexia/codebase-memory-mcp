@@ -3649,6 +3649,12 @@ TEST(cli_skill_files_content) {
     ASSERT(strstr(sk[0].content, "Cypher") != NULL);
     ASSERT(strstr(sk[0].content, "15 MCP Tools") != NULL);
 
+    /* Indexing hygiene: cheap project listing, repo root as repo_path, no
+     * gratuitous `name` override, long-lived worktrees only. */
+    ASSERT(strstr(sk[0].content, "metadata_only: true") != NULL);
+    ASSERT(strstr(sk[0].content, "git rev-parse --show-toplevel") != NULL);
+    ASSERT(strstr(sk[0].content, "index_worktree") != NULL);
+
     /* Gotchas section */
     ASSERT(strstr(sk[0].content, "Gotchas") != NULL);
 
@@ -13856,6 +13862,11 @@ TEST(cli_agent_instructions_content) {
     ASSERT(strstr(instr, "must not call or claim MCP access") != NULL);
     ASSERT(strstr(instr, "# Codebase Memory\n") != NULL);
     ASSERT(strstr(instr, "## Codebase Knowledge Graph (codebase-memory-mcp)\n") != NULL);
+    /* Indexing hygiene mirrors the skill: cheap project listing, repo root as
+     * repo_path, no gratuitous `name` override, long-lived worktrees only. */
+    ASSERT(strstr(instr, "metadata_only: true") != NULL);
+    ASSERT(strstr(instr, "git rev-parse --show-toplevel") != NULL);
+    ASSERT(strstr(instr, "index_worktree") != NULL);
     PASS();
 }
 
