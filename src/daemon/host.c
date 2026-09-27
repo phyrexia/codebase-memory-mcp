@@ -690,7 +690,10 @@ bool cbm_daemon_host_runtime_knobs_load_for_test(cbm_daemon_host_runtime_knobs_t
     cbm_config_t *config = NULL;
     cbm_daemon_host_runtime_knobs_t loaded = {0};
     bool loaded_ok = host_runtime_knobs_load(&loaded, &config);
-    if (loaded_ok && knobs != NULL) {
+    /* host_runtime_knobs_load initializes the struct to the sentinel defaults
+     * before any of its failure returns, so the out-param is always well
+     * defined: only the return value says whether startup may proceed. */
+    if (knobs != NULL) {
         *knobs = loaded;
     }
     cbm_config_close(config);
