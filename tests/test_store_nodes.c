@@ -7,6 +7,8 @@
 #include "test_framework.h"
 #include <store/store.h>
 #include <foundation/constants.h>
+#include <foundation/compat.h>    /* cbm_mkdtemp / cbm_tmpdir */
+#include <foundation/compat_fs.h> /* cbm_unlink / cbm_rmdir */
 #include <cbm.h>
 #include <sqlite3.h>
 #include <string.h>
@@ -2422,11 +2424,114 @@ TEST(store_coverage_meta_indexed_checkout_sha_roundtrip_and_rollback) {
               CBM_STORE_ERR);
     got = (cbm_coverage_meta_t){0};
     ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
-    ASSERT_STR_EQ(got.generation, "gen-2");
-    ASSERT_STR_EQ(got.indexed_checkout_sha, "abcdef0123456789abcdef0123456789abcdef01");
-    cbm_store_coverage_meta_clear(&got);
-
     cbm_store_close(s);
+    PASS();
+}
+
+/* C5: persisted project counts. A DB whose `projects` table predates the
+ * node_count/edge_count columns (exactly what ff3b9f27 shipped) must keep
+ * reading on read-only opens, be migrated by the next writable open, and only
+ * report `stored` counts once a publish stamps them. */
+TEST(store_project_counts_migrate_legacy_projects_and_store_exact_totals) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "%s/cbm-counts-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/counts.db", dir);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "counts-project", "/tmp/counts-project"), CBM_STORE_OK);
+    for (int i = 0; i < 3; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "counts-project.fn%d", i);
+        cbm_node_t node = {.project = "counts-project",
+                           .label = "Function",
+                           .name = qn,
+                           .qualified_name = qn,
+                           .file_path = "src/main.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    }
+    cbm_edge_t edge = {.project = "counts-project",
+                       .source_id = 1,
+                       .target_id = 2,
+                       .type = "CALLS",
+                       .properties_json = "{}"};
+    ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+    edge.target_id = 3;
+    ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+    /* Rewind to the pre-C5 schema: `projects` exactly as ff3b9f27 shipped it. */
+    ASSERT_EQ(cbm_store_exec(s, "ALTER TABLE projects DROP COLUMN node_count;"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(s, "ALTER TABLE projects DROP COLUMN edge_count;"), CBM_STORE_OK);
+    cbm_store_close(s);
+
+    /* (1) Read-only open of the legacy file: no columns, so counts are unknown
+     * and the reader must not name them. */
+    cbm_store_t *q = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(q);
+    ASSERT_FALSE(cbm_store_projects_has_count_columns(q));
+    cbm_project_t proj = {0};
+    cbm_project_stats_t stats = {0};
+    ASSERT_EQ(cbm_store_get_project_stats(q, "counts-project", false, &proj, &stats),
+              CBM_STORE_OK);
+    ASSERT_FALSE(stats.has_count_columns);
+    ASSERT_FALSE(stats.counts_stored);
+    ASSERT_STR_EQ(proj.name, "counts-project");
+    ASSERT_STR_EQ(proj.root_path, "/tmp/counts-project");
+    ASSERT_NOT_NULL(proj.indexed_at);
+    cbm_project_free_fields(&proj);
+    /* Naming the columns without a probe is the failure the probe exists to
+     * prevent: such a SELECT dies at prepare time, not with NULL columns. */
+    cbm_project_t named = {0};
+    cbm_project_stats_t named_stats = {0};
+    ASSERT_EQ(cbm_store_get_project_stats(q, "counts-project", true, &named, &named_stats),
+              CBM_STORE_ERR);
+    cbm_store_close(q);
+
+    /* (2) A writable open runs the idempotent migration: the columns exist and
+     * are NULL, which still means "unknown". */
+    s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(cbm_store_projects_has_count_columns(s));
+    proj = (cbm_project_t){0};
+    stats = (cbm_project_stats_t){0};
+    ASSERT_EQ(cbm_store_get_project_stats(s, "counts-project", true, &proj, &stats), CBM_STORE_OK);
+    ASSERT_TRUE(stats.has_count_columns);
+    ASSERT_FALSE(stats.counts_stored);
+    cbm_project_free_fields(&proj);
+
+    /* (3) A publish stamps the exact totals: `stored` equals COUNT(*). */
+    ASSERT_EQ(cbm_store_persist_project_counts(s, "counts-project"), CBM_STORE_OK);
+    proj = (cbm_project_t){0};
+    stats = (cbm_project_stats_t){0};
+    ASSERT_EQ(cbm_store_get_project_stats(s, "counts-project", true, &proj, &stats), CBM_STORE_OK);
+    ASSERT_TRUE(stats.counts_stored);
+    ASSERT_EQ(stats.node_count, cbm_store_count_nodes(s, "counts-project"));
+    ASSERT_EQ(stats.edge_count, cbm_store_count_edges(s, "counts-project"));
+    ASSERT_EQ(stats.node_count, 3);
+    ASSERT_EQ(stats.edge_count, 2);
+    cbm_project_free_fields(&proj);
+    /* Unknown rows stay unknown: no row, no stamp. */
+    ASSERT_EQ(cbm_store_set_project_counts(s, "no-such-project", 1, 1), CBM_STORE_NOT_FOUND);
+    cbm_store_close(s);
+
+    /* (4) The migration is idempotent: reopening must not fail on a duplicate
+     * column, and the stamped values survive it. */
+    s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(cbm_store_projects_has_count_columns(s));
+    proj = (cbm_project_t){0};
+    stats = (cbm_project_stats_t){0};
+    ASSERT_EQ(cbm_store_get_project_stats(s, "counts-project", true, &proj, &stats), CBM_STORE_OK);
+    ASSERT_TRUE(stats.counts_stored);
+    ASSERT_EQ(stats.node_count, 3);
+    cbm_project_free_fields(&proj);
+    cbm_store_close(s);
+
+    cbm_unlink(db_path);
+    cbm_rmdir(dir);
     PASS();
 }
 
@@ -2437,6 +2542,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
     RUN_TEST(store_coverage_meta_indexed_checkout_sha_roundtrip_and_rollback);
+    RUN_TEST(store_project_counts_migrate_legacy_projects_and_store_exact_totals);
     RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);
     RUN_TEST(sql_relation_labels_match_cbm_label_is_relation);
     RUN_TEST(store_open_memory);

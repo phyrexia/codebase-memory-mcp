@@ -2296,6 +2296,16 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
     cbm_log_info("publish.timing", "block", "get_project", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t_pub)));
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
+    /* C5: stamp the persisted node/edge counts while the generation is still
+     * private, so list_projects serves `stored` totals instead of COUNT(*)
+     * scans. The values are derived from the staged tables themselves, so
+     * `stored` is exactly what a later COUNT(*) would report. */
+    if (ok && cbm_store_persist_project_counts(store, generation->project) != CBM_STORE_OK) {
+        ok = false;
+    }
+    cbm_log_info("publish.timing", "block", "project_counts", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t_pub)));
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
     cbm_coverage_meta_t meta = generation->coverage_meta;
     meta.generation = have_project_info ? project_info.indexed_at : NULL;
     meta.coverage_version = CBM_SEMANTIC_INDEX_VERSION;

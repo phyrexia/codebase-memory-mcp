@@ -9,6 +9,7 @@
 // for ISO timestamp
 
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
@@ -144,6 +145,9 @@ struct cbm_store {
 
     sqlite3_stmt *stmt_upsert_project;
     sqlite3_stmt *stmt_get_project;
+    sqlite3_stmt *stmt_get_project_stats_full;
+    sqlite3_stmt *stmt_get_project_stats_legacy;
+    sqlite3_stmt *stmt_set_project_counts;
     sqlite3_stmt *stmt_list_projects;
     sqlite3_stmt *stmt_delete_project;
 
@@ -257,12 +261,72 @@ static bool coverage_meta_has_checkout_column(cbm_store_t *s) {
     return has;
 }
 
+/* C5 count-column probe, one PRAGMA per call. The result is cached per DB file
+ * generation by the project registry, so the catalog is read once per
+ * published generation instead of once per list_projects call. */
+enum {
+    PROJECTS_COUNT_COL_NODE = 1u,
+    PROJECTS_COUNT_COL_EDGE = 2u,
+    PROJECTS_COUNT_COL_ALL = 3u,
+};
+
+#if defined(CBM_CLI_ENABLE_TEST_API)
+static atomic_size_t g_projects_count_column_probes = 0;
+
+size_t cbm_store_projects_count_column_probes_for_test(void) {
+    return atomic_load_explicit(&g_projects_count_column_probes, memory_order_relaxed);
+}
+
+void cbm_store_projects_count_column_probes_reset_for_test(void) {
+    atomic_store_explicit(&g_projects_count_column_probes, 0, memory_order_relaxed);
+}
+
+static void projects_count_column_probe_tick(void) {
+    atomic_fetch_add_explicit(&g_projects_count_column_probes, 1, memory_order_relaxed);
+}
+#else
+static void projects_count_column_probe_tick(void) {}
+#endif
+
+static unsigned projects_count_column_mask(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return 0;
+    }
+    projects_count_column_probe_tick();
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "PRAGMA table_info(projects);", CBM_NOT_FOUND, &stmt, NULL) !=
+        SQLITE_OK) {
+        return 0;
+    }
+    unsigned mask = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW && mask != PROJECTS_COUNT_COL_ALL) {
+        const char *name = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        if (!name) {
+            continue;
+        }
+        if (strcmp(name, "node_count") == 0) {
+            mask |= PROJECTS_COUNT_COL_NODE;
+        } else if (strcmp(name, "edge_count") == 0) {
+            mask |= PROJECTS_COUNT_COL_EDGE;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return mask;
+}
+
+bool cbm_store_projects_has_count_columns(cbm_store_t *s) {
+    return projects_count_column_mask(s) == PROJECTS_COUNT_COL_ALL;
+}
+
 static int init_schema(cbm_store_t *s) {
     const char *ddl =
         "CREATE TABLE IF NOT EXISTS projects ("
         "  name TEXT PRIMARY KEY,"
         "  indexed_at TEXT NOT NULL,"
-        "  root_path TEXT NOT NULL"
+        "  root_path TEXT NOT NULL,"
+        "  node_count INTEGER,"
+        "  edge_count INTEGER"
         ");"
         "CREATE TABLE IF NOT EXISTS file_hashes ("
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
@@ -385,6 +449,23 @@ static int init_schema(cbm_store_t *s) {
         exec_sql(s, "ALTER TABLE index_coverage_meta ADD COLUMN indexed_checkout_sha TEXT;") !=
             CBM_STORE_OK) {
         return CBM_STORE_ERR;
+    }
+
+    /* C5 migration, same shape as BT-240: CREATE TABLE IF NOT EXISTS cannot add
+     * a column to a `projects` table that predates it, so add each missing one
+     * idempotently on every writable open. Read-only query opens skip
+     * init_schema entirely and the readers probe the columns instead (a legacy
+     * DB simply reports unknown counts until its next published generation). */
+    {
+        unsigned count_columns = projects_count_column_mask(s);
+        if ((count_columns & PROJECTS_COUNT_COL_NODE) == 0 &&
+            exec_sql(s, "ALTER TABLE projects ADD COLUMN node_count INTEGER;") != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
+        if ((count_columns & PROJECTS_COUNT_COL_EDGE) == 0 &&
+            exec_sql(s, "ALTER TABLE projects ADD COLUMN edge_count INTEGER;") != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
     }
 
     /* Schema-compat probe (#768): DBs created before the local_name_gen
@@ -1327,6 +1408,9 @@ void cbm_store_close(cbm_store_t *s) {
 
     finalize_stmt(&s->stmt_upsert_project);
     finalize_stmt(&s->stmt_get_project);
+    finalize_stmt(&s->stmt_get_project_stats_full);
+    finalize_stmt(&s->stmt_get_project_stats_legacy);
+    finalize_stmt(&s->stmt_set_project_counts);
     finalize_stmt(&s->stmt_list_projects);
     finalize_stmt(&s->stmt_delete_project);
 
@@ -2512,6 +2596,94 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) 
     }
     sqlite3_reset(stmt);
     return CBM_STORE_NOT_FOUND;
+}
+
+/* C5 reader: one project row plus its persisted counts, in one statement. Two
+ * variants — SQL_FULL names the count columns, SQL_LEGACY does not — so a DB
+ * whose `projects` table predates them keeps reading instead of failing at
+ * prepare time with "no such column". `has_count_columns` must come from
+ * cbm_store_projects_has_count_columns() or from a cached probe result for
+ * this file generation; the reader never guesses. */
+int cbm_store_get_project_stats(cbm_store_t *s, const char *name, bool has_count_columns,
+                                cbm_project_t *out, cbm_project_stats_t *stats) {
+    if (stats) {
+        memset(stats, 0, sizeof(*stats));
+        stats->has_count_columns = has_count_columns;
+    }
+    static const char sql_full[] =
+        "SELECT name, indexed_at, root_path, node_count, edge_count FROM projects WHERE name = ?1;";
+    static const char sql_legacy[] =
+        "SELECT name, indexed_at, root_path FROM projects WHERE name = ?1;";
+    sqlite3_stmt **slot =
+        has_count_columns ? &s->stmt_get_project_stats_full : &s->stmt_get_project_stats_legacy;
+    sqlite3_stmt *stmt = prepare_cached(s, slot, has_count_columns ? sql_full : sql_legacy);
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, SKIP_ONE, name);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_reset(stmt);
+        return CBM_STORE_NOT_FOUND;
+    }
+    out->name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+    out->indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+    out->root_path = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_2));
+    if (stats && has_count_columns) {
+        bool have_nodes = sqlite3_column_type(stmt, ST_COL_3) != SQLITE_NULL;
+        bool have_edges = sqlite3_column_type(stmt, ST_COL_4) != SQLITE_NULL;
+        /* NULL means "unknown": a generation published before the columns
+         * existed, or one written by a binary that does not stamp them. */
+        stats->counts_stored = have_nodes && have_edges;
+        if (stats->counts_stored) {
+            stats->node_count = sqlite3_column_int64(stmt, ST_COL_3);
+            stats->edge_count = sqlite3_column_int64(stmt, ST_COL_4);
+        }
+    }
+    /* Cached SELECT statements must not remain parked on SQLITE_ROW — see the
+     * same note in cbm_store_get_project(). */
+    sqlite3_reset(stmt);
+    return CBM_STORE_OK;
+}
+
+int cbm_store_set_project_counts(cbm_store_t *s, const char *name, int64_t node_count,
+                                 int64_t edge_count) {
+    if (!s || !s->db || !name) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_set_project_counts,
+                       "UPDATE projects SET node_count = ?2, edge_count = ?3 WHERE name = ?1;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, SKIP_ONE, name);
+    sqlite3_bind_int64(stmt, ST_COL_2, node_count);
+    sqlite3_bind_int64(stmt, ST_COL_3, edge_count);
+    int rc = sqlite3_step(stmt);
+    sqlite3_reset(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "set_project_counts");
+        return CBM_STORE_ERR;
+    }
+    return sqlite3_changes(s->db) > 0 ? CBM_STORE_OK : CBM_STORE_NOT_FOUND;
+}
+
+int cbm_store_persist_project_counts(cbm_store_t *s, const char *project) {
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    /* The stored values must equal what a later COUNT(*) reports, so derive
+     * them from the freshly written tables instead of trusting producer-side
+     * tallies (which can differ, e.g. after orphan-edge pruning). */
+    int nodes = cbm_store_count_nodes(s, project);
+    int edges = cbm_store_count_edges(s, project);
+    if (nodes < 0 || edges < 0) {
+        return CBM_STORE_ERR;
+    }
+    return cbm_store_set_project_counts(s, project, nodes, edges);
 }
 
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
