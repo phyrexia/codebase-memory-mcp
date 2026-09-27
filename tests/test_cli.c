@@ -15695,19 +15695,19 @@ TEST(cli_config_index_workers_parse_is_strict_and_bounded) {
     PASS();
 }
 
-/* The B1 config tests point the CLI at a private cache. ASSERT_* returns out of
- * a failing test (test_framework.h), so the restore and the rmtree belong to
+/* The B1/C8 config tests point the CLI at a private cache. ASSERT_* returns out
+ * of a failing test (test_framework.h), so the restore and the rmtree belong to
  * the wrapper at the end of each test: an aborted test must not leave
  * CBM_CACHE_DIR pointing at a cache holding a _config.db — every later
  * `uninstall` in this shared runner would then fail against an index it cannot
- * remove (same contract as b1_knobs_env_end in test_daemon_application.c). */
+ * remove (same contract as knobs_env_end in test_daemon_application.c). */
 typedef struct {
     char tmpdir[512];
     char *saved_cache;
     bool ready;
-} cli_budget_cfg_env_t;
+} cli_runtime_cfg_env_t;
 
-static bool cli_budget_cfg_env_begin(cli_budget_cfg_env_t *env) {
+static bool cli_runtime_cfg_env_begin(cli_runtime_cfg_env_t *env) {
     memset(env, 0, sizeof(*env));
     const char *prior = getenv("CBM_CACHE_DIR");
     env->saved_cache = prior ? strdup(prior) : NULL;
@@ -15720,7 +15720,7 @@ static bool cli_budget_cfg_env_begin(cli_budget_cfg_env_t *env) {
     return true;
 }
 
-static void cli_budget_cfg_env_end(cli_budget_cfg_env_t *env) {
+static void cli_runtime_cfg_env_end(cli_runtime_cfg_env_t *env) {
     if (env->saved_cache) {
         cbm_setenv("CBM_CACHE_DIR", env->saved_cache, 1);
         free(env->saved_cache);
@@ -15735,8 +15735,8 @@ static void cli_budget_cfg_env_end(cli_budget_cfg_env_t *env) {
 }
 
 static int cli_config_index_budget_keys_round_trip_reset_and_persist_body(
-    cli_budget_cfg_env_t *env) {
-    bool ready = cli_budget_cfg_env_begin(env);
+    cli_runtime_cfg_env_t *env) {
+    bool ready = cli_runtime_cfg_env_begin(env);
     ASSERT_TRUE(ready);
     char *tmpdir = env->tmpdir;
 
@@ -15798,15 +15798,15 @@ static int cli_config_index_budget_keys_round_trip_reset_and_persist_body(
 }
 
 TEST(cli_config_index_budget_keys_round_trip_reset_and_persist) {
-    cli_budget_cfg_env_t env = {0};
+    cli_runtime_cfg_env_t env = {0};
     int rc = cli_config_index_budget_keys_round_trip_reset_and_persist_body(&env);
-    cli_budget_cfg_env_end(&env);
+    cli_runtime_cfg_env_end(&env);
     return rc;
 }
 
 static int cli_config_index_budget_keys_reject_invalid_and_out_of_range_values_body(
-    cli_budget_cfg_env_t *env) {
-    bool ready = cli_budget_cfg_env_begin(env);
+    cli_runtime_cfg_env_t *env) {
+    bool ready = cli_runtime_cfg_env_begin(env);
     ASSERT_TRUE(ready);
 
     char out[512];
@@ -15864,9 +15864,9 @@ static int cli_config_index_budget_keys_reject_invalid_and_out_of_range_values_b
 }
 
 TEST(cli_config_index_budget_keys_reject_invalid_and_out_of_range_values) {
-    cli_budget_cfg_env_t env = {0};
+    cli_runtime_cfg_env_t env = {0};
     int rc = cli_config_index_budget_keys_reject_invalid_and_out_of_range_values_body(&env);
-    cli_budget_cfg_env_end(&env);
+    cli_runtime_cfg_env_end(&env);
     return rc;
 }
 
@@ -15916,6 +15916,241 @@ TEST(cli_config_index_budget_readers_reject_truncated_and_embedded_nul_values) {
     /* And a well-formed value still reads through the exact-byte path. */
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, "1536"), 0);
     ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg), 1536);
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* ── C8: max_clients ──────────────────────────────────────────────────
+ * The durable layer of CBM_MAX_CLIENTS. Contract: the `index_workers` shape
+ * ("auto" or a bounded decimal) over the range the env knob is clamped into,
+ * [1, CBM_DAEMON_MAX_CLIENTS_LIMIT] — so a value `config set` accepts is
+ * always one the cap would have honoured as written, and a value the cap
+ * would have had to clamp is refused instead of stored. */
+TEST(cli_config_max_clients_parse_is_strict_and_bounded) {
+    size_t out = 12345;
+
+    /* Sentinel: auto. */
+    ASSERT_TRUE(cbm_config_parse_max_clients("auto", &out));
+    ASSERT_EQ(out, 0);
+
+    /* The range is 1..CBM_DAEMON_MAX_CLIENTS_LIMIT, inclusive at both ends. */
+    ASSERT_TRUE(cbm_config_parse_max_clients("1", &out));
+    ASSERT_EQ(out, 1);
+    ASSERT_TRUE(cbm_config_parse_max_clients("0128", &out));
+    ASSERT_EQ(out, 128);
+    ASSERT_TRUE(cbm_config_parse_max_clients("512", &out));
+    ASSERT_EQ(out, 512);
+    ASSERT_FALSE(cbm_config_parse_max_clients("0", &out));
+    ASSERT_FALSE(cbm_config_parse_max_clients("00", &out));
+    ASSERT_FALSE(cbm_config_parse_max_clients("513", &out));
+
+    const char *invalid[] = {"",
+                             "0",
+                             "00",
+                             "513",
+                             "-1",
+                             "+2",
+                             " 2",
+                             "2 ",
+                             "1.5",
+                             "0x10",
+                             "2x",
+                             "abc",
+                             "auto ",
+                             "AUTO",
+                             "off",
+                             "1e3",
+                             "123456789012345678901234567890"};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        ASSERT_FALSE(cbm_config_parse_max_clients(invalid[i], &out));
+    }
+
+    /* The ceiling is the limit CBM_MAX_CLIENTS is clamped into, so it is the
+     * bound this parser must enforce rather than a second number to keep in
+     * step with it. */
+    ASSERT_TRUE(cbm_config_parse_max_clients("512", &out));
+    ASSERT_EQ(out, CBM_CONFIG_MAX_CLIENTS_MAX);
+
+    /* NULL arguments are refused, not dereferenced. */
+    ASSERT_FALSE(cbm_config_parse_max_clients(NULL, &out));
+    ASSERT_FALSE(cbm_config_parse_max_clients("128", NULL));
+    PASS();
+}
+
+static int cli_config_max_clients_key_round_trip_reset_and_persist_body(
+    cli_runtime_cfg_env_t *env) {
+    bool ready = cli_runtime_cfg_env_begin(env);
+    ASSERT_TRUE(ready);
+    char *tmpdir = env->tmpdir;
+
+    char out[512];
+    /* Discoverable and defaulted to the sentinel on an empty store. */
+    bool listed = false;
+    for (size_t i = 0; i < cbm_cli_config_key_count_for_testing(); i++) {
+        const char *key = cbm_cli_config_key_at_for_testing(i);
+        listed = listed || (key && strcmp(key, CBM_CONFIG_MAX_CLIENTS) == 0);
+    }
+    ASSERT_TRUE(listed);
+
+    char *get_clients[] = {"get", CBM_CONFIG_MAX_CLIENTS};
+    ASSERT_EQ(cli_config_cmd_capture(2, get_clients, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "auto\n");
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    size_t clients = 12345;
+    ASSERT_EQ(cbm_config_max_clients(cfg, &clients), CBM_CONFIG_MAX_CLIENTS_UNSET);
+    ASSERT_EQ(clients, 0);
+    cbm_config_close(cfg);
+
+    /* 64 is in range on any host; the ceiling is exercised by the parse and
+     * rejection tests, which do not need a store. */
+    char *set_clients[] = {"set", CBM_CONFIG_MAX_CLIENTS, "64"};
+    ASSERT_EQ(cli_config_cmd_capture(3, set_clients, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_clients, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "64\n");
+
+    /* The daemon-side reader agrees with the CLI, and the value survives a
+     * reopen of _config.db — the durability C8 exists for. */
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_max_clients(cfg, &clients), CBM_CONFIG_MAX_CLIENTS_SET);
+    ASSERT_EQ(clients, 64);
+    cbm_config_close(cfg);
+
+    /* Reset returns the key to its sentinel. */
+    char *reset_clients[] = {"reset", CBM_CONFIG_MAX_CLIENTS};
+    ASSERT_EQ(cli_config_cmd_capture(2, reset_clients, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_clients, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "auto\n");
+
+    PASS();
+}
+
+TEST(cli_config_max_clients_key_round_trip_reset_and_persist) {
+    cli_runtime_cfg_env_t env = {0};
+    int rc = cli_config_max_clients_key_round_trip_reset_and_persist_body(&env);
+    cli_runtime_cfg_env_end(&env);
+    return rc;
+}
+
+static int cli_config_max_clients_key_rejects_invalid_and_out_of_range_values_body(
+    cli_runtime_cfg_env_t *env) {
+    bool ready = cli_runtime_cfg_env_begin(env);
+    ASSERT_TRUE(ready);
+
+    char out[512];
+    char *set_clients[] = {"set", CBM_CONFIG_MAX_CLIENTS, "64"};
+    char *get_clients[] = {"get", CBM_CONFIG_MAX_CLIENTS};
+    ASSERT_EQ(cli_config_cmd_capture(3, set_clients, out, sizeof(out)), 0);
+
+    /* Every malformed value is refused with a non-zero exit, clean stdout, and
+     * the stored value left exactly as it was. */
+    const char *invalid[] = {"",      "0",    "00",   "513", "-1",   "+2",       " 2",
+                             "2 ",    "1.5",  "0x10", "2x",  "abc",  "auto ",    "AUTO",
+                             "off",   "1e3",  "128x",
+                             "123456789012345678901234567890"};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        char *argv_set[] = {"set", CBM_CONFIG_MAX_CLIENTS, (char *)invalid[i]};
+        ASSERT_TRUE(cli_config_cmd_capture(3, argv_set, out, sizeof(out)) != 0);
+        ASSERT_STR_EQ(out, "");
+        ASSERT_EQ(cli_config_cmd_capture(2, get_clients, out, sizeof(out)), 0);
+        ASSERT_STR_EQ(out, "64\n");
+    }
+
+    /* One past the ceiling is refused and the ceiling itself is accepted: the
+     * bound is a hard rule, not a hint. */
+    char over[64];
+    snprintf(over, sizeof(over), "%zu", CBM_CONFIG_MAX_CLIENTS_MAX + 1U);
+    char *argv_over[] = {"set", CBM_CONFIG_MAX_CLIENTS, over};
+    ASSERT_TRUE(cli_config_cmd_capture(3, argv_over, out, sizeof(out)) != 0);
+    ASSERT_STR_EQ(out, "");
+
+    char at[64];
+    snprintf(at, sizeof(at), "%zu", CBM_CONFIG_MAX_CLIENTS_MAX);
+    char *argv_at[] = {"set", CBM_CONFIG_MAX_CLIENTS, at};
+    ASSERT_EQ(cli_config_cmd_capture(3, argv_at, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_clients, out, sizeof(out)), 0);
+    /* CBM_CONFIG_MAX_CLIENTS_MAX is 512 (the CBM_MAX_CLIENTS clamp ceiling),
+     * pinned by the parse test above. */
+    ASSERT_STR_EQ(out, "512\n");
+
+    PASS();
+}
+
+TEST(cli_config_max_clients_key_rejects_invalid_and_out_of_range_values) {
+    cli_runtime_cfg_env_t env = {0};
+    int rc = cli_config_max_clients_key_rejects_invalid_and_out_of_range_values_body(&env);
+    cli_runtime_cfg_env_end(&env);
+    return rc;
+}
+
+TEST(cli_config_max_clients_reader_reports_hand_edits_it_refuses) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-cfg-clients-bytes-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    size_t clients = 12345;
+
+    /* Absent and the sentinel are the user's choice of the default, not a
+     * problem to warn about. */
+    ASSERT_EQ(cbm_config_max_clients(cfg, &clients), CBM_CONFIG_MAX_CLIENTS_UNSET);
+    ASSERT_EQ(clients, 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MAX_CLIENTS, "auto"), 0);
+    ASSERT_EQ(cbm_config_max_clients(cfg, &clients), CBM_CONFIG_MAX_CLIENTS_UNSET);
+    ASSERT_EQ(clients, 0);
+
+    /* The readers take the stored TEXT by its exact byte length (no truncating
+     * copy like cbm_config_get()'s 4 KiB TLS buffer), so a value whose visible
+     * prefix is a valid 128 but whose stored bytes continue is refused — and
+     * reported as INVALID rather than as an unset key, because the daemon warns
+     * about a hand edit and stays quiet about a default. */
+    char truncated[4097];
+    memset(truncated, '0', sizeof(truncated) - 6);
+    memcpy(truncated + sizeof(truncated) - 6, "128xy", 5);
+    truncated[sizeof(truncated) - 1] = '\0';
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MAX_CLIENTS, truncated), 0);
+    ASSERT_EQ(cbm_config_max_clients(cfg, &clients), CBM_CONFIG_MAX_CLIENTS_INVALID);
+    ASSERT_EQ(clients, 0);
+
+    char overlong[36];
+    memset(overlong, '0', sizeof(overlong) - 2);
+    overlong[sizeof(overlong) - 2] = '7';
+    overlong[sizeof(overlong) - 1] = '\0';
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MAX_CLIENTS, overlong), 0);
+    ASSERT_EQ(cbm_config_max_clients(cfg, &clients), CBM_CONFIG_MAX_CLIENTS_INVALID);
+    ASSERT_EQ(clients, 0);
+
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", tmpdir);
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open(dbpath, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(stmt, 1, CBM_CONFIG_MAX_CLIENTS, -1, SQLITE_TRANSIENT), SQLITE_OK);
+    const char embedded_nul[] = {'1', '2', '8', '\0', 'x'};
+    ASSERT_EQ(sqlite3_bind_text(stmt, 2, embedded_nul, (int)sizeof(embedded_nul), SQLITE_TRANSIENT),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    ASSERT_EQ(cbm_config_max_clients(cfg, &clients), CBM_CONFIG_MAX_CLIENTS_INVALID);
+    ASSERT_EQ(clients, 0);
+
+    /* And a well-formed value still reads through the exact-byte path. */
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MAX_CLIENTS, "128"), 0);
+    ASSERT_EQ(cbm_config_max_clients(cfg, &clients), CBM_CONFIG_MAX_CLIENTS_SET);
+    ASSERT_EQ(clients, 128);
+
+    /* No database, no verdict. */
+    ASSERT_EQ(cbm_config_max_clients(NULL, &clients), CBM_CONFIG_MAX_CLIENTS_UNSET);
+    ASSERT_EQ(clients, 0);
 
     cbm_config_close(cfg);
     test_rmdir_r(tmpdir);
@@ -17403,6 +17638,10 @@ SUITE(cli) {
     RUN_TEST(cli_config_index_budget_keys_round_trip_reset_and_persist);
     RUN_TEST(cli_config_index_budget_keys_reject_invalid_and_out_of_range_values);
     RUN_TEST(cli_config_index_budget_readers_reject_truncated_and_embedded_nul_values);
+    RUN_TEST(cli_config_max_clients_parse_is_strict_and_bounded);
+    RUN_TEST(cli_config_max_clients_key_round_trip_reset_and_persist);
+    RUN_TEST(cli_config_max_clients_key_rejects_invalid_and_out_of_range_values);
+    RUN_TEST(cli_config_max_clients_reader_reports_hand_edits_it_refuses);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
     RUN_TEST(cli_config_watcher_enabled_default_and_persist);
