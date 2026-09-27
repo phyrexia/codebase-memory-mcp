@@ -2424,6 +2424,10 @@ TEST(store_coverage_meta_indexed_checkout_sha_roundtrip_and_rollback) {
               CBM_STORE_ERR);
     got = (cbm_coverage_meta_t){0};
     ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.generation, "gen-2");
+    ASSERT_STR_EQ(got.indexed_checkout_sha, "abcdef0123456789abcdef0123456789abcdef01");
+    cbm_store_coverage_meta_clear(&got);
+
     cbm_store_close(s);
     PASS();
 }
