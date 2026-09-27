@@ -6106,14 +6106,20 @@ TEST(tool_index_status_includes_git_metadata) {
 /* BT-240 RED: a live checkout SHA is not proof of the generation that produced
  * graph content. Older databases lack an indexed-checkout identity, so verbose
  * status must fail closed as unknown while exposing graph generation
- * separately. */
+ * separately.
+ *
+ * Wire shape: since upstream's lean-transport split, the model-facing default
+ * is a compact tree (unquoted keys) and only format:"json" returns the
+ * structured JSON these key-level asserts pin — the same spelling upstream's
+ * own tool_lean_defaults_schema_and_status uses for its key-level asserts. */
 TEST(tool_index_status_fails_closed_without_indexed_checkout_identity) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
     char *resp = cbm_mcp_handle_tool(
-        srv, "index_status", "{\"project\":\"test-project\",\"verbose\":true}");
+        srv, "index_status",
+        "{\"project\":\"test-project\",\"verbose\":true,\"format\":\"json\"}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -6138,15 +6144,35 @@ TEST(tool_index_status_omits_freshness_by_default) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
+    /* Lean-default guard on the model-facing transport: the compact tree keys
+     * are unquoted, so the omission asserts are spelled quote-free here and
+     * hold for either wire shape (a leaked block would surface as `freshness:`
+     * / `status_available:` just the same). */
     char *resp = cbm_mcp_handle_tool(srv, "index_status", "{\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "\"status\""));
-    ASSERT_NULL(strstr(inner, "\"freshness\""));
+    ASSERT_NOT_NULL(strstr(inner, "test-project"));
+    ASSERT_NULL(strstr(inner, "freshness"));
     ASSERT_NULL(strstr(inner, "indexed_checkout_sha"));
     /* BT-240 increment 3: the worktree-status snapshot is part of the
      * verbose-only freshness block and must not leak into the default call. */
+    ASSERT_NULL(strstr(inner, "status_available"));
+    ASSERT_NULL(strstr(inner, "tracked_changes"));
+    ASSERT_NULL(strstr(inner, "untracked_source"));
+    free(inner);
+    free(resp);
+
+    /* Same guard on the machine-readable projection, with the JSON key-level
+     * asserts (format:"json" is upstream's structured spelling). */
+    resp = cbm_mcp_handle_tool(srv, "index_status",
+                               "{\"project\":\"test-project\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status\""));
+    ASSERT_NULL(strstr(inner, "\"freshness\""));
+    ASSERT_NULL(strstr(inner, "indexed_checkout_sha"));
     ASSERT_NULL(strstr(inner, "status_available"));
     ASSERT_NULL(strstr(inner, "tracked_changes"));
     ASSERT_NULL(strstr(inner, "untracked_source"));
@@ -6245,7 +6271,8 @@ TEST(tool_index_status_freshness_verdict_current_when_indexed_checkout_matches) 
     }
 
     char *resp = cbm_mcp_handle_tool(
-        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -6283,7 +6310,8 @@ TEST(tool_index_status_freshness_verdict_stale_when_indexed_checkout_mismatches)
     }
 
     char *resp = cbm_mcp_handle_tool(
-        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -6339,7 +6367,8 @@ TEST(tool_index_status_freshness_verdict_stale_when_tracked_changes) {
     }
 
     char *resp = cbm_mcp_handle_tool(
-        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -6390,7 +6419,8 @@ TEST(tool_index_status_freshness_verdict_unknown_when_untracked_only) {
     }
 
     char *resp = cbm_mcp_handle_tool(
-        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -6448,7 +6478,8 @@ TEST(tool_index_status_freshness_verdict_stale_when_tracked_and_untracked) {
     }
 
     char *resp = cbm_mcp_handle_tool(
-        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -6478,7 +6509,8 @@ TEST(tool_index_status_freshness_status_unavailable_non_git) {
     }
 
     char *resp = cbm_mcp_handle_tool(
-        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -6533,7 +6565,8 @@ TEST(tool_index_status_freshness_sample_cap_truncates) {
     }
 
     char *resp = cbm_mcp_handle_tool(
-        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -17729,10 +17762,27 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
     ASSERT_NOT_NULL(list);
     ASSERT_NOT_NULL(strstr(list, "alpha704")); /* control */
     ASSERT_NOT_NULL(strstr(list, "beta704"));  /* internal name of drifted db (RED before) */
-    ASSERT_NOT_NULL(strstr(list, "\\\"indexed_at\\\":"));
     ASSERT_NULL(strstr(list, "gamma704"));     /* filename must NOT be advertised (RED before) */
     ASSERT_NULL(strstr(list, "ghost704"));     /* 0-byte ghost filtered (RED before) */
     free(list);
+
+    /* indexed_at (9841ca46) lives in the machine-readable projection — the one
+     * the graph UI reads (useProjects.ts calls list_projects with
+     * format:"json"). Upstream's lean tree keeps its stable header (cols: name
+     * root_path branch, pinned by
+     * tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct),
+     * so the key-level assert belongs on this projection. */
+    char *list_json =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"list_projects\","
+                                   "\"arguments\":{\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(list_json);
+    ASSERT_NOT_NULL(strstr(list_json, "alpha704"));
+    ASSERT_NOT_NULL(strstr(list_json, "beta704"));
+    ASSERT_NOT_NULL(strstr(list_json, "\\\"indexed_at\\\":"));
+    ASSERT_NULL(strstr(list_json, "gamma704"));
+    ASSERT_NULL(strstr(list_json, "ghost704"));
+    free(list_json);
 
     char *page =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\","
