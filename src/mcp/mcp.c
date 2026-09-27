@@ -17769,7 +17769,37 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
 
 /* ── Session detection + auto-index ────────────────────────────── */
 
-/* Detect session root from CWD (fallback: single indexed project from DB). */
+/* `/` and $HOME are never useful session roots: one covers the whole machine,
+ * the other the whole user profile. Compares the raw and the resolved home so a
+ * symlinked HOME — or a git toplevel that resolved through one — still matches. */
+static bool is_useless_session_root(const char *root, const char *home) {
+    if (!root || !root[0]) {
+        return true;
+    }
+    if (strcmp(root, "/") == 0) {
+        return true;
+    }
+    if (home && strcmp(root, home) == 0) {
+        return true;
+    }
+    if (home && home[0]) {
+        char resolved_home[CBM_SZ_4K];
+        if (cbm_canonical_path(home, resolved_home, sizeof(resolved_home))) {
+            cbm_normalize_path_sep(resolved_home);
+            if (strcmp(root, resolved_home) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Detect session root from CWD (fallback: single indexed project from DB).
+ *
+ * `session_root=git_toplevel` (the default) binds the session to the repository
+ * root of the cwd, so a session started in a subdirectory queries the project
+ * the indexer creates for the repository instead of a per-subdirectory one.
+ * `session_root=cwd` keeps the historical behavior. */
 static void detect_session(cbm_mcp_server_t *srv) {
     if (srv->session_detected) {
         return;
@@ -17781,9 +17811,23 @@ static void detect_session(cbm_mcp_server_t *srv) {
     if (getcwd(cwd, sizeof(cwd)) != NULL) {
         const char *home = cbm_get_home_dir();
         /* Skip useless roots: / and $HOME */
-        if (strcmp(cwd, "/") != 0 && (home == NULL || strcmp(cwd, home) != 0)) {
-            snprintf(srv->session_root, sizeof(srv->session_root), "%s", cwd);
-            cbm_log_info("session.root.cwd", "path", cwd);
+        if (!is_useless_session_root(cwd, home)) {
+            const char *root = cwd;
+            bool rooted_at_toplevel = false;
+            if (cbm_config_session_root(srv->config) == CBM_SESSION_ROOT_GIT_TOPLEVEL) {
+                cbm_git_context_t ctx = {0};
+                if (cbm_git_context_resolve(cwd, &ctx) == 0 && ctx.is_git && ctx.worktree_root &&
+                    !is_useless_session_root(ctx.worktree_root, home)) {
+                    root = ctx.worktree_root;
+                    rooted_at_toplevel = true;
+                    cbm_log_info("session.root.git_toplevel", "cwd", cwd, "root", root);
+                }
+                cbm_git_context_free(&ctx);
+            }
+            snprintf(srv->session_root, sizeof(srv->session_root), "%s", root);
+            if (!rooted_at_toplevel) {
+                cbm_log_info("session.root.cwd", "path", cwd);
+            }
         }
     }
 
