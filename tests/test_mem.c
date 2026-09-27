@@ -686,6 +686,13 @@ static int mem_init_uses_staged_config_budget_and_reports_config_source_body(voi
     ASSERT_EQ(cbm_mem_budget(), 1536 * CBM_TEST_MB);
     ASSERT_STR_EQ(cbm_mem_budget_source(), "config");
     ASSERT_EQ(cbm_mem_configured_budget_mb(), 1536);
+
+    /* The same real init path with nothing staged and no env is a derived
+     * budget, attributed to the RAM fraction. */
+    cbm_mem_reset_for_tests();
+    cbm_mem_set_configured_budget_mb(0);
+    cbm_mem_init(0.5);
+    ASSERT_STR_EQ(cbm_mem_budget_source(), "ram_fraction");
     PASS();
 }
 
