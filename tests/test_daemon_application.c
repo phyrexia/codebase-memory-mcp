@@ -6072,6 +6072,8 @@ typedef struct {
     char *saved_cache;
     char *saved_workers;
     char *saved_budget_env;
+    cbm_config_t *config;
+    bool active;
     bool ready;
 } b1_knobs_env_t;
 
@@ -6083,6 +6085,7 @@ static bool b1_knobs_env_begin(b1_knobs_env_t *env, const char *tag) {
     env->saved_cache = prior_cache ? strdup(prior_cache) : NULL;
     env->saved_workers = prior_workers ? strdup(prior_workers) : NULL;
     env->saved_budget_env = prior_budget ? strdup(prior_budget) : NULL;
+    env->active = true;
     snprintf(env->cache, sizeof(env->cache), "%s/%s-XXXXXX", cbm_tmpdir(), tag);
     if (!cbm_mkdtemp(env->cache)) {
         return false;
@@ -6095,30 +6098,45 @@ static bool b1_knobs_env_begin(b1_knobs_env_t *env, const char *tag) {
 }
 
 static void b1_knobs_env_restore(b1_knobs_env_t *env) {
+    if (!env->active) {
+        return;
+    }
+    env->active = false;
     if (env->saved_cache) {
         cbm_setenv("CBM_CACHE_DIR", env->saved_cache, 1);
         free(env->saved_cache);
+        env->saved_cache = NULL;
     } else {
         cbm_unsetenv("CBM_CACHE_DIR");
     }
     if (env->saved_workers) {
         cbm_setenv("CBM_WORKERS", env->saved_workers, 1);
         free(env->saved_workers);
+        env->saved_workers = NULL;
     } else {
         cbm_unsetenv("CBM_WORKERS");
     }
     if (env->saved_budget_env) {
         cbm_setenv("CBM_MEM_BUDGET_MB", env->saved_budget_env, 1);
         free(env->saved_budget_env);
+        env->saved_budget_env = NULL;
     } else {
         cbm_unsetenv("CBM_MEM_BUDGET_MB");
     }
 }
 
+/* The whole cleanup of a test lives here, never after its assertions: ASSERT_*
+ * returns from the test function on failure (test_framework.h), and one
+ * aborted run of these tests used to leave CBM_CACHE_DIR pointing at a cache
+ * holding an undeletable _config.db — every later `uninstall` in the shared
+ * runner then failed against an index it could not remove. */
 static void b1_knobs_env_end(b1_knobs_env_t *env) {
+    cbm_config_close(env->config);
+    env->config = NULL;
     b1_knobs_env_restore(env);
     if (env->ready) {
         (void)th_rmtree(env->cache);
+        env->ready = false;
     }
 }
 
@@ -6142,12 +6160,12 @@ static void b1_config_open_probe(void *context) {
  * still unset, and the open costs kilobytes — the accounting claim of the
  * audit round 1 (pages reserved before the ceiling are still charged by
  * cbm_mem_charged) is only true if this ordering holds. */
-TEST(daemon_host_reads_runtime_config_before_fixing_the_memory_ceiling) {
-    b1_knobs_env_t env;
-    bool setup = b1_knobs_env_begin(&env, "b1-order");
+static int daemon_host_reads_runtime_config_before_fixing_the_memory_ceiling_body(
+    b1_knobs_env_t *env) {
+    bool setup = b1_knobs_env_begin(env, "b1-order");
     bool seeded = false;
     if (setup) {
-        cbm_config_t *cfg = cbm_config_open(env.cache);
+        cbm_config_t *cfg = cbm_config_open(env->cache);
         seeded = cfg != NULL && cbm_config_set(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, "1536") == 0;
         cbm_config_close(cfg);
     }
@@ -6187,20 +6205,28 @@ TEST(daemon_host_reads_runtime_config_before_fixing_the_memory_ceiling) {
     ASSERT_EQ(cbm_mem_budget(), 1536 * 1024 * 1024);
     ASSERT_STR_EQ(cbm_mem_budget_source(), "config");
 
+    PASS();
+}
+
+TEST(daemon_host_reads_runtime_config_before_fixing_the_memory_ceiling) {
+    /* ASSERT_* returns straight out of a failing test, so all cleanup lives in
+     * this wrapper, which always runs (see b1_knobs_env_end). */
+    b1_knobs_env_t env = {0};
+    int rc = daemon_host_reads_runtime_config_before_fixing_the_memory_ceiling_body(&env);
+    b1_knobs_env_end(&env);
     cbm_mem_reset_for_tests();
     cbm_mem_set_configured_budget_mb(0);
     cbm_mem_init(0.5);
-    b1_knobs_env_end(&env);
-    PASS();
+    return rc;
 }
 
 /* The daemon pins CBM_WORKERS so every worker it spawns inherits the same
  * value — but never over an explicit one (cbm_setenv with overwrite=0). What
  * is reported is what the workers will read back. */
-TEST(daemon_host_pins_workers_from_config_without_overwriting_env) {
-    b1_knobs_env_t env;
-    bool setup = b1_knobs_env_begin(&env, "b1-workers");
-    cbm_config_t *cfg = setup ? cbm_config_open(env.cache) : NULL;
+static int daemon_host_pins_workers_from_config_without_overwriting_env_body(b1_knobs_env_t *env) {
+    bool setup = b1_knobs_env_begin(env, "b1-workers");
+    cbm_config_t *cfg = setup ? cbm_config_open(env->cache) : NULL;
+    env->config = cfg;
     bool seeded = cfg != NULL && cbm_config_set(cfg, CBM_CONFIG_INDEX_WORKERS, "1") == 0;
 
     cbm_mem_reset_for_tests();
@@ -6244,22 +6270,27 @@ TEST(daemon_host_pins_workers_from_config_without_overwriting_env) {
     ASSERT_FALSE(knobs.workers_exported);
     ASSERT_STR_EQ(getenv("CBM_WORKERS"), "not-a-number");
 
-    cbm_config_close(cfg);
+    PASS();
+}
+
+TEST(daemon_host_pins_workers_from_config_without_overwriting_env) {
+    b1_knobs_env_t env = {0};
+    int rc = daemon_host_pins_workers_from_config_without_overwriting_env_body(&env);
+    b1_knobs_env_end(&env);
     cbm_mem_reset_for_tests();
     cbm_mem_set_configured_budget_mb(0);
     cbm_mem_init(0.5);
-    b1_knobs_env_end(&env);
-    PASS();
+    return rc;
 }
 
 /* The read moved ahead of the memory ceiling, but the contract it inherited
  * did not: an unopenable _config.db refuses startup instead of silently
  * running on defaults. */
-TEST(daemon_host_runtime_knobs_refuse_an_unopenable_config_database) {
-    b1_knobs_env_t env;
-    bool setup = b1_knobs_env_begin(&env, "b1-blocked");
+static int daemon_host_runtime_knobs_refuse_an_unopenable_config_database_body(
+    b1_knobs_env_t *env) {
+    bool setup = b1_knobs_env_begin(env, "b1-blocked");
     char blocker[600];
-    snprintf(blocker, sizeof(blocker), "%s/_config.db", env.cache);
+    snprintf(blocker, sizeof(blocker), "%s/_config.db", env->cache);
     bool blocked = setup && cbm_mkdir_p(blocker, 0700);
 
     cbm_daemon_host_runtime_knobs_t knobs = {0};
@@ -6270,8 +6301,14 @@ TEST(daemon_host_runtime_knobs_refuse_an_unopenable_config_database) {
     ASSERT_FALSE(loaded);
     ASSERT_EQ(knobs.configured_budget_mb, 0);
     ASSERT_STR_EQ(knobs.index_workers_text, "auto");
-    b1_knobs_env_end(&env);
     PASS();
+}
+
+TEST(daemon_host_runtime_knobs_refuse_an_unopenable_config_database) {
+    b1_knobs_env_t env = {0};
+    int rc = daemon_host_runtime_knobs_refuse_an_unopenable_config_database_body(&env);
+    b1_knobs_env_end(&env);
+    return rc;
 }
 
 SUITE(daemon_application) {

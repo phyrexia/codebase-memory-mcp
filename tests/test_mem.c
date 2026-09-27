@@ -675,12 +675,7 @@ TEST(resolve_budget_layers_env_over_config_over_fraction) {
     PASS();
 }
 
-TEST(mem_init_uses_staged_config_budget_and_reports_config_source) {
-    char *saved_env = NULL;
-    const char *prior = getenv("CBM_MEM_BUDGET_MB");
-    if (prior) {
-        saved_env = strdup(prior);
-    }
+static int mem_init_uses_staged_config_budget_and_reports_config_source_body(void) {
     cbm_unsetenv("CBM_MEM_BUDGET_MB");
 
     /* ADR §3.B test (1): seeded config, no env → the configured budget, and
@@ -691,6 +686,19 @@ TEST(mem_init_uses_staged_config_budget_and_reports_config_source) {
     ASSERT_EQ(cbm_mem_budget(), 1536 * CBM_TEST_MB);
     ASSERT_STR_EQ(cbm_mem_budget_source(), "config");
     ASSERT_EQ(cbm_mem_configured_budget_mb(), 1536);
+    PASS();
+}
+
+/* ASSERT_* returns out of a failing test (test_framework.h), so the process
+ * state these tests borrow — CBM_MEM_BUDGET_MB and the one-shot memory ceiling
+ * — is restored by this wrapper, which always runs. */
+TEST(mem_init_uses_staged_config_budget_and_reports_config_source) {
+    char *saved_env = NULL;
+    const char *prior = getenv("CBM_MEM_BUDGET_MB");
+    if (prior) {
+        saved_env = strdup(prior);
+    }
+    int rc = mem_init_uses_staged_config_budget_and_reports_config_source_body();
 
     /* Restore the state an ordinary cbm_mem_init(0.5) leaves behind. */
     cbm_mem_reset_for_tests();
@@ -700,15 +708,10 @@ TEST(mem_init_uses_staged_config_budget_and_reports_config_source) {
         free(saved_env);
     }
     cbm_mem_init(0.5);
-    PASS();
+    return rc;
 }
 
-TEST(mem_init_env_beats_staged_config_budget) {
-    char *saved_env = NULL;
-    const char *prior = getenv("CBM_MEM_BUDGET_MB");
-    if (prior) {
-        saved_env = strdup(prior);
-    }
+static int mem_init_env_beats_staged_config_budget_body(void) {
     cbm_setenv("CBM_MEM_BUDGET_MB", "2048", 1);
 
     /* ADR §3.B test (1), second half: with env present it wins and the source
@@ -718,6 +721,16 @@ TEST(mem_init_env_beats_staged_config_budget) {
     cbm_mem_init(0.5);
     ASSERT_EQ(cbm_mem_budget(), 2048 * CBM_TEST_MB);
     ASSERT_STR_EQ(cbm_mem_budget_source(), "env");
+    PASS();
+}
+
+TEST(mem_init_env_beats_staged_config_budget) {
+    char *saved_env = NULL;
+    const char *prior = getenv("CBM_MEM_BUDGET_MB");
+    if (prior) {
+        saved_env = strdup(prior);
+    }
+    int rc = mem_init_env_beats_staged_config_budget_body();
 
     cbm_mem_reset_for_tests();
     cbm_mem_set_configured_budget_mb(0);
@@ -728,7 +741,7 @@ TEST(mem_init_env_beats_staged_config_budget) {
         cbm_unsetenv("CBM_MEM_BUDGET_MB");
     }
     cbm_mem_init(0.5);
-    PASS();
+    return rc;
 }
 
 #undef CBM_TEST_MB

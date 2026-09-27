@@ -15340,8 +15340,11 @@ TEST(cli_config_index_workers_parse_is_strict_and_bounded) {
     ASSERT_FALSE(cbm_config_parse_index_workers("9", 8, &out));
 
     const char *invalid[] = {"",     "0",     "-1",      "+2",   " 2",  "2 ",
-                             "1.5",  "0x10",  "2x",      "abc",  "auto", "AUTO",
+                             "1.5",  "0x10",  "2x",      "abc",  "AUTO",
                              "off",  "1e3",   "9999999999999999999999999999999999"};
+    /* "off" is the other key's sentinel and must not parse here; "auto" is
+     * this key's own sentinel and is asserted valid above, so it cannot be in
+     * this list. */
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
         ASSERT_FALSE(cbm_config_parse_index_workers(invalid[i], 8, &out));
     }
@@ -15356,16 +15359,50 @@ TEST(cli_config_index_workers_parse_is_strict_and_bounded) {
     PASS();
 }
 
-TEST(cli_config_index_budget_keys_round_trip_reset_and_persist) {
+/* The B1 config tests point the CLI at a private cache. ASSERT_* returns out of
+ * a failing test (test_framework.h), so the restore and the rmtree belong to
+ * the wrapper at the end of each test: an aborted test must not leave
+ * CBM_CACHE_DIR pointing at a cache holding a _config.db — every later
+ * `uninstall` in this shared runner would then fail against an index it cannot
+ * remove (same contract as b1_knobs_env_end in test_daemon_application.c). */
+typedef struct {
     char tmpdir[512];
-    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-cfg-budget-XXXXXX", cbm_tmpdir());
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
-    char *saved_cache = NULL;
+    char *saved_cache;
+    bool ready;
+} cli_budget_cfg_env_t;
+
+static bool cli_budget_cfg_env_begin(cli_budget_cfg_env_t *env) {
+    memset(env, 0, sizeof(*env));
     const char *prior = getenv("CBM_CACHE_DIR");
-    if (prior) {
-        saved_cache = strdup(prior);
+    env->saved_cache = prior ? strdup(prior) : NULL;
+    snprintf(env->tmpdir, sizeof(env->tmpdir), "%s/cli-cfg-budget-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(env->tmpdir)) {
+        return false;
     }
-    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", env->tmpdir, 1);
+    env->ready = true;
+    return true;
+}
+
+static void cli_budget_cfg_env_end(cli_budget_cfg_env_t *env) {
+    if (env->saved_cache) {
+        cbm_setenv("CBM_CACHE_DIR", env->saved_cache, 1);
+        free(env->saved_cache);
+        env->saved_cache = NULL;
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (env->ready) {
+        test_rmdir_r(env->tmpdir);
+        env->ready = false;
+    }
+}
+
+static int cli_config_index_budget_keys_round_trip_reset_and_persist_body(
+    cli_budget_cfg_env_t *env) {
+    bool ready = cli_budget_cfg_env_begin(env);
+    ASSERT_TRUE(ready);
+    char *tmpdir = env->tmpdir;
 
     char out[512];
     /* Discoverable and defaulted to the sentinel on an empty store. */
@@ -15421,26 +15458,20 @@ TEST(cli_config_index_budget_keys_round_trip_reset_and_persist) {
     ASSERT_EQ(cli_config_cmd_capture(2, get_workers, out, sizeof(out)), 0);
     ASSERT_STR_EQ(out, "auto\n");
 
-    if (saved_cache) {
-        cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
-        free(saved_cache);
-    } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
-    }
-    test_rmdir_r(tmpdir);
     PASS();
 }
 
-TEST(cli_config_index_budget_keys_reject_invalid_and_out_of_range_values) {
-    char tmpdir[512];
-    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-cfg-budget-XXXXXX", cbm_tmpdir());
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
-    char *saved_cache = NULL;
-    const char *prior = getenv("CBM_CACHE_DIR");
-    if (prior) {
-        saved_cache = strdup(prior);
-    }
-    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+TEST(cli_config_index_budget_keys_round_trip_reset_and_persist) {
+    cli_budget_cfg_env_t env = {0};
+    int rc = cli_config_index_budget_keys_round_trip_reset_and_persist_body(&env);
+    cli_budget_cfg_env_end(&env);
+    return rc;
+}
+
+static int cli_config_index_budget_keys_reject_invalid_and_out_of_range_values_body(
+    cli_budget_cfg_env_t *env) {
+    bool ready = cli_budget_cfg_env_begin(env);
+    ASSERT_TRUE(ready);
 
     char out[512];
     char *set_budget[] = {"set", CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, "1536"};
@@ -15493,14 +15524,14 @@ TEST(cli_config_index_budget_keys_reject_invalid_and_out_of_range_values) {
         ASSERT_TRUE(cli_config_cmd_capture(3, argv_set, out, sizeof(out)) != 0);
     }
 
-    if (saved_cache) {
-        cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
-        free(saved_cache);
-    } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
-    }
-    test_rmdir_r(tmpdir);
     PASS();
+}
+
+TEST(cli_config_index_budget_keys_reject_invalid_and_out_of_range_values) {
+    cli_budget_cfg_env_t env = {0};
+    int rc = cli_config_index_budget_keys_reject_invalid_and_out_of_range_values_body(&env);
+    cli_budget_cfg_env_end(&env);
+    return rc;
 }
 
 TEST(cli_config_index_budget_readers_reject_truncated_and_embedded_nul_values) {
