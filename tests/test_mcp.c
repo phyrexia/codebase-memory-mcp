@@ -5736,6 +5736,115 @@ TEST(tool_list_projects_registry_reuses_identity_until_generation_changes) {
     PASS();
 }
 
+/* C5 cost criterion: listing ~120 projects must average under 100 ms. The
+ * assertion is on the warm mean — what a session pays once the daemon has read
+ * each generation — and the numbers are printed so a qf-infra run records
+ * them. The details projection keeps one git process per listed project (the
+ * ADR gates it behind include_details, and C10 tells callers not to ask for
+ * it at session start), so it is reported, not asserted. */
+TEST(tool_list_projects_mean_latency_with_120_projects) {
+    enum { C5_BENCH_PROJECTS = 120, C5_BENCH_ROUNDS = 5 };
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-c5-bench-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    for (int i = 0; i < C5_BENCH_PROJECTS; i++) {
+        char name[64];
+        char root[128];
+        char db_path[512];
+        snprintf(name, sizeof(name), "bench-project-%03d", i);
+        snprintf(root, sizeof(root), "/tmp/bench-project-%03d", i);
+        snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, name);
+        cbm_store_t *store = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(cbm_store_upsert_project(store, name, root), CBM_STORE_OK);
+        for (int n = 0; n < 2; n++) {
+            char qn[96];
+            snprintf(qn, sizeof(qn), "%s.fn%d", name, n);
+            cbm_node_t node = {.project = name,
+                               .label = "Function",
+                               .name = qn,
+                               .qualified_name = qn,
+                               .file_path = "src/main.c",
+                               .start_line = n + 1,
+                               .end_line = n + 1};
+            ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+        }
+        cbm_edge_t edge = {.project = name,
+                           .source_id = 1,
+                           .target_id = 2,
+                           .type = "CALLS",
+                           .properties_json = "{}"};
+        ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+        ASSERT_EQ(cbm_store_persist_project_counts(store, name), CBM_STORE_OK);
+        cbm_store_close(store);
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    yyjson_doc *doc = c5_list_projects_json(srv, "{\"limit\":500,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(c5_first_project(doc));
+    yyjson_doc_free(doc);
+
+    struct timespec t0;
+    struct timespec t1;
+    double lean_ms = 0.0;
+    double metadata_ms = 0.0;
+    double details_ms = 0.0;
+    for (int round = 0; round < C5_BENCH_ROUNDS; round++) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
+        doc = c5_list_projects_json(srv, "{\"limit\":500,\"format\":\"json\"}");
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
+        ASSERT_NOT_NULL(c5_first_project(doc));
+        yyjson_doc_free(doc);
+        lean_ms += (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+                   (double)(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
+        doc = c5_list_projects_json(
+            srv, "{\"limit\":500,\"format\":\"json\",\"metadata_only\":true}");
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
+        ASSERT_NOT_NULL(c5_first_project(doc));
+        yyjson_doc_free(doc);
+        metadata_ms += (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+                       (double)(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
+        doc = c5_list_projects_json(srv, "{\"limit\":50,\"format\":\"json\","
+                                         "\"include_details\":true}");
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
+        ASSERT_NOT_NULL(c5_first_project(doc));
+        yyjson_doc_free(doc);
+        details_ms += (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+                      (double)(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+    }
+    lean_ms /= C5_BENCH_ROUNDS;
+    metadata_ms /= C5_BENCH_ROUNDS;
+    details_ms /= C5_BENCH_ROUNDS;
+    printf("[c5-bench] projects=%d rounds=%d lean_mean_ms=%.3f metadata_mean_ms=%.3f "
+           "details_mean_ms=%.3f\n",
+           C5_BENCH_PROJECTS, C5_BENCH_ROUNDS, lean_ms, metadata_ms, details_ms);
+
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    for (int i = 0; i < C5_BENCH_PROJECTS; i++) {
+        char name[64];
+        char db_path[512];
+        snprintf(name, sizeof(name), "bench-project-%03d.db", i);
+        snprintf(db_path, sizeof(db_path), "%s/%s", cache, name);
+        cbm_unlink(db_path);
+    }
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(lean_ms < 100.0);
+    ASSERT_TRUE(metadata_ms < 100.0);
+    PASS();
+}
+
 TEST(tool_index_status_no_project) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -21381,6 +21490,7 @@ SUITE(mcp) {
     RUN_TEST(tool_list_projects_preserves_root_beyond_one_kib);
     RUN_TEST(tool_list_projects_legacy_counts_fall_back_and_store_on_publish);
     RUN_TEST(tool_list_projects_registry_reuses_identity_until_generation_changes);
+    RUN_TEST(tool_list_projects_mean_latency_with_120_projects);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
     RUN_TEST(tool_check_index_coverage_reports_truncation_marker_issue963);
