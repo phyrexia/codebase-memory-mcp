@@ -11318,6 +11318,86 @@ static bool project_db_is_servable(const char *project, const char *db_path) {
     return servable;
 }
 
+/* Byte-for-byte path identity, with the case-insensitivity Windows paths have.
+ * Both sides are canonicalized and separator-normalized before reaching here. */
+static bool same_path(const char *a, const char *b) {
+    if (!a || !b) {
+        return false;
+    }
+#ifdef _WIN32
+    return _stricmp(a, b) == 0;
+#else
+    return strcmp(a, b) == 0;
+#endif
+}
+
+/* B3: a `name` override is public API, but it silently mints a second project
+ * for a root that is already indexed — the origin of the duplicated project
+ * databases the fleet review found. When the override disagrees with the name
+ * derived from repo_path AND another project already owns that root_path, the
+ * result names the owner instead of staying silent. Query-only scan of the
+ * cache directory; NULL when no other project owns the root. */
+static char *project_alias_for_root(const char *root_path, const char *current_project) {
+    if (!root_path || !root_path[0] || !current_project || !current_project[0]) {
+        return NULL;
+    }
+
+    char canonical_root[CBM_SZ_4K];
+    if (!cbm_canonical_path(root_path, canonical_root, sizeof(canonical_root))) {
+        snprintf(canonical_root, sizeof(canonical_root), "%s", root_path);
+    }
+    cbm_normalize_path_sep(canonical_root);
+
+    char dir_path[CBM_SZ_1K];
+    cache_dir(dir_path, sizeof(dir_path));
+    cbm_dir_t *d = cbm_opendir(dir_path);
+    if (!d) {
+        return NULL;
+    }
+
+    char *alias = NULL;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        const char *n = entry->name;
+        size_t len = strlen(n);
+        if (!is_project_db_file(n, len)) {
+            continue;
+        }
+        char full_path[CBM_SZ_2K];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, n);
+        char project_name[CBM_SZ_1K];
+        cbm_store_t *store = NULL;
+        if (!db_internal_project_name(full_path, project_name, sizeof(project_name), &store)) {
+            continue; /* ghost / unreadable — it owns nothing */
+        }
+        bool owns_root = false;
+        if (strcmp(project_name, current_project) != 0) {
+            cbm_project_t proj = {0};
+            if (cbm_store_get_project(store, project_name, &proj) == CBM_STORE_OK) {
+                if (proj.root_path && proj.root_path[0]) {
+                    char canonical_other[CBM_SZ_4K];
+                    if (!cbm_canonical_path(proj.root_path, canonical_other,
+                                            sizeof(canonical_other))) {
+                        snprintf(canonical_other, sizeof(canonical_other), "%s", proj.root_path);
+                    }
+                    cbm_normalize_path_sep(canonical_other);
+                    owns_root = same_path(canonical_other, canonical_root);
+                }
+                cbm_project_free_fields(&proj);
+            }
+        }
+        cbm_store_close(store);
+        /* Deterministic answer when several projects duplicate the root: the
+         * smallest name, not whatever order readdir happened to return. */
+        if (owns_root && (!alias || strcmp(project_name, alias) < 0)) {
+            free(alias);
+            alias = heap_strdup(project_name);
+        }
+    }
+    cbm_closedir(d);
+    return alias;
+}
+
 /* The three heap strings handle_index_repository owns from
  * cbm_mcp_get_string_arg / resolved_repo_path_from_project_arg. One release
  * point keeps the dozen early-return paths in step; free(NULL) is a no-op, so
@@ -11332,6 +11412,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
+    /* Survives the early free of name_override: B3 only reports an alias when
+     * the caller asked for a custom name in the first place. */
+    bool name_overridden = name_override != NULL && name_override[0] != '\0';
     cbm_normalize_path_sep(repo_path);
 
     if (!repo_path) {
@@ -11549,6 +11632,24 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
 
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
+
+    /* B3: name the project this run duplicated, when it duplicated one. Only a
+     * `name` override can, and only when it disagrees with the name derived
+     * from repo_path — passing the derived name is not an alias. */
+    if (name_overridden) {
+        char *derived_name = cbm_project_name_from_path(repo_path);
+        char *alias_of =
+            derived_name && strcmp(derived_name, project_name) != 0
+                ? project_alias_for_root(repo_path, project_name)
+                : NULL;
+        free(derived_name);
+        if (alias_of) {
+            cbm_log_info("index.project_alias", "project", project_name, "alias_of", alias_of,
+                         "root", repo_path);
+            yyjson_mut_obj_add_strcpy(doc, root, "alias_of", alias_of);
+            free(alias_of);
+        }
+    }
 
     if (rc == 0) {
         /* Write the per-run logfile ONLY when there were skips (no logfile on a
