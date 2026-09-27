@@ -1171,8 +1171,8 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
      * this read (explicit CBM_MEM_BUDGET_MB still wins over it). The handle it
      * opens is reused below for watcher_enabled/max_index_jobs. */
     cbm_daemon_host_runtime_knobs_t knobs = {0};
-    cbm_config_t *runtime_config = NULL;
-    if (!host_runtime_knobs_load(&knobs, &runtime_config)) {
+    cbm_config_t *knob_config = NULL;
+    if (!host_runtime_knobs_load(&knobs, &knob_config)) {
         cbm_log_error("daemon.start_failed", "component", "application");
         host_log_close();
         cbm_daemon_ipc_lifetime_reservation_release(lifetime_reservation);
@@ -1186,7 +1186,7 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
 
     host_state_t host = {0};
     host.permanent = config->permanent;
-    if (!host_state_prepare(&host, config->endpoint, runtime_config)) {
+    if (!host_state_prepare(&host, config->endpoint, knob_config)) {
         cbm_log_error("daemon.start_failed", "component", "application");
         host_state_free(&host);
         host_log_close();
@@ -1209,6 +1209,12 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
         .shutdown_timeout_ms = HOST_RUNTIME_SHUTDOWN_MS,
         .application = callbacks,
         .permanent = config->permanent,
+        /* B1: the ceiling/parallelism this generation runs with, reported by
+         * `daemon status` (daemon.start logs the same values). */
+        .budget_status = {.memory_budget_bytes = cbm_mem_budget(),
+                          .index_workers = (uint32_t)knobs.index_workers,
+                          .budget_source =
+                              cbm_daemon_budget_source_from_name(cbm_mem_budget_source())},
     };
     cbm_daemon_runtime_service_t *service =
         cbm_daemon_runtime_service_start_reserved(&runtime_config, &lifetime_reservation);

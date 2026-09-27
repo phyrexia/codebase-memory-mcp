@@ -229,6 +229,8 @@ struct cbm_daemon_runtime_service {
     /* Born via `daemon start`: last-client-disconnect does not begin stopping.
      * The stop/drain ops and process kill remain the only exits. */
     bool permanent;
+    /* B1: reported by `daemon status` (and logged by daemon.start). */
+    cbm_daemon_runtime_budget_status_t budget_status;
 
     cbm_thread_t accept_thread;
     bool accept_thread_started;
@@ -1717,6 +1719,14 @@ static void runtime_control_collect_clients_locked(cbm_daemon_runtime_service_t 
         count > CBM_DAEMON_CONTROL_CLIENT_CAP ? (uint8_t)CBM_DAEMON_CONTROL_CLIENT_CAP : count;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static bool g_runtime_status_legacy_for_test;
+
+void cbm_daemon_runtime_force_legacy_status_for_test(bool legacy) {
+    g_runtime_status_legacy_for_test = legacy;
+}
+#endif
+
 static void runtime_worker_handle_status(cbm_daemon_runtime_worker_t *worker,
                                          const uint8_t *payload, uint32_t length) {
     cbm_daemon_runtime_service_t *service = worker->service;
@@ -1724,8 +1734,19 @@ static void runtime_worker_handle_status(cbm_daemon_runtime_worker_t *worker,
     bool peer_verified =
         runtime_control_request_decode(payload, length, requested_build) &&
         runtime_activation_peer_matches_claim(service, worker->peer_process_id, requested_build);
-    uint8_t response[CBM_DAEMON_STATUS_RESPONSE_SIZE];
+    uint8_t response[CBM_DAEMON_STATUS_RESPONSE_FULL_SIZE];
     memset(response, 0, sizeof(response));
+    /* B1: the budget snapshot rides only in the same-build layout. A
+     * cross-build requester gets the frozen 121-byte response, so `daemon
+     * status` keeps answering across build skew exactly as before. */
+    bool same_build =
+        peer_verified && strcmp(requested_build, service->identity.build_fingerprint) == 0;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_runtime_status_legacy_for_test) {
+        same_build = false;
+    }
+#endif
+    uint32_t response_length = CBM_DAEMON_STATUS_RESPONSE_SIZE;
     if (peer_verified) {
         uint8_t count = 0U;
         uint32_t pids[CBM_DAEMON_CONTROL_CLIENT_CAP] = {0};
@@ -1758,10 +1779,26 @@ static void runtime_worker_handle_status(cbm_daemon_runtime_worker_t *worker,
         (void)snprintf((char *)response + 109U, 12U, "%s",
                        service->identity.semantic_version ? service->identity.semantic_version
                                                           : "");
+        if (same_build) {
+            /* B1 budget snapshot @121: u64 memory_budget_bytes, u16
+             * index_workers (0 = auto), u8 budget_source — network byte
+             * order, appended after the frozen layout. */
+            cbm_daemon_runtime_budget_status_t budget = service->budget_status;
+            for (size_t index = 0; index < 8U; index++) {
+                response[121U + index] =
+                    (uint8_t)(budget.memory_budget_bytes >> (56U - index * 8U));
+            }
+            uint32_t workers =
+                budget.index_workers > UINT16_MAX ? (uint32_t)UINT16_MAX : budget.index_workers;
+            response[129U] = (uint8_t)(workers >> 8);
+            response[130U] = (uint8_t)(workers & 0xFFU);
+            response[131U] = (uint8_t)budget.budget_source;
+            response_length = CBM_DAEMON_STATUS_RESPONSE_FULL_SIZE;
+        }
         cbm_mutex_unlock(&service->mutex);
     }
     (void)runtime_worker_send_frame(worker, CBM_DAEMON_FRAME_RESPONSE, CBM_DAEMON_RUNTIME_OP_STATUS,
-                                    response, (uint32_t)sizeof(response));
+                                    response, response_length);
     runtime_worker_finish(worker);
 }
 
@@ -2531,6 +2568,7 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     service->shutdown_timeout_ms = config->shutdown_timeout_ms;
     service->application = config->application;
     service->permanent = config->permanent;
+    service->budget_status = config->budget_status;
     service->state = CBM_DAEMON_RUNTIME_SERVICE_STARTING;
 
     if (!service->workers || !service->coordinator || !service->conflict_log_path ||
@@ -2899,12 +2937,21 @@ bool cbm_daemon_runtime_request_activation_shutdown(
     return valid;
 }
 
+/* `response_size` is the frozen response layout every build understands;
+ * `full_response_size` is this build's layout (equal to `response_size` unless
+ * the response has grown). A control response of either exact length is
+ * accepted so `daemon status` keeps working across build skew. */
 static bool runtime_control_request_send(const cbm_daemon_ipc_endpoint_t *endpoint,
                                          const cbm_daemon_build_identity_t *identity,
                                          cbm_daemon_runtime_operation_t operation,
                                          uint32_t timeout_ms, uint32_t response_size,
-                                         uint8_t **payload_out, uint64_t *muted_holder_pid_out) {
+                                         uint32_t full_response_size,
+                                         uint32_t *payload_length_out, uint8_t **payload_out,
+                                         uint64_t *muted_holder_pid_out) {
     *payload_out = NULL;
+    if (payload_length_out) {
+        *payload_length_out = 0;
+    }
     if (muted_holder_pid_out) {
         *muted_holder_pid_out = 0;
     }
@@ -2924,8 +2971,8 @@ static bool runtime_control_request_send(const cbm_daemon_ipc_endpoint_t *endpoi
                                                 request, (uint32_t)sizeof(request));
     cbm_daemon_frame_t frame = {0};
     uint8_t *payload = NULL;
-    int received = sent ? cbm_daemon_ipc_receive_frame_bounded(connection, timeout_ms,
-                                                               response_size, &frame, &payload)
+    int received = sent ? cbm_daemon_ipc_receive_frame_bounded(
+                              connection, timeout_ms, full_response_size, &frame, &payload)
                         : 0;
     if (muted_holder_pid_out && sent &&
         (received != 1 || (frame.type == CBM_DAEMON_FRAME_RESPONSE && frame.flags != operation))) {
@@ -2937,7 +2984,8 @@ static bool runtime_control_request_send(const cbm_daemon_ipc_endpoint_t *endpoi
         *muted_holder_pid_out = cbm_daemon_ipc_connection_peer_pid(connection);
     }
     bool valid = received == 1 && frame.type == CBM_DAEMON_FRAME_RESPONSE &&
-                 frame.flags == operation && frame.length == response_size && payload &&
+                 frame.flags == operation &&
+                 (frame.length == response_size || frame.length == full_response_size) && payload &&
                  payload[0] == 1U;
     cbm_daemon_ipc_connection_close(connection);
     if (!valid) {
@@ -2945,12 +2993,41 @@ static bool runtime_control_request_send(const cbm_daemon_ipc_endpoint_t *endpoi
         return false;
     }
     *payload_out = payload;
+    if (payload_length_out) {
+        *payload_length_out = frame.length;
+    }
     return true;
 }
 
 static uint32_t runtime_control_read_u32(const uint8_t *bytes) {
     return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) | ((uint32_t)bytes[2] << 8) |
            (uint32_t)bytes[3];
+}
+
+static uint64_t runtime_control_read_u64(const uint8_t *bytes) {
+    return ((uint64_t)runtime_control_read_u32(bytes) << 32) | runtime_control_read_u32(bytes + 4);
+}
+
+const char *cbm_daemon_budget_source_name(cbm_daemon_budget_source_t source) {
+    switch (source) {
+    case CBM_DAEMON_BUDGET_SOURCE_CONFIG:
+        return "config";
+    case CBM_DAEMON_BUDGET_SOURCE_ENV:
+        return "env";
+    case CBM_DAEMON_BUDGET_SOURCE_RAM_FRACTION:
+    default:
+        return "ram_fraction";
+    }
+}
+
+cbm_daemon_budget_source_t cbm_daemon_budget_source_from_name(const char *name) {
+    if (name != NULL && strcmp(name, "config") == 0) {
+        return CBM_DAEMON_BUDGET_SOURCE_CONFIG;
+    }
+    if (name != NULL && strcmp(name, "env") == 0) {
+        return CBM_DAEMON_BUDGET_SOURCE_ENV;
+    }
+    return CBM_DAEMON_BUDGET_SOURCE_RAM_FRACTION;
 }
 
 bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint,
@@ -2962,9 +3039,11 @@ bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint
     }
     memset(status_out, 0, sizeof(*status_out));
     uint8_t *payload = NULL;
+    uint32_t payload_length = 0;
     if (!runtime_control_request_send(endpoint, identity, CBM_DAEMON_RUNTIME_OP_STATUS, timeout_ms,
-                                      CBM_DAEMON_STATUS_RESPONSE_SIZE, &payload,
-                                      &status_out->muted_endpoint_holder_pid)) {
+                                      CBM_DAEMON_STATUS_RESPONSE_SIZE,
+                                      CBM_DAEMON_STATUS_RESPONSE_FULL_SIZE, &payload_length,
+                                      &payload, &status_out->muted_endpoint_holder_pid)) {
         return false;
     }
     status_out->permanent = (payload[1] & 0x01U) != 0U;
@@ -2981,6 +3060,18 @@ bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint
     status_out->build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE - 1U] = '\0';
     memcpy(status_out->semantic_version, payload + 109U, sizeof(status_out->semantic_version));
     status_out->semantic_version[sizeof(status_out->semantic_version) - 1U] = '\0';
+    /* B1 snapshot: present only in the same-build (long) layout. A cross-build
+     * daemon answers with the frozen layout and these fields stay zeroed. */
+    if (payload_length >= CBM_DAEMON_STATUS_RESPONSE_FULL_SIZE) {
+        status_out->memory_budget_bytes = runtime_control_read_u64(payload + 121U);
+        status_out->index_workers =
+            (uint32_t)(((uint32_t)payload[129] << 8) | (uint32_t)payload[130]);
+        status_out->budget_source =
+            payload[131] <= (uint8_t)CBM_DAEMON_BUDGET_SOURCE_ENV
+                ? (cbm_daemon_budget_source_t)payload[131]
+                : CBM_DAEMON_BUDGET_SOURCE_RAM_FRACTION;
+        status_out->has_budget_status = true;
+    }
     free(payload);
     return true;
 }
@@ -2995,7 +3086,8 @@ bool cbm_daemon_runtime_request_stop(const cbm_daemon_ipc_endpoint_t *endpoint,
     memset(result_out, 0, sizeof(*result_out));
     uint8_t *payload = NULL;
     if (!runtime_control_request_send(endpoint, identity, CBM_DAEMON_RUNTIME_OP_STOP, timeout_ms,
-                                      CBM_DAEMON_STOP_RESPONSE_SIZE, &payload, NULL)) {
+                                      CBM_DAEMON_STOP_RESPONSE_SIZE,
+                                      CBM_DAEMON_STOP_RESPONSE_SIZE, NULL, &payload, NULL)) {
         return false;
     }
     result_out->accepted = (payload[1] & 0x01U) != 0U;

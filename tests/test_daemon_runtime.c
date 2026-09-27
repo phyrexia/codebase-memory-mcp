@@ -1293,6 +1293,8 @@ static bool runtime_test_fixture_start_failed(const char *tag, const char *stage
 }
 
 static bool runtime_test_fixture_permanent = false;
+/* B1: budget snapshot the fixture's service reports via `daemon status`. */
+static cbm_daemon_runtime_budget_status_t runtime_test_fixture_budget_status;
 
 static bool runtime_test_fixture_start_configured(
     runtime_test_fixture_t *fixture, const char *tag, const cbm_daemon_build_identity_t *identity,
@@ -1345,6 +1347,7 @@ static bool runtime_test_fixture_start_configured(
         /* Default false: every teardown-latency fixture depends on prompt
          * last-client-exit. Only the permanent-lifecycle tests flip this. */
         .permanent = runtime_test_fixture_permanent,
+        .budget_status = runtime_test_fixture_budget_status,
     };
     if (application) {
         config.application = *application;
@@ -5252,11 +5255,52 @@ TEST(daemon_runtime_stop_refuses_while_committed_clients_exist) {
     PASS();
 }
 
+/* B1: `daemon status` carries the daemon's resolved budget/parallelism on the
+ * same-build wire layout — and a build-skew requester keeps getting the frozen
+ * 121-byte answer, which must still parse (this is the probe operators use
+ * while two generations coexist). */
+TEST(daemon_runtime_status_reports_budget_snapshot_and_keeps_the_frozen_layout) {
+    cbm_daemon_build_identity_t identity = runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    runtime_test_fixture_budget_status = (cbm_daemon_runtime_budget_status_t){
+        .memory_budget_bytes = 6442450944ULL,
+        .index_workers = 4,
+        .budget_source = CBM_DAEMON_BUDGET_SOURCE_CONFIG,
+    };
+    bool started = runtime_test_fixture_start(&fixture, "status-budget", &identity);
+    runtime_test_fixture_budget_status = (cbm_daemon_runtime_budget_status_t){0};
+
+    cbm_daemon_runtime_status_t status = {0};
+    bool snapshot_ok =
+        started && cbm_daemon_runtime_request_status(fixture.endpoint, &identity,
+                                                     RUNTIME_TEST_TIMEOUT_MS, &status) &&
+        status.has_budget_status && status.memory_budget_bytes == 6442450944ULL &&
+        status.index_workers == 4 && status.budget_source == CBM_DAEMON_BUDGET_SOURCE_CONFIG &&
+        strcmp(cbm_daemon_budget_source_name(status.budget_source), "config") == 0 &&
+        status.daemon_pid != 0 && strcmp(status.build_fingerprint, runtime_test_self_build()) == 0;
+
+    cbm_daemon_runtime_force_legacy_status_for_test(true);
+    cbm_daemon_runtime_status_t legacy = {0};
+    bool legacy_ok =
+        started && cbm_daemon_runtime_request_status(fixture.endpoint, &identity,
+                                                     RUNTIME_TEST_TIMEOUT_MS, &legacy) &&
+        !legacy.has_budget_status && legacy.memory_budget_bytes == 0 && legacy.index_workers == 0 &&
+        legacy.daemon_pid != 0 && strcmp(legacy.build_fingerprint, runtime_test_self_build()) == 0;
+    cbm_daemon_runtime_force_legacy_status_for_test(false);
+
+    runtime_test_fixture_finish(&fixture);
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(snapshot_ok);
+    ASSERT_TRUE(legacy_ok);
+    PASS();
+}
+
 SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_idle_accept_has_no_timeout_wakes);
     RUN_TEST(daemon_runtime_state_waiters_recheck_after_spurious_broadcast);
     RUN_TEST(daemon_runtime_permanent_service_survives_last_disconnect_until_stop);
     RUN_TEST(daemon_runtime_stop_refuses_while_committed_clients_exist);
+    RUN_TEST(daemon_runtime_status_reports_budget_snapshot_and_keeps_the_frozen_layout);
     RUN_TEST(daemon_host_early_coordination_failure_is_durable);
     RUN_TEST(daemon_host_refuses_unopenable_runtime_config_database);
     RUN_TEST(daemon_host_http_reconcile_rate_limits_and_retries_transient_failures);
