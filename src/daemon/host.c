@@ -1395,7 +1395,7 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     char memory_budget[32];
     char physical_job_limit[32];
     char worker_memory_budget[32];
-    char max_clients[32];
+    char max_clients_text[32];
     (void)snprintf(process_id, sizeof(process_id), "%llu",
                    (unsigned long long)host_current_process_id());
     (void)snprintf(memory_budget, sizeof(memory_budget), "%zu", cbm_mem_budget());
@@ -1403,7 +1403,7 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
                    cbm_daemon_application_physical_job_limit(host.application));
     (void)snprintf(worker_memory_budget, sizeof(worker_memory_budget), "%zu",
                    cbm_daemon_application_worker_memory_budget_bytes(host.application));
-    (void)snprintf(max_clients, sizeof(max_clients), "%u", knobs.max_clients);
+    (void)snprintf(max_clients_text, sizeof(max_clients_text), "%u", knobs.max_clients);
     cbm_log_info("daemon.start", "version", config->identity.semantic_version, "pid", process_id,
                  "cache_fingerprint",
                  config->identity.cache_fingerprint ? config->identity.cache_fingerprint
@@ -1413,7 +1413,7 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
                  cbm_mem_budget_source(), "index_workers", knobs.index_workers_text,
                  /* C8: the cap this generation admits and which layer chose
                   * it — the same values `daemon status` reports. */
-                 "max_clients", max_clients, "max_clients_source",
+                 "max_clients", max_clients_text, "max_clients_source",
                  cbm_daemon_max_clients_source_name(knobs.max_clients_source));
     if (!host_wait_for_lifetime(service, config->stop_requested, &host, config->permanent)) {
         host_force_terminate("runtime");
