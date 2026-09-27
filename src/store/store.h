@@ -486,6 +486,10 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out);
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count);
 int cbm_store_delete_project(cbm_store_t *s, const char *name);
 
+/* Index of the single primary project row of a DB, ignoring internal shadow
+ * rows ("<name>::missed", #1044). Returns -1 when there is not exactly one. */
+int cbm_store_primary_project_index(const cbm_project_t *projects, int count);
+
 /* ── Persisted per-project row counts (C5) ─────────────────────────
  *
  * `projects.node_count` / `projects.edge_count` are stamped when a generation

@@ -292,7 +292,6 @@ static unsigned projects_count_column_mask(cbm_store_t *s) {
     if (!s || !s->db) {
         return 0;
     }
-    projects_count_column_probe_tick();
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, "PRAGMA table_info(projects);", CBM_NOT_FOUND, &stmt, NULL) !=
         SQLITE_OK) {
@@ -315,7 +314,10 @@ static unsigned projects_count_column_mask(cbm_store_t *s) {
     return mask;
 }
 
+/* The seam counts READER probes only: the writable-open migration probes its
+ * own schema and is not part of the listing cost the counter exists to prove. */
 bool cbm_store_projects_has_count_columns(cbm_store_t *s) {
+    projects_count_column_probe_tick();
     return projects_count_column_mask(s) == PROJECTS_COUNT_COL_ALL;
 }
 
@@ -2684,6 +2686,23 @@ int cbm_store_persist_project_counts(cbm_store_t *s, const char *project) {
         return CBM_STORE_ERR;
     }
     return cbm_store_set_project_counts(s, project, nodes, edges);
+}
+
+/* Index of the single primary project row of a DB, ignoring internal shadow
+ * rows ("<name>::missed"). Returns -1 when there is not exactly one: a DB with
+ * only shadow rows is not addressable, and one with several primaries is
+ * ambiguous. Issue #1044: requiring a single row over ALL rows made every
+ * project with a miss graph vanish from list_projects. */
+int cbm_store_primary_project_index(const cbm_project_t *projects, int count) {
+    int primary = -1;
+    int primary_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (projects[i].name && projects[i].name[0] && !strstr(projects[i].name, "::")) {
+            primary = i;
+            primary_count++;
+        }
+    }
+    return primary_count == 1 ? primary : -1;
 }
 
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
