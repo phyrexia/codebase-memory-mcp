@@ -18,6 +18,7 @@
 #include "ui/embedded_assets.h"
 #include "ui/layout3d.h"
 #include "mcp/mcp.h"
+#include "store/project_registry.h"
 #include "store/store.h"
 #include "watcher/watcher.h"
 #include "cli/cli.h"
@@ -858,9 +859,20 @@ static void handle_browse(cbm_http_server_t *srv, cbm_http_conn_t *c,
 
 /* GET /api/indexed-roots → every indexed project with its root_path and
  * freshness, so the ingest modal can mark folders that are already indexed
- * and flag orphans whose root no longer exists on disk. One entry per
- * primary project; "::" shadow rows (miss graphs) share the db and are
- * skipped exactly like list_projects does (#1044). */
+ * and flag orphans whose root no longer exists on disk.
+ *
+ * Identity comes from the project registry (C5): name, root_path and
+ * indexed_at are the cached row of each .db file, validated by (size,
+ * mtime_ns), so a warm request opens no database at all. This endpoint used
+ * to open every project db and run two COUNT(*) per call — 821 ms mean at
+ * ~120 projects. Totals travel with the identity: the persisted ones when the
+ * row carries them, a live COUNT(*) computed once per generation otherwise.
+ *
+ * One entry per project db, exactly like list_projects resolves a project
+ * (#1044): "::" shadow rows (miss graphs) share the db and are never
+ * addressable, and a db whose projects table holds anything other than a
+ * single primary row is unresolvable and skipped — the registry caches that
+ * verdict too, so ghost files are not retried on every call. */
 static void handle_indexed_roots(cbm_http_conn_t *c) {
     const char *cdir = cbm_resolve_cache_dir();
     DIR *dir = cdir ? opendir(cdir) : NULL;
@@ -886,56 +898,41 @@ static void handle_indexed_roots(cbm_http_conn_t *c) {
 
         char full[2048];
         snprintf(full, sizeof(full), "%s/%s", cdir, fname);
-        cbm_store_t *st = cbm_store_open_path_query(full);
-        if (!st)
-            continue; /* ghost / unreadable — not a resolvable project */
+        cbm_project_identity_t id = {0};
+        if (cbm_project_registry_lookup(full, &id) != CBM_PROJECT_REGISTRY_OK)
+            continue; /* ghost / unreadable / no single primary project */
 
-        cbm_project_t *projs = NULL;
-        int n = 0;
-        if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK) {
-            for (int i = 0; i < n; i++) {
-                const cbm_project_t *p = &projs[i];
-                if (!p->name || !p->name[0] || strstr(p->name, "::"))
-                    continue;
-
-                int nodes = cbm_store_count_nodes(st, p->name);
-                int edges = cbm_store_count_edges(st, p->name);
-                if (nodes < 0) nodes = 0; /* CBM_STORE_ERR sentinel */
-                if (edges < 0) edges = 0;
-
-                /* Stage the whole entry before committing it: a clamped
-                 * partial entry would leave invalid JSON in the response.
-                 * When the 32KB buffer fills, later projects are dropped
-                 * but the emitted JSON stays parseable. */
-                char entry[8192];
-                int epos = 0;
-                char esc[2048];
-                cbm_json_escape(esc, (int)sizeof(esc), p->name);
-                http_appendf(entry, sizeof(entry), &epos, "%s{\"name\":\"%s\"",
-                             count > 0 ? "," : "", esc);
-                cbm_json_escape(esc, (int)sizeof(esc), p->root_path ? p->root_path : "");
-                http_appendf(entry, sizeof(entry), &epos, ",\"root_path\":\"%s\"", esc);
-                if (p->indexed_at && p->indexed_at[0]) {
-                    cbm_json_escape(esc, (int)sizeof(esc), p->indexed_at);
-                    http_appendf(entry, sizeof(entry), &epos, ",\"indexed_at\":\"%s\"", esc);
-                }
-                http_appendf(entry, sizeof(entry), &epos,
-                             ",\"nodes\":%d,\"edges\":%d,\"root_exists\":%s}", nodes, edges,
-                             p->root_path && cbm_is_dir(p->root_path) ? "true" : "false");
-
-                /* +2 keeps room for the closing "]" and the NUL. */
-                if (pos + epos + 2 > (int)sizeof(buf)) {
-                    out_of_space = true;
-                    break;
-                }
-                memcpy(buf + pos, entry, (size_t)epos);
-                pos += epos;
-                buf[pos] = '\0';
-                count++;
-            }
+        /* Stage the whole entry before committing it: a clamped
+         * partial entry would leave invalid JSON in the response.
+         * When the 32KB buffer fills, later projects are dropped
+         * but the emitted JSON stays parseable. */
+        char entry[8192];
+        int epos = 0;
+        char esc[2048];
+        cbm_json_escape(esc, (int)sizeof(esc), id.name);
+        http_appendf(entry, sizeof(entry), &epos, "%s{\"name\":\"%s\"",
+                     count > 0 ? "," : "", esc);
+        cbm_json_escape(esc, (int)sizeof(esc), id.root_path);
+        http_appendf(entry, sizeof(entry), &epos, ",\"root_path\":\"%s\"", esc);
+        if (id.indexed_at && id.indexed_at[0]) {
+            cbm_json_escape(esc, (int)sizeof(esc), id.indexed_at);
+            http_appendf(entry, sizeof(entry), &epos, ",\"indexed_at\":\"%s\"", esc);
         }
-        cbm_store_free_projects(projs, n);
-        cbm_store_close(st);
+        bool root_exists = id.root_path[0] && cbm_is_dir(id.root_path);
+        http_appendf(entry, sizeof(entry), &epos,
+                     ",\"nodes\":%lld,\"edges\":%lld,\"root_exists\":%s}", (long long)id.node_count,
+                     (long long)id.edge_count, root_exists ? "true" : "false");
+
+        /* +2 keeps room for the closing "]" and the NUL. */
+        if (pos + epos + 2 > (int)sizeof(buf)) {
+            out_of_space = true;
+        } else {
+            memcpy(buf + pos, entry, (size_t)epos);
+            pos += epos;
+            buf[pos] = '\0';
+            count++;
+        }
+        cbm_project_identity_clear(&id);
     }
     closedir(dir);
 

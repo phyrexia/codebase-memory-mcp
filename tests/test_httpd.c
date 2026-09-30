@@ -27,6 +27,7 @@
 #include "ui/httpd.h"
 #include "ui/http_server.h"
 #include <store/store.h>
+#include <store/project_registry.h> /* C5b: registry disk-read seam */
 #include <watcher/watcher.h>
 #include <yyjson/yyjson.h>
 
@@ -2222,6 +2223,341 @@ TEST(ui_server_indexed_roots_reports_projects_and_orphans) {
     PASS();
 }
 
+/* C5b fixture for /api/indexed-roots: one project .db carrying `nodes`/`edges`
+ * real rows. `stamp_totals` writes the publish-time totals a C5 generation has;
+ * without it the row has no totals and the reader must derive them. */
+static int th_roots_make_db(const ui_delete_fixture_t *fx, const char *name, const char *root_path,
+                            int nodes, int edges, bool stamp_totals) {
+    if (nodes < 0 || nodes > 64 || edges < 0 || (edges > 0 && nodes == 0))
+        return -1;
+    char db_path[1088];
+    ui_delete_db_path(fx, name, db_path, sizeof(db_path));
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store)
+        return -1;
+    int rc = cbm_store_upsert_project(store, name, root_path) == CBM_STORE_OK ? 0 : -1;
+    int64_t ids[64];
+    for (int i = 0; rc == 0 && i < nodes; i++) {
+        char qn[128];
+        snprintf(qn, sizeof(qn), "%s.n%d", name, i);
+        cbm_node_t node = {.project = name,
+                           .label = "Function",
+                           .name = qn,
+                           .qualified_name = qn,
+                           .file_path = "src/main.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ids[i] = cbm_store_upsert_node(store, &node);
+        if (ids[i] <= 0)
+            rc = -1;
+    }
+    for (int i = 0; rc == 0 && i < edges; i++) {
+        cbm_edge_t edge = {.project = name,
+                           .source_id = ids[i % nodes],
+                           .target_id = ids[(i + 1) % nodes],
+                           .type = "CALLS",
+                           .properties_json = "{}"};
+        if (cbm_store_insert_edge(store, &edge) <= 0)
+            rc = -1;
+    }
+    if (rc == 0 && stamp_totals && cbm_store_persist_project_counts(store, name) != CBM_STORE_OK)
+        rc = -1;
+    cbm_store_close(store);
+    return rc;
+}
+
+/* What the project row itself says for indexed_at. It is a live timestamp, so
+ * it is read back rather than hardcoded. */
+static int th_roots_indexed_at(const ui_delete_fixture_t *fx, const char *name, char *out,
+                               size_t outsz) {
+    char db_path[1088];
+    ui_delete_db_path(fx, name, db_path, sizeof(db_path));
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (!store)
+        return -1;
+    cbm_project_t *projs = NULL;
+    int n = 0;
+    int rc = -1;
+    if (cbm_store_list_projects(store, &projs, &n) == CBM_STORE_OK) {
+        for (int i = 0; i < n; i++) {
+            if (projs[i].name && strcmp(projs[i].name, name) == 0 && projs[i].indexed_at) {
+                snprintf(out, outsz, "%s", projs[i].indexed_at);
+                rc = 0;
+                break;
+            }
+        }
+    }
+    cbm_store_free_projects(projs, n);
+    cbm_store_close(store);
+    return rc;
+}
+
+/* One entry must carry exactly what this endpoint has always reported: the
+ * project row's name/root_path/indexed_at, the node/edge totals and whether
+ * the root still exists on disk. */
+static int th_expect_root_entry(yyjson_val *roots, const char *name, const char *root_path,
+                                const char *indexed_at, int nodes, int edges, bool root_exists) {
+    size_t idx;
+    size_t count;
+    yyjson_val *item;
+    yyjson_val *entry = NULL;
+    yyjson_arr_foreach(roots, idx, count, item) {
+        const char *entry_name = yyjson_get_str(yyjson_obj_get(item, "name"));
+        if (entry_name && strcmp(entry_name, name) == 0) {
+            entry = item;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(entry, "name")), name);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(entry, "root_path")), root_path);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(entry, "indexed_at")), indexed_at);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(entry, "nodes")), nodes);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(entry, "edges")), edges);
+    ASSERT_EQ(yyjson_get_bool(yyjson_obj_get(entry, "root_exists")) ? 1 : 0, root_exists ? 1 : 0);
+    PASS();
+}
+
+/* The whole body: exactly the two fixture projects and nothing else — the
+ * internal _config.db and the unreadable .db must never surface. */
+static int th_expect_roots_body(const char *resp, const char *live_root,
+                                const char *live_indexed_at, const char *orphan_root,
+                                const char *orphan_indexed_at) {
+    yyjson_doc *doc = th_http_json(resp);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *roots = yyjson_doc_get_root(doc);
+    ASSERT_TRUE(yyjson_is_arr(roots));
+    ASSERT_EQ((int)yyjson_arr_size(roots), 2);
+    if (th_expect_root_entry(roots, "roots-live", live_root, live_indexed_at, 3, 2, true) != 0 ||
+        th_expect_root_entry(roots, "roots-orphan", orphan_root, orphan_indexed_at, 1, 0, false) !=
+            0) {
+        yyjson_doc_free(doc);
+        return 1;
+    }
+    yyjson_doc_free(doc);
+    ASSERT_NULL(strstr(resp, "_config"));
+    ASSERT_NULL(strstr(resp, "roots-ghost"));
+    PASS();
+}
+
+/* C5b: /api/indexed-roots answers from the project identity registry and keeps
+ * the JSON it has always served. Identity (name/root_path/indexed_at) comes
+ * from the (size, mtime_ns) validated cache and the totals travel with it, so
+ * a warm request opens no database at all — this endpoint used to open every
+ * project db and run two COUNT(*) per call. */
+TEST(ui_server_indexed_roots_registry_serves_same_json_without_opening_dbs) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+
+    /* A real _config.db in the cache dir must be skipped by the scan. */
+    char cfgdb[1088];
+    snprintf(cfgdb, sizeof(cfgdb), "%s/_config.db", fx.cache_dir);
+    ASSERT_EQ(th_write_file(cfgdb, "not a project"), 0);
+    /* A .db that is not a database: not a project either, and — cached as
+     * unresolvable — never retried on later calls. */
+    char ghostdb[1088];
+    snprintf(ghostdb, sizeof(ghostdb), "%s/roots-ghost.db", fx.cache_dir);
+    ASSERT_EQ(th_write_file(ghostdb, "not a database"), 0);
+
+    char orphan_root[1088];
+    snprintf(orphan_root, sizeof(orphan_root), "%s/gone", fx.tmpdir);
+
+    /* One published generation (totals stamped) and one legacy row (no totals
+     * to serve, so a live COUNT(*) supplies them): same JSON either way. */
+    ASSERT_EQ(th_roots_make_db(&fx, "roots-live", fx.tmpdir, 3, 2, true), 0);
+    ASSERT_EQ(th_roots_make_db(&fx, "roots-orphan", orphan_root, 1, 0, false), 0);
+
+    char live_indexed_at[64];
+    char orphan_indexed_at[64];
+    ASSERT_EQ(th_roots_indexed_at(&fx, "roots-live", live_indexed_at, sizeof(live_indexed_at)), 0);
+    ASSERT_EQ(th_roots_indexed_at(&fx, "roots-orphan", orphan_indexed_at,
+                                 sizeof(orphan_indexed_at)),
+              0);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    cbm_project_registry_reset();
+    cbm_project_registry_disk_reads_reset_for_test();
+    char first[16384];
+    int n = th_http(cbm_http_server_port(ts.srv), "GET /api/indexed-roots HTTP/1.1\r\n\r\n", first,
+                    sizeof(first));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(first), 200);
+    /* Cold request: three candidates went to disk — the two projects and the
+     * ghost, whose unreadable verdict is cached like any other identity. */
+    ASSERT_EQ((int)cbm_project_registry_disk_reads_for_test(), 3);
+    if (th_expect_roots_body(first, fx.tmpdir, live_indexed_at, orphan_root, orphan_indexed_at))
+        return 1;
+
+    /* Warm request: same JSON, and not one database opened. */
+    cbm_project_registry_disk_reads_reset_for_test();
+    char second[16384];
+    n = th_http(cbm_http_server_port(ts.srv), "GET /api/indexed-roots HTTP/1.1\r\n\r\n", second,
+                sizeof(second));
+    th_server_stop(&ts);
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(second), 200);
+    ASSERT_EQ((int)cbm_project_registry_disk_reads_for_test(), 0);
+    if (th_expect_roots_body(second, fx.tmpdir, live_indexed_at, orphan_root, orphan_indexed_at))
+        return 1;
+
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+/* C5b: a rewritten .db is a new generation. Only that file is re-read — the
+ * rest stay cached by (size, mtime_ns) — and the response serves its new
+ * values while the untouched projects keep theirs. */
+TEST(ui_server_indexed_roots_rereads_only_the_changed_db) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+
+    char gone_root[1088];
+    snprintf(gone_root, sizeof(gone_root), "%s/gone-b", fx.tmpdir);
+    char moved_root[1088];
+    snprintf(moved_root, sizeof(moved_root), "%s/moved-b", fx.tmpdir);
+    ASSERT_EQ(th_mkdir_p(moved_root), 0);
+
+    ASSERT_EQ(th_roots_make_db(&fx, "roots-a", fx.tmpdir, 2, 1, true), 0);
+    ASSERT_EQ(th_roots_make_db(&fx, "roots-b", gone_root, 1, 0, false), 0);
+    ASSERT_EQ(th_roots_make_db(&fx, "roots-c", fx.tmpdir, 1, 0, true), 0);
+
+    char a_indexed_at[64];
+    char b_indexed_at[64];
+    char c_indexed_at[64];
+    ASSERT_EQ(th_roots_indexed_at(&fx, "roots-a", a_indexed_at, sizeof(a_indexed_at)), 0);
+    ASSERT_EQ(th_roots_indexed_at(&fx, "roots-b", b_indexed_at, sizeof(b_indexed_at)), 0);
+    ASSERT_EQ(th_roots_indexed_at(&fx, "roots-c", c_indexed_at, sizeof(c_indexed_at)), 0);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    cbm_project_registry_reset();
+    cbm_project_registry_disk_reads_reset_for_test();
+    char first[16384];
+    int n = th_http(cbm_http_server_port(ts.srv), "GET /api/indexed-roots HTTP/1.1\r\n\r\n", first,
+                    sizeof(first));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(first), 200);
+    ASSERT_EQ((int)cbm_project_registry_disk_reads_for_test(), 3);
+    yyjson_doc *doc = th_http_json(first);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *roots = yyjson_doc_get_root(doc);
+    ASSERT_TRUE(yyjson_is_arr(roots));
+    ASSERT_EQ((int)yyjson_arr_size(roots), 3);
+    if (th_expect_root_entry(roots, "roots-a", fx.tmpdir, a_indexed_at, 2, 1, true) != 0 ||
+        th_expect_root_entry(roots, "roots-b", gone_root, b_indexed_at, 1, 0, false) != 0 ||
+        th_expect_root_entry(roots, "roots-c", fx.tmpdir, c_indexed_at, 1, 0, true) != 0) {
+        yyjson_doc_free(doc);
+        return 1;
+    }
+    yyjson_doc_free(doc);
+
+    /* Rewrite one generation in place: new root, one more node, totals
+     * stamped. The file's (size, mtime_ns) moves; the other two do not. */
+    char db_path[1088];
+    ui_delete_db_path(&fx, "roots-b", db_path, sizeof(db_path));
+    cbm_store_t *writable = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(writable);
+    ASSERT_EQ(cbm_store_upsert_project(writable, "roots-b", moved_root), CBM_STORE_OK);
+    ASSERT_GT(cbm_store_upsert_node(writable,
+                                    &(cbm_node_t){.project = "roots-b",
+                                                  .label = "Function",
+                                                  .name = "roots-b.n2",
+                                                  .qualified_name = "roots-b.n2",
+                                                  .file_path = "src/main.c",
+                                                  .start_line = 3,
+                                                  .end_line = 3}),
+              0);
+    ASSERT_EQ(cbm_store_persist_project_counts(writable, "roots-b"), CBM_STORE_OK);
+    cbm_store_close(writable);
+    char b_indexed_at_after[64];
+    ASSERT_EQ(th_roots_indexed_at(&fx, "roots-b", b_indexed_at_after, sizeof(b_indexed_at_after)),
+              0);
+
+    cbm_project_registry_disk_reads_reset_for_test();
+    char second[16384];
+    n = th_http(cbm_http_server_port(ts.srv), "GET /api/indexed-roots HTTP/1.1\r\n\r\n", second,
+                sizeof(second));
+    th_server_stop(&ts);
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(second), 200);
+    /* Exactly one database opened: the generation that changed. */
+    ASSERT_EQ((int)cbm_project_registry_disk_reads_for_test(), 1);
+
+    doc = th_http_json(second);
+    ASSERT_NOT_NULL(doc);
+    roots = yyjson_doc_get_root(doc);
+    ASSERT_TRUE(yyjson_is_arr(roots));
+    ASSERT_EQ((int)yyjson_arr_size(roots), 3);
+    if (th_expect_root_entry(roots, "roots-a", fx.tmpdir, a_indexed_at, 2, 1, true) != 0 ||
+        th_expect_root_entry(roots, "roots-b", moved_root, b_indexed_at_after, 2, 0, true) != 0 ||
+        th_expect_root_entry(roots, "roots-c", fx.tmpdir, c_indexed_at, 1, 0, true) != 0) {
+        yyjson_doc_free(doc);
+        return 1;
+    }
+    yyjson_doc_free(doc);
+
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+/* C5b cost criterion (ADR §3.C): /api/indexed-roots over ~120 projects must
+ * average under 100 ms — the readdir + open-every-db handler measured 821 ms.
+ * The assertion is on the warm mean, what the UI pays once each generation has
+ * been read; the number is printed so a qf-infra run records it. */
+TEST(ui_server_indexed_roots_mean_latency_with_120_projects) {
+    enum { C5B_BENCH_PROJECTS = 120, C5B_BENCH_ROUNDS = 5 };
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+
+    for (int i = 0; i < C5B_BENCH_PROJECTS; i++) {
+        char name[64];
+        char root[128];
+        snprintf(name, sizeof(name), "bench-project-%03d", i);
+        snprintf(root, sizeof(root), "/tmp/bench-project-%03d", i);
+        ASSERT_EQ(th_roots_make_db(&fx, name, root, 2, 1, true), 0);
+    }
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *req = "GET /api/indexed-roots HTTP/1.1\r\n\r\n";
+    char resp[65536];
+
+    /* Warm-up: the one call that reads the 120 generations. */
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    yyjson_doc *doc = th_http_json(resp);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_EQ((int)yyjson_arr_size(yyjson_doc_get_root(doc)), C5B_BENCH_PROJECTS);
+    yyjson_doc_free(doc);
+    cbm_project_registry_disk_reads_reset_for_test();
+
+    struct timespec t0;
+    struct timespec t1;
+    double total_ms = 0.0;
+    for (int round = 0; round < C5B_BENCH_ROUNDS; round++) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
+        n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
+        ASSERT_GT(n, 0);
+        ASSERT_EQ(th_status(resp), 200);
+        total_ms += (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+                    (double)(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+    }
+    th_server_stop(&ts);
+    /* The warm rounds opened nothing: every identity came from the registry. */
+    ASSERT_EQ((int)cbm_project_registry_disk_reads_for_test(), 0);
+
+    double mean_ms = total_ms / (double)C5B_BENCH_ROUNDS;
+    printf("[c5b-bench] indexed-roots mean=%.3f ms per call over %d rounds with %d projects\n",
+           mean_ms, C5B_BENCH_ROUNDS, C5B_BENCH_PROJECTS);
+    ASSERT(mean_ms < 100.0); /* ADR §3.C: mean under 100 ms at ~120 projects */
+
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
 /* /api/metrics serves the trailing window of hourly buckets from
  * metrics_requests and silently excludes rows older than ?hours=. */
 TEST(ui_server_metrics_endpoint_returns_windowed_buckets) {
@@ -2938,6 +3274,9 @@ SUITE(httpd) {
     /* #798 follow-up: full UI-mode hang repro under live sockets */
     RUN_TEST(ui_server_list_projects_responds_under_watchdog);
     RUN_TEST(ui_server_indexed_roots_reports_projects_and_orphans);
+    RUN_TEST(ui_server_indexed_roots_registry_serves_same_json_without_opening_dbs);
+    RUN_TEST(ui_server_indexed_roots_rereads_only_the_changed_db);
+    RUN_TEST(ui_server_indexed_roots_mean_latency_with_120_projects);
     RUN_TEST(ui_server_metrics_endpoint_returns_windowed_buckets);
     RUN_TEST(git_context_resolve_no_hang_under_live_ui_sockets);
 }

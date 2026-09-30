@@ -24,6 +24,27 @@
 
 /* ── Identity ───────────────────────────────────────────────────── */
 
+#if defined(CBM_CLI_ENABLE_TEST_API)
+/* Counted with default (seq_cst) ordering on purpose: the handler that ticks
+ * runs on the server thread while the test reads from its own, and a test seam
+ * that could report a stale zero would fail as flaky instead of red. */
+static atomic_size_t g_disk_reads = 0;
+
+size_t cbm_project_registry_disk_reads_for_test(void) {
+    return atomic_load(&g_disk_reads);
+}
+
+void cbm_project_registry_disk_reads_reset_for_test(void) {
+    atomic_store(&g_disk_reads, 0);
+}
+
+static void registry_disk_read_tick(void) {
+    atomic_fetch_add(&g_disk_reads, 1);
+}
+#else
+static void registry_disk_read_tick(void) {}
+#endif
+
 static char *identity_strdup(const char *s) {
     if (!s) {
         return NULL;
@@ -70,6 +91,7 @@ static bool identity_clone(const cbm_project_identity_t *src, cbm_project_identi
 static cbm_project_registry_status_t project_identity_read(const char *db_path, int64_t size_bytes,
                                                            int64_t mtime_ns,
                                                            cbm_project_identity_t *out) {
+    registry_disk_read_tick();
     cbm_store_t *store = cbm_store_open_path_query(db_path);
     if (!store) {
         return CBM_PROJECT_REGISTRY_ABSENT;
@@ -103,6 +125,17 @@ static cbm_project_registry_status_t project_identity_read(const char *db_path, 
                     cbm_project_identity_clear(out);
                     status = CBM_PROJECT_REGISTRY_OOM;
                 } else {
+                    if (!out->counts_stored) {
+                        /* No totals on the row: derive them now and cache them
+                         * with this generation, so a reader that must report
+                         * totals (/api/indexed-roots) costs no second open.
+                         * COUNT(*) reads the same tables the row describes, so
+                         * the value is as fresh as the generation itself. */
+                        int nodes = cbm_store_count_nodes(store, out->name);
+                        int edges = cbm_store_count_edges(store, out->name);
+                        out->node_count = nodes < 0 ? 0 : nodes;
+                        out->edge_count = edges < 0 ? 0 : edges;
+                    }
                     status = CBM_PROJECT_REGISTRY_OK;
                 }
             }

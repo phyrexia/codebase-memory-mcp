@@ -18,6 +18,7 @@
 #define CBM_STORE_PROJECT_REGISTRY_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* Identity of one project DB file: what its single primary `projects` row
@@ -30,6 +31,11 @@ typedef struct {
     int64_t mtime_ns;
     bool has_count_columns; /* schema probe result for node_count/edge_count */
     bool counts_stored;     /* both count columns are NOT NULL for the row */
+    /* Totals of the primary project, always filled: the persisted values when
+     * the row carries them, otherwise the live COUNT(*) computed while reading
+     * this generation. Cached with the generation, so a reader that must report
+     * totals — /api/indexed-roots has no "skip stats" projection — never has to
+     * open the file just to count. */
     int64_t node_count;
     int64_t edge_count;
 } cbm_project_identity_t;
@@ -55,5 +61,13 @@ void cbm_project_registry_invalidate(const char *db_path);
 
 /* Drop every entry (tests). */
 void cbm_project_registry_reset(void);
+
+#if defined(CBM_CLI_ENABLE_TEST_API)
+/* Test seam: how many times the registry has gone to disk to fill an identity —
+ * one per .db file generation actually opened (an unreadable file counts once,
+ * and is then cached as unresolvable). A warm lookup performs none. */
+size_t cbm_project_registry_disk_reads_for_test(void);
+void cbm_project_registry_disk_reads_reset_for_test(void);
+#endif
 
 #endif /* CBM_STORE_PROJECT_REGISTRY_H */
