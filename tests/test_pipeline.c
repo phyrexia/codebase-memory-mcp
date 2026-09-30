@@ -14216,13 +14216,18 @@ TEST(pipeline_over_budget_after_futility_fails_whole_and_preserves_db) {
  *   pipeline_backpressure_futile_nap_disengages and
  *   pipeline_over_budget_after_futility_fails_whole_and_preserves_db.)
  *
- * - RESOLVE over budget: nothing upstream relieves (the result cache is read
- *   back and the edge arena grows), and on 2026-09-14 a worker died entering
- *   parallel.resolve at rss_mb=10.999 against budget_mb=12.288. The guard
- *   (1356220d, ported to cbm_mem_should_relieve()) must fail the attempt whole
- *   with CBM_PIPELINE_ABORT_OVER_BUDGET — the code MCP names
- *   "over_memory_budget" (mcp.c, d72250a9/b5f10c22) — never a generic error,
- *   with the previous generation still serving.
+ * - RESOLVE over budget: the guard that failed the attempt whole here
+ *   (1356220d, ported in bc12624b) is RETIRED per ADR §A3. Its retirement
+ *   criterion was "three reference-corpus runs at the operating budget never
+ *   trip it", and A7 met it literally: 3/3 full runs of the integrated binary
+ *   over the 104234-file CO Refactor corpus at 6144 MB / 4 workers published
+ *   314225 nodes with a parallel_resolve peak_mb of 4899-4912 and ZERO guard
+ *   trips (the pre-upstream binary OOM-died in 3/3 at >=11942 MB). Resolve
+ *   over budget now completes and publishes; repos beyond the reference corpus
+ *   are covered by extract spill, index_max_files and the upstream extract
+ *   fail-whole. The second test pins the retirement: the budget is armed over
+ *   at the resolve boundary and the run must succeed WITHOUT the retired
+ *   `parallel.resolve.memory_budget_exceeded` record.
  *
  * Budgets are simulated with the 699be6c2 seam (cbm_mem_set_budget_for_tests)
  * and the phase boundaries with the cbm_log_set_sink seam: the pipeline logs
@@ -14255,28 +14260,30 @@ static void extract_spill_budget_sink(const char *line) {
         cbm_mem_set_budget_for_tests(CBM_TEST_BUDGET_NEVER_OVER);
     } else if (strstr(line, "parallel.resolve.start")) {
         /* Extract is done; disarm the budget gates for the rest of the run so
-         * this test cannot trip the resolve guard — pinned by the next test. */
+         * this test stays scoped to extraction — resolve's budget behavior is
+         * pinned by the next test. */
         cbm_mem_set_budget_for_tests(0);
     }
 }
 
 static bool g_resolve_sink_started;
+static bool g_resolve_sink_over_at_start;
 static bool g_resolve_sink_spilled;
-static bool g_resolve_sink_aborted;
+static bool g_resolve_sink_guard_seen;
 
-static void resolve_over_budget_sink(const char *line) {
+static void resolve_budget_sink(const char *line) {
     if (strstr(line, "parallel.resolve.start")) {
         g_resolve_sink_started = true;
         cbm_mem_set_budget_for_tests((size_t)CBM_TEST_BUDGET_OVER_BYTES);
+        g_resolve_sink_over_at_start = cbm_mem_over_budget();
     } else if (strstr(line, "pass.timing") && strstr(line, "parallel_resolve")) {
         cbm_mem_set_budget_for_tests(0);
     } else if (strstr(line, "mem.spill.on")) {
         g_resolve_sink_spilled = true;
     } else if (strstr(line, "parallel.resolve.memory_budget_exceeded")) {
-        /* The guard's own record: fired in resolve, not somewhere else. This
-         * is an engagement guard, not the contract assertion — the code the
-         * run returns is. */
-        g_resolve_sink_aborted = true;
+        /* The RETIRED guard's own record (ADR §A3). Its reappearance is the
+         * regression this sink exists to catch. */
+        g_resolve_sink_guard_seen = true;
     }
 }
 
@@ -14346,12 +14353,15 @@ TEST(pipeline_extract_over_budget_spills_and_completes) {
     PASS();
 }
 
-/* Decision A3: resolve over budget fails WHOLE with the named code — not the
- * cancel sentinel, not success — and the previously serving generation is
- * byte-identical afterwards. RED before the guard port: the run returns the
- * generic cancel code (or completes), which MCP cannot name
- * "over_memory_budget". */
-TEST(pipeline_over_budget_resolve_aborts_named_over_memory_budget) {
+/* ADR §A3 retirement: resolve over budget must NOT abort any more (A7: 3/3
+ * reference-corpus runs at the operating budget completed with ZERO guard
+ * trips, so the guard is gone). The budget is armed over at the resolve
+ * boundary and extraction spills first (the incident shape), yet the run
+ * completes and publishes a valid graph — and the retired guard record never
+ * appears. RED if the guard comes back: the run returns
+ * CBM_PIPELINE_ABORT_OVER_BUDGET and/or logs
+ * parallel.resolve.memory_budget_exceeded. */
+TEST(pipeline_over_budget_resolve_completes_without_guard) {
     if (!write_backpressure_fixture()) {
         FAIL("failed to create fixture");
     }
@@ -14366,39 +14376,23 @@ TEST(pipeline_over_budget_resolve_aborts_named_over_memory_budget) {
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/resolve_budget.db", g_tmpdir);
 
-    /* Generation 1 at the process budget: publishes normally. */
-    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
-    int rc_first = p ? cbm_pipeline_run(p) : -1;
-    char *project = p ? strdup(cbm_pipeline_project_name(p)) : NULL;
-    cbm_pipeline_free(p);
-    int nodes_before = -1;
-    bool valid_before = false;
-    cbm_store_t *live = rc_first == 0 && project ? cbm_store_open_path(db_path) : NULL;
-    if (live) {
-        valid_before = cbm_store_check_integrity(live);
-        nodes_before = cbm_store_count_nodes(live, project);
-        cbm_store_close(live);
-    }
-    size_t before_len = 0;
-    unsigned char *before = read_file_bytes(db_path, &before_len);
-
-    /* Generation 2 over a CHANGED repo (every file gains a definition, so the
-     * run must re-extract all 64). Extraction spills its results (the incident
-     * shape: the spill keeps extraction alive), and the budget is exceeded at
-     * the resolve boundary — the phase nothing upstream relieves. */
-    bool mutated = mutate_backpressure_fixture();
+    /* Extraction spills its results (the incident shape: the spill keeps
+     * extraction alive) and the budget is exceeded at the resolve boundary —
+     * exactly where the retired guard used to fail the attempt whole. */
     size_t saved_budget = cbm_mem_budget();
     CBMLogLevel saved_level = cbm_log_get_level();
     cbm_mem_set_budget_for_tests(0); /* extraction must not trip any gate */
     cbm_log_set_level(CBM_LOG_INFO);
     g_resolve_sink_started = false;
+    g_resolve_sink_over_at_start = false;
     g_resolve_sink_spilled = false;
-    g_resolve_sink_aborted = false;
-    cbm_log_set_sink(resolve_over_budget_sink);
+    g_resolve_sink_guard_seen = false;
+    cbm_log_set_sink(resolve_budget_sink);
     cbm_setenv("CBM_MEM_SPILL", "1", 1); /* park every extraction result */
 
-    p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
-    int rc_second = p ? cbm_pipeline_run(p) : -1;
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    char *project = p ? strdup(cbm_pipeline_project_name(p)) : NULL;
     cbm_unsetenv("CBM_MEM_SPILL");
 
     cbm_log_set_sink(NULL);
@@ -14406,21 +14400,15 @@ TEST(pipeline_over_budget_resolve_aborts_named_over_memory_budget) {
     cbm_mem_set_budget_for_tests(saved_budget);
     cbm_pipeline_free(p);
 
-    size_t after_len = 0;
-    unsigned char *after = read_file_bytes(db_path, &after_len);
     int stage_count = count_generation_stage_artifacts(g_tmpdir, "resolve_budget.db");
-    int nodes_after = -1;
-    bool valid_after = false;
-    live = cbm_store_open_path(db_path);
+    int nodes = -1;
+    bool valid = false;
+    cbm_store_t *live = rc == 0 && project ? cbm_store_open_path(db_path) : NULL;
     if (live) {
-        valid_after = cbm_store_check_integrity(live);
-        nodes_after = project ? cbm_store_count_nodes(live, project) : -1;
+        valid = cbm_store_check_integrity(live);
+        nodes = cbm_store_count_nodes(live, project);
         cbm_store_close(live);
     }
-    bool bytes_identical =
-        before && after && before_len == after_len && memcmp(before, after, before_len) == 0;
-    free(before);
-    free(after);
     free(project);
     int restore_workers_rc =
         saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
@@ -14428,31 +14416,26 @@ TEST(pipeline_over_budget_resolve_aborts_named_over_memory_budget) {
     teardown_test_repo();
 
     ASSERT_EQ(restore_workers_rc, 0);
-    ASSERT_EQ(rc_first, 0);
-    ASSERT_TRUE(valid_before);
-    ASSERT_GT(nodes_before, 0);
-    ASSERT_TRUE(before_len > 0);
-    ASSERT_TRUE(mutated);
-    /* Engagement guards (anti-vacuous): the budget flipped at the resolve
-     * boundary, the guard really fired there, and extraction really spilled
-     * first. */
+    /* Engagement guards (anti-vacuous): the budget really flipped OVER at the
+     * resolve boundary and extraction really spilled first — or this test
+     * proved nothing. */
     if (!g_resolve_sink_started) {
         FAIL("budget never armed at the resolve boundary");
     }
-    if (!g_resolve_sink_aborted) {
-        FAIL("no resolve budget abort (parallel.resolve.memory_budget_exceeded unseen)");
+    if (!g_resolve_sink_over_at_start) {
+        FAIL("resolve boundary was not over budget");
     }
     if (!g_resolve_sink_spilled) {
         FAIL("extraction never spilled (mem.spill.on unseen)");
     }
-    /* THE contract: the named failure — the code MCP delivers as
-     * "over_memory_budget", not the cancel sentinel and not success. */
-    ASSERT_EQ(rc_second, CBM_PIPELINE_ABORT_OVER_BUDGET);
-    /* The serving generation is untouched: same bytes, still valid, same
-     * graph; and the failed attempt left no stage residue behind. */
-    ASSERT_TRUE(bytes_identical);
-    ASSERT_TRUE(valid_after);
-    ASSERT_EQ(nodes_after, nodes_before);
+    /* THE contract: the guard stays retired. */
+    if (g_resolve_sink_guard_seen) {
+        FAIL("retired guard fired (parallel.resolve.memory_budget_exceeded)");
+    }
+    /* Resolve over budget completes and publishes a valid graph. */
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(valid);
+    ASSERT_GT(nodes, 0);
     ASSERT_EQ(stage_count, 0);
     PASS();
 }
@@ -15417,7 +15400,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_backpressure_futile_nap_disengages);
     RUN_TEST(pipeline_over_budget_after_futility_fails_whole_and_preserves_db);
     RUN_TEST(pipeline_extract_over_budget_spills_and_completes);
-    RUN_TEST(pipeline_over_budget_resolve_aborts_named_over_memory_budget);
+    RUN_TEST(pipeline_over_budget_resolve_completes_without_guard);
     /* Sequential cross-LSP shared registry (ms-typescript quadratic) */
     RUN_TEST(pipeline_seq_ts_cross_uses_shared_registry);
     /* File persistence */
