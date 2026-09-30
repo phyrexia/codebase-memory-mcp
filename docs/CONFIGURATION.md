@@ -71,6 +71,16 @@ The `config` subcommand stores runtime settings in a small SQLite database:
 ${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db
 ```
 
+**The daemon requires this database.** If it cannot be opened at startup, the
+daemon logs `daemon.runtime_config_open_failed` and refuses to start instead of
+running on compiled defaults. That is deliberate fail-fast: the defaults bring
+`watcher_enabled` back to `true`, so a daemon that "started anyway" would begin
+watching and re-indexing projects nobody asked it to, and every setting above
+would read as its default for as long as the database stays unreachable. A lock
+wait is not an open failure — `cbm_config_open` gives SQLite a 2 s busy timeout
+(`sqlite3_busy_timeout(db, 2000)`, covering a concurrent `config set` or the
+once-a-minute metrics flush), so contended startup is delayed, not refused.
+
 Inspect or change values with the CLI:
 
 ```bash
