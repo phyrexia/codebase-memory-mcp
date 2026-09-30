@@ -509,8 +509,11 @@ typedef enum {
 /* Strict reader, same contract as cbm_config_max_index_jobs: only the two
  * documented literals are accepted, so a truncated, suffixed or otherwise
  * malformed stored value can never half-match a mode. Anything else (and a NULL
- * cfg) reads as the default. */
-cbm_session_root_mode_t cbm_config_session_root(cbm_config_t *cfg);
+ * cfg) reads as the default. `out_invalid` (nullable) separates that fallback
+ * from a key that simply is not set: a hand edit `config set` would have
+ * refused is reported by the caller instead of silently rebinding every
+ * session to the default. */
+cbm_session_root_mode_t cbm_config_session_root(cbm_config_t *cfg, bool *out_invalid);
 
 /* Whether a value is one of the two accepted `session_root` literals. Used by
  * `config set`, which rejects anything else instead of storing it. */
@@ -551,11 +554,23 @@ bool cbm_config_parse_index_memory_budget_mb(const char *value, size_t total_ram
                                              size_t *out_mb);
 bool cbm_config_parse_index_workers(const char *value, int core_count, size_t *out_workers);
 
-/* Readers for the daemon host startup path. Return the validated value, or 0
- * when the key holds its sentinel ("off"/"auto") or a value that fails the
- * strict parse. The bound is the machine's total RAM / online core count. */
-size_t cbm_config_index_memory_budget_mb(cbm_config_t *cfg);
-size_t cbm_config_index_workers(cbm_config_t *cfg);
+/* What a stored value of either B1 key says, the same trichotomy
+ * cbm_config_max_clients() reports for C8. UNSET is the sentinel ("off" /
+ * "auto") or an absent key — the runtime falls back to detection. INVALID is
+ * text the strict parse refuses: a hand edit `config set` would never have
+ * written, and the daemon reports it before falling back instead of dropping
+ * it silently (the reason this is not a plain "0 means absent"). SET carries
+ * the validated value in `out_*` (never 0: both floors are >= 1). */
+typedef enum {
+    CBM_CONFIG_INDEX_KNOB_UNSET = 0,
+    CBM_CONFIG_INDEX_KNOB_SET = 1,
+    CBM_CONFIG_INDEX_KNOB_INVALID = 2,
+} cbm_config_index_knob_status_t;
+
+/* Readers for the daemon host startup path. The bound is the machine's total
+ * RAM / online core count (see the parsers above). */
+cbm_config_index_knob_status_t cbm_config_index_memory_budget_mb(cbm_config_t *cfg, size_t *out_mb);
+cbm_config_index_knob_status_t cbm_config_index_workers(cbm_config_t *cfg, size_t *out_workers);
 
 /* ── C8: durable connection cap ─────────────────────────────────
  * Third knob of the same family: the durable layer of CBM_MAX_CLIENTS, the

@@ -6758,6 +6758,72 @@ TEST(daemon_host_resolves_the_connection_cap_from_config_env_and_default) {
     return rc;
 }
 
+/* B1 keeps its promise only if a stored value the strict parse refuses is not
+ * the same silence as an unset key: the configured budget would quietly become
+ * a RAM fraction — the very thing index_memory_budget_mb exists to prevent.
+ * Both B1 knobs therefore report a hand edit `config set` would have refused
+ * (value, and what is used instead) while startup proceeds on the fallback. */
+static int daemon_host_warns_and_falls_back_on_refused_persisted_knobs_body(knobs_env_t *env) {
+    bool setup = knobs_env_begin(env, "b1-invalid");
+    cbm_config_t *cfg = setup ? cbm_config_open(env->cache) : NULL;
+    env->config = cfg;
+    bool seeded =
+        cfg != NULL && cbm_config_set(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, "6144junk") == 0 &&
+        cbm_config_set(cfg, CBM_CONFIG_INDEX_WORKERS, "4x") == 0;
+
+    cbm_mem_reset_for_tests();
+    cbm_mem_set_configured_budget_mb(0);
+
+    knobs_env_capture_log(env);
+    cbm_daemon_host_runtime_knobs_t knobs = {0};
+    bool loaded = setup && seeded && cbm_daemon_host_runtime_knobs_load_for_test(&knobs);
+    knobs_env_restore_log(env);
+
+    /* Startup proceeds: the fallback both keys fall back to (no configured
+     * budget -> RAM fraction, no pinned workers -> auto-detection). */
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(seeded);
+    ASSERT_TRUE(loaded);
+    ASSERT_EQ(knobs.configured_budget_mb, 0);
+    ASSERT_EQ(knobs.index_workers, 0);
+    ASSERT_STR_EQ(knobs.index_workers_text, "auto");
+    ASSERT_FALSE(knobs.workers_exported);
+
+    /* ... and the log names the refused text and the value used instead. */
+    const char *budget_warned = strstr(knobs_log_capture, "daemon.mem.config_invalid");
+    ASSERT_TRUE(budget_warned != NULL);
+    ASSERT_TRUE(strstr(budget_warned, "6144junk") != NULL);
+    ASSERT_TRUE(strstr(budget_warned, "ram_fraction") != NULL);
+    const char *workers_warned = strstr(knobs_log_capture, "daemon.workers.config_invalid");
+    ASSERT_TRUE(workers_warned != NULL);
+    ASSERT_TRUE(strstr(workers_warned, "4x") != NULL);
+    ASSERT_TRUE(strstr(workers_warned, "auto") != NULL);
+
+    /* A key that simply is not set is silent: the fallback is expected there,
+     * not a defect to report. */
+    ASSERT_EQ(cbm_config_delete(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB), 0);
+    ASSERT_EQ(cbm_config_delete(cfg, CBM_CONFIG_INDEX_WORKERS), 0);
+    knobs_env_capture_log(env);
+    knobs = (cbm_daemon_host_runtime_knobs_t){0};
+    loaded = cbm_daemon_host_runtime_knobs_load_for_test(&knobs);
+    knobs_env_restore_log(env);
+    ASSERT_TRUE(loaded);
+    ASSERT_EQ(knobs.configured_budget_mb, 0);
+    ASSERT_STR_EQ(knobs_log_capture, "");
+
+    PASS();
+}
+
+TEST(daemon_host_warns_and_falls_back_on_refused_persisted_knobs) {
+    knobs_env_t env = {0};
+    int rc = daemon_host_warns_and_falls_back_on_refused_persisted_knobs_body(&env);
+    knobs_env_end(&env);
+    cbm_mem_reset_for_tests();
+    cbm_mem_set_configured_budget_mb(0);
+    cbm_mem_init(0.5);
+    return rc;
+}
+
 SUITE(daemon_application) {
     RUN_TEST(daemon_application_oversized_reply_is_a_jsonrpc_error_not_a_death);
     RUN_TEST(daemon_application_new_session_does_not_retain_initial_store);
@@ -6830,4 +6896,5 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_host_pins_workers_from_config_without_overwriting_env);
     RUN_TEST(daemon_host_runtime_knobs_refuse_an_unopenable_config_database);
     RUN_TEST(daemon_host_resolves_the_connection_cap_from_config_env_and_default);
+    RUN_TEST(daemon_host_warns_and_falls_back_on_refused_persisted_knobs);
 }

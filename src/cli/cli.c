@@ -7572,7 +7572,10 @@ bool cbm_config_session_root_value_valid(const char *value) {
  * where sessions bind. The comparison is done on the stored BYTES rather than
  * through cbm_config_get(), whose C-string copy stops at an embedded NUL and
  * would accept "git_toplevel\0junk" as a valid value. */
-cbm_session_root_mode_t cbm_config_session_root(cbm_config_t *cfg) {
+cbm_session_root_mode_t cbm_config_session_root(cbm_config_t *cfg, bool *out_invalid) {
+    if (out_invalid) {
+        *out_invalid = false;
+    }
     cbm_session_root_mode_t mode = CBM_SESSION_ROOT_GIT_TOPLEVEL;
     if (!cfg) {
         return mode;
@@ -7590,10 +7593,20 @@ cbm_session_root_mode_t cbm_config_session_root(cbm_config_t *cfg) {
         const unsigned char *value = sqlite3_column_text(stmt, 0);
         size_t value_bytes = (size_t)sqlite3_column_bytes(stmt, 0);
         const char *cwd_literal = CBM_CONFIG_SESSION_ROOT_CWD;
+        const char *toplevel_literal = CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL;
         size_t cwd_bytes = strlen(cwd_literal);
+        size_t toplevel_bytes = strlen(toplevel_literal);
         /* git_toplevel is the default, so only an exact `cwd` changes it. */
         if (value && value_bytes == cwd_bytes && memcmp(value, cwd_literal, cwd_bytes) == 0) {
             mode = CBM_SESSION_ROOT_CWD;
+        } else if (!value || value_bytes != toplevel_bytes ||
+                   memcmp(value, toplevel_literal, toplevel_bytes) != 0) {
+            /* A row that is present but neither literal (a NULL value column
+             * included) is a hand edit `config set` refused, not an unset key:
+             * report it and let the caller fall back to the default. */
+            if (out_invalid) {
+                *out_invalid = true;
+            }
         }
     }
     sqlite3_finalize(stmt);
@@ -7743,31 +7756,61 @@ static size_t config_index_memory_budget_ram_mb(void) {
     return cbm_system_info().total_ram / CONFIG_MIB_BYTES;
 }
 
-size_t cbm_config_index_memory_budget_mb(cbm_config_t *cfg) {
+/* Both B1 readers report the trichotomy cbm_config_max_clients() reports for
+ * C8: config_get_exact()'s out_present separates "no row" from "a row whose
+ * bytes the reader refuses", so a hand-edited value is never mistaken for an
+ * unset key. The sentinel ("off"/"auto") is the same fallback an absent key
+ * takes, so it reads as UNSET. */
+cbm_config_index_knob_status_t cbm_config_index_memory_budget_mb(cbm_config_t *cfg,
+                                                                 size_t *out_mb) {
+    if (out_mb) {
+        *out_mb = 0;
+    }
     if (!cfg) {
-        return 0;
+        return CBM_CONFIG_INDEX_KNOB_UNSET;
     }
     char value[CONFIG_VALUE_MAX_BYTES + 1];
-    size_t budget_mb = 0;
-    if (!config_get_exact(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, value, sizeof(value), NULL) ||
-        !cbm_config_parse_index_memory_budget_mb(value, config_index_memory_budget_ram_mb(),
-                                                 &budget_mb)) {
-        return 0;
+    bool present = false;
+    if (!config_get_exact(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, value, sizeof(value), &present)) {
+        return present ? CBM_CONFIG_INDEX_KNOB_INVALID : CBM_CONFIG_INDEX_KNOB_UNSET;
     }
-    return budget_mb;
+    size_t budget_mb = 0;
+    if (!cbm_config_parse_index_memory_budget_mb(value, config_index_memory_budget_ram_mb(),
+                                                 &budget_mb)) {
+        return CBM_CONFIG_INDEX_KNOB_INVALID;
+    }
+    if (budget_mb == 0) { /* the "off" sentinel */
+        return CBM_CONFIG_INDEX_KNOB_UNSET;
+    }
+    if (out_mb) {
+        *out_mb = budget_mb;
+    }
+    return CBM_CONFIG_INDEX_KNOB_SET;
 }
 
-size_t cbm_config_index_workers(cbm_config_t *cfg) {
+cbm_config_index_knob_status_t cbm_config_index_workers(cbm_config_t *cfg, size_t *out_workers) {
+    if (out_workers) {
+        *out_workers = 0;
+    }
     if (!cfg) {
-        return 0;
+        return CBM_CONFIG_INDEX_KNOB_UNSET;
     }
     char value[CONFIG_VALUE_MAX_BYTES + 1];
-    size_t workers = 0;
-    if (!config_get_exact(cfg, CBM_CONFIG_INDEX_WORKERS, value, sizeof(value), NULL) ||
-        !cbm_config_parse_index_workers(value, cbm_system_info().total_cores, &workers)) {
-        return 0;
+    bool present = false;
+    if (!config_get_exact(cfg, CBM_CONFIG_INDEX_WORKERS, value, sizeof(value), &present)) {
+        return present ? CBM_CONFIG_INDEX_KNOB_INVALID : CBM_CONFIG_INDEX_KNOB_UNSET;
     }
-    return workers;
+    size_t workers = 0;
+    if (!cbm_config_parse_index_workers(value, cbm_system_info().total_cores, &workers)) {
+        return CBM_CONFIG_INDEX_KNOB_INVALID;
+    }
+    if (workers == 0) { /* the "auto" sentinel */
+        return CBM_CONFIG_INDEX_KNOB_UNSET;
+    }
+    if (out_workers) {
+        *out_workers = workers;
+    }
+    return CBM_CONFIG_INDEX_KNOB_SET;
 }
 
 /* C8: the durable connection cap. Same strict parse as the two keys above,
@@ -7791,10 +7834,10 @@ bool cbm_config_parse_max_clients(const char *value, size_t *out_clients) {
     return true;
 }
 
-/* Unlike the two B1 readers, this one distinguishes a stored value it refuses
- * from a key that is simply not set: the daemon warns about the first and
- * falls back to CBM_DAEMON_MAX_CLIENTS_DEFAULT for both, and the operator is
- * owed the difference. */
+/* Third of the family to distinguish a stored value it refuses from a key that
+ * is simply not set: the daemon warns about the first and falls back to
+ * CBM_DAEMON_MAX_CLIENTS_DEFAULT for both, and the operator is owed the
+ * difference (the two B1 readers above report the same trichotomy). */
 cbm_config_max_clients_status_t cbm_config_max_clients(cbm_config_t *cfg, size_t *out_clients) {
     if (out_clients) {
         *out_clients = 0;
@@ -7966,7 +8009,7 @@ static int config_session_root_write(cbm_config_t *config, const char *key, cons
  * session_root that is the validated mode — never the raw bytes a hand edit
  * left in _config.db, which the reader rejects back to the default. */
 static void config_session_root_read(cbm_config_t *cfg, char *out, size_t out_sz) {
-    snprintf(out, out_sz, "%s", cbm_config_session_root(cfg) == CBM_SESSION_ROOT_CWD
+    snprintf(out, out_sz, "%s", cbm_config_session_root(cfg, NULL) == CBM_SESSION_ROOT_CWD
                                     ? CBM_CONFIG_SESSION_ROOT_CWD
                                     : CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL);
 }

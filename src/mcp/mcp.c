@@ -17904,12 +17904,27 @@ static void detect_session(cbm_mcp_server_t *srv) {
 
     /* 1. Try CWD */
     char cwd[CBM_SZ_1K];
+
+    /* A stored session_root the strict reader refuses is a hand edit
+     * `config set` would never have written. It falls back to the default —
+     * silently rebinding every session is what it must not do, so say which
+     * text was refused. Once per session (see session_detected above). */
+    bool session_root_invalid = false;
+    cbm_session_root_mode_t session_root_mode =
+        cbm_config_session_root(srv->config, &session_root_invalid);
+    if (session_root_invalid) {
+        const char *stored =
+            srv->config ? cbm_config_get(srv->config, CBM_CONFIG_SESSION_ROOT, "") : "";
+        cbm_log_warn("session_root.config_invalid", "value", stored ? stored : "", "using",
+                     CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL);
+    }
+
     if (getcwd(cwd, sizeof(cwd)) != NULL) {
         const char *home = cbm_get_home_dir();
         /* Skip useless roots: / and $HOME */
         if (!is_useless_session_root(cwd, home)) {
             bool rooted_at_toplevel = false;
-            if (cbm_config_session_root(srv->config) == CBM_SESSION_ROOT_GIT_TOPLEVEL) {
+            if (session_root_mode == CBM_SESSION_ROOT_GIT_TOPLEVEL) {
                 cbm_git_context_t ctx = {0};
                 if (cbm_git_context_resolve(cwd, &ctx) == 0 && ctx.is_git && ctx.worktree_root &&
                     !is_useless_session_root(ctx.worktree_root, home)) {
