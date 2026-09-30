@@ -28,6 +28,7 @@
 #include "ui/http_server.h"
 #include <store/store.h>
 #include <store/project_registry.h> /* C5b: registry disk-read seam */
+#include <sqlite3.h>               /* C5b follow-up: a projects row this binary's schema forbids */
 #include <watcher/watcher.h>
 #include <yyjson/yyjson.h>
 
@@ -2501,6 +2502,121 @@ TEST(ui_server_indexed_roots_rereads_only_the_changed_db) {
     PASS();
 }
 
+/* C5b follow-up: a projects row with no root path — empty, or NULL as a
+ * foreign or hand-edited database can hold it — is an identity this endpoint
+ * has always reported: root_path "" and root_exists false. The registry
+ * normalizes the NULL column to the empty spelling (project_registry.h: "never
+ * NULL; empty when the row has none") and the handler keeps the guard the
+ * pre-registry code had, so neither spelling may cost the response or crash
+ * it. The NULL row is written straight into a table that permits it, because
+ * root_path TEXT NOT NULL — the schema cbm_store_init_schema writes — is
+ * exactly what rules it out of every fixture built through the store API. */
+static int th_roots_make_null_root_db(const ui_delete_fixture_t *fx, const char *file_name,
+                                      const char *project_name, const char *indexed_at) {
+    char db_path[1088];
+    ui_delete_db_path(fx, file_name, db_path, sizeof(db_path));
+    sqlite3 *db = NULL;
+    if (sqlite3_open(db_path, &db) != SQLITE_OK) {
+        if (db) {
+            sqlite3_close(db);
+        }
+        return -1;
+    }
+    int rc = sqlite3_exec(db,
+                          "CREATE TABLE projects (name TEXT PRIMARY KEY, indexed_at TEXT, "
+                          "root_path TEXT);",
+                          NULL, NULL, NULL);
+    sqlite3_stmt *stmt = NULL;
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_prepare_v2(db,
+                                "INSERT INTO projects (name, indexed_at, root_path) "
+                                "VALUES (?, ?, NULL);",
+                                -1, &stmt, NULL);
+    }
+    if (rc == SQLITE_OK &&
+        sqlite3_bind_text(stmt, 1, project_name, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        rc = SQLITE_ERROR;
+    }
+    if (rc == SQLITE_OK &&
+        sqlite3_bind_text(stmt, 2, indexed_at, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        rc = SQLITE_ERROR;
+    }
+    if (rc == SQLITE_OK && sqlite3_step(stmt) != SQLITE_DONE) {
+        rc = SQLITE_ERROR;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc == SQLITE_OK ? 0 : -1;
+}
+
+/* C5b follow-up: identity rows go in by the row name, not the file name, so a
+ * fixture can hold the empty and "::" names the primary-project rule is about. */
+static int th_roots_add_row(const ui_delete_fixture_t *fx, const char *file_name,
+                            const char *project_name, const char *root_path) {
+    char db_path[1088];
+    ui_delete_db_path(fx, file_name, db_path, sizeof(db_path));
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return -1;
+    }
+    int rc = cbm_store_upsert_project(store, project_name, root_path) == CBM_STORE_OK ? 0 : -1;
+    cbm_store_close(store);
+    return rc;
+}
+
+TEST(ui_server_indexed_roots_reports_a_missing_root_path_as_empty) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+
+    /* Empty: legal in the store schema (NOT NULL rules out NULL, not ""). */
+    char empty_indexed_at[64];
+    ASSERT_EQ(th_roots_add_row(&fx, "roots-empty", "roots-empty", ""), 0);
+    ASSERT_EQ(th_roots_indexed_at(&fx, "roots-empty", empty_indexed_at, sizeof(empty_indexed_at)),
+              0);
+
+    /* NULL: unreachable through the store API, so written directly. */
+    const char *noroot_indexed_at = "2026-01-01T00:00:00Z";
+    ASSERT_EQ(th_roots_make_null_root_db(&fx, "roots-noroot", "roots-noroot", noroot_indexed_at),
+              0);
+
+    /* The registry seam: a NULL column is the documented empty spelling, never
+     * a NULL the consumer would have to guard. */
+    char null_db_path[1088];
+    ui_delete_db_path(&fx, "roots-noroot", null_db_path, sizeof(null_db_path));
+    cbm_project_registry_reset();
+    cbm_project_identity_t id = {0};
+    ASSERT_EQ(cbm_project_registry_lookup(null_db_path, &id), CBM_PROJECT_REGISTRY_OK);
+    ASSERT_NOT_NULL(id.root_path);
+    ASSERT_STR_EQ(id.root_path, "");
+    cbm_project_identity_clear(&id);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    cbm_project_registry_reset();
+    char resp[16384];
+    int n = th_http(cbm_http_server_port(ts.srv), "GET /api/indexed-roots HTTP/1.1\r\n\r\n", resp,
+                    sizeof(resp));
+    th_server_stop(&ts);
+
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    yyjson_doc *doc = th_http_json(resp);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *roots = yyjson_doc_get_root(doc);
+    ASSERT_TRUE(yyjson_is_arr(roots));
+    ASSERT_EQ((int)yyjson_arr_size(roots), 2);
+    if (th_expect_root_entry(roots, "roots-empty", "", empty_indexed_at, 0, 0, false) != 0 ||
+        th_expect_root_entry(roots, "roots-noroot", "", noroot_indexed_at, 0, 0, false) != 0) {
+        yyjson_doc_free(doc);
+        return 1;
+    }
+    yyjson_doc_free(doc);
+
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+
 /* C5b cost criterion (ADR §3.C): /api/indexed-roots over ~120 projects must
  * average under 100 ms — the readdir + open-every-db handler measured 821 ms.
  * The assertion is on the warm mean, what the UI pays once each generation has
@@ -3276,6 +3392,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_indexed_roots_reports_projects_and_orphans);
     RUN_TEST(ui_server_indexed_roots_registry_serves_same_json_without_opening_dbs);
     RUN_TEST(ui_server_indexed_roots_rereads_only_the_changed_db);
+    RUN_TEST(ui_server_indexed_roots_reports_a_missing_root_path_as_empty);
     RUN_TEST(ui_server_indexed_roots_mean_latency_with_120_projects);
     RUN_TEST(ui_server_metrics_endpoint_returns_windowed_buckets);
     RUN_TEST(git_context_resolve_no_hang_under_live_ui_sockets);

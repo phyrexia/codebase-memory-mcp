@@ -912,13 +912,18 @@ static void handle_indexed_roots(cbm_http_conn_t *c) {
         cbm_json_escape(esc, (int)sizeof(esc), id.name);
         http_appendf(entry, sizeof(entry), &epos, "%s{\"name\":\"%s\"",
                      count > 0 ? "," : "", esc);
-        cbm_json_escape(esc, (int)sizeof(esc), id.root_path);
+        /* The registry contracts root_path as never NULL (empty when the row
+         * has none) — and normalizes a NULL column to that — but this is the
+         * dereference a missing one used to crash, so keep the guard the
+         * pre-registry code had. */
+        const char *root_path = id.root_path ? id.root_path : "";
+        cbm_json_escape(esc, (int)sizeof(esc), root_path);
         http_appendf(entry, sizeof(entry), &epos, ",\"root_path\":\"%s\"", esc);
         if (id.indexed_at && id.indexed_at[0]) {
             cbm_json_escape(esc, (int)sizeof(esc), id.indexed_at);
             http_appendf(entry, sizeof(entry), &epos, ",\"indexed_at\":\"%s\"", esc);
         }
-        bool root_exists = id.root_path[0] && cbm_is_dir(id.root_path);
+        bool root_exists = root_path[0] && cbm_is_dir(root_path);
         http_appendf(entry, sizeof(entry), &epos,
                      ",\"nodes\":%lld,\"edges\":%lld,\"root_exists\":%s}", (long long)id.node_count,
                      (long long)id.edge_count, root_exists ? "true" : "false");
