@@ -65,8 +65,13 @@
  * layout, which appends u64 memory_budget_bytes @121, u16 index_workers @129
  * (0 = auto), u8 budget_source @131 (the B1 block, ending at 132), then u32
  * connections_peak @132, u64 capacity_rejected @136, u32 max_clients @144 and
- * u8 max_clients_source @148 — all network byte order. Clients accept any of
- * the three lengths and report each block only when its bytes arrived. */
+ * u8 max_clients_source @148 — all network byte order. A client accepts the
+ * frozen 121-byte layout and the full layout of its own build (149 here), and
+ * reports each block only when its bytes arrived. The intermediate 132-byte
+ * B1-only layout is readable by a B1-only client alone: this daemon never
+ * emits one — a requester whose build fingerprint differs gets the frozen
+ * layout, a same-build one gets the full one — and this client refuses a
+ * length that is neither of its two. */
 #define CBM_DAEMON_STATUS_RESPONSE_SIZE 121U
 #define CBM_DAEMON_STATUS_RESPONSE_BUDGET_SIZE 132U
 #define CBM_DAEMON_STATUS_RESPONSE_FULL_SIZE 149U
