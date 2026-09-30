@@ -2616,6 +2616,51 @@ TEST(ui_server_indexed_roots_reports_a_missing_root_path_as_empty) {
     PASS();
 }
 
+/* One entry per project db, exactly like list_projects resolves a project
+ * (#1044): "::" shadow rows (miss graphs) share the db and are never
+ * addressable, and a row with no name is not a project at all. That verdict is
+ * cbm_store_primary_project_index's — the same three tests the pre-registry
+ * handler applied to every row — so a db whose only row is one of those is
+ * unresolvable and absent from this endpoint. */
+TEST(ui_server_indexed_roots_skips_empty_and_shadow_project_names) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+
+    /* Two dbs whose only row is one the pre-registry handler skipped. */
+    ASSERT_EQ(th_roots_add_row(&fx, "roots-emptyname", "", fx.tmpdir), 0);
+    ASSERT_EQ(th_roots_add_row(&fx, "roots-shadowonly", "proj::miss", fx.tmpdir), 0);
+
+    /* One db holding a primary row and its shadow: exactly one identity. */
+    ASSERT_EQ(th_roots_add_row(&fx, "proj-mixed", "proj-mixed", fx.tmpdir), 0);
+    ASSERT_EQ(th_roots_add_row(&fx, "proj-mixed", "proj-mixed::miss", fx.tmpdir), 0);
+    char mixed_indexed_at[64];
+    ASSERT_EQ(th_roots_indexed_at(&fx, "proj-mixed", mixed_indexed_at, sizeof(mixed_indexed_at)),
+              0);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    cbm_project_registry_reset();
+    char resp[16384];
+    int n = th_http(cbm_http_server_port(ts.srv), "GET /api/indexed-roots HTTP/1.1\r\n\r\n", resp,
+                    sizeof(resp));
+    th_server_stop(&ts);
+
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    yyjson_doc *doc = th_http_json(resp);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *roots = yyjson_doc_get_root(doc);
+    ASSERT_TRUE(yyjson_is_arr(roots));
+    ASSERT_EQ((int)yyjson_arr_size(roots), 1);
+    if (th_expect_root_entry(roots, "proj-mixed", fx.tmpdir, mixed_indexed_at, 0, 0, true) != 0) {
+        yyjson_doc_free(doc);
+        return 1;
+    }
+    yyjson_doc_free(doc);
+
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
 
 /* C5b cost criterion (ADR §3.C): /api/indexed-roots over ~120 projects must
  * average under 100 ms — the readdir + open-every-db handler measured 821 ms.
@@ -3393,6 +3438,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_indexed_roots_registry_serves_same_json_without_opening_dbs);
     RUN_TEST(ui_server_indexed_roots_rereads_only_the_changed_db);
     RUN_TEST(ui_server_indexed_roots_reports_a_missing_root_path_as_empty);
+    RUN_TEST(ui_server_indexed_roots_skips_empty_and_shadow_project_names);
     RUN_TEST(ui_server_indexed_roots_mean_latency_with_120_projects);
     RUN_TEST(ui_server_metrics_endpoint_returns_windowed_buckets);
     RUN_TEST(git_context_resolve_no_hang_under_live_ui_sockets);
