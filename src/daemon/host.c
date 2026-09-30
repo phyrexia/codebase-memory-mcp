@@ -704,9 +704,26 @@ static bool host_runtime_knobs_load(cbm_daemon_host_runtime_knobs_t *knobs,
     }
 
     /* Memory: staged for the resolver (explicit CBM_MEM_BUDGET_MB still wins;
-     * see cbm_mem_resolve_budget_layers). */
-    knobs->configured_budget_mb = cbm_config_index_memory_budget_mb(config);
+     * see cbm_mem_resolve_budget_layers). A stored value the strict parse
+     * refuses is not the same as an unset key: the very budget B1 exists to
+     * pin would quietly become a RAM fraction, so name the text that was
+     * refused and the layer that takes over. `using` is cbm_mem_budget_source's
+     * vocabulary — the source `daemon.start` will report. */
+    size_t configured_budget_mb = 0;
+    cbm_config_index_knob_status_t budget_status =
+        cbm_config_index_memory_budget_mb(config, &configured_budget_mb);
+    knobs->configured_budget_mb = configured_budget_mb;
     cbm_mem_set_configured_budget_mb(knobs->configured_budget_mb);
+    if (budget_status == CBM_CONFIG_INDEX_KNOB_INVALID) {
+        char shown[CBM_SZ_32];
+        char env_budget[CBM_SZ_32];
+        const char *stored = cbm_config_get(config, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, "");
+        (void)snprintf(shown, sizeof(shown), "%s", stored ? stored : "");
+        const char *env_layer =
+            cbm_safe_getenv("CBM_MEM_BUDGET_MB", env_budget, sizeof(env_budget), NULL);
+        cbm_log_warn("daemon.mem.config_invalid", "value", shown, "using",
+                     env_layer != NULL ? "CBM_MEM_BUDGET_MB" : "ram_fraction");
+    }
 
     /* Workers: every index worker reads CBM_WORKERS from its own environment
      * and inherits the daemon's, so the daemon pins it here. An existing
@@ -714,7 +731,8 @@ static bool host_runtime_knobs_load(cbm_daemon_host_runtime_knobs_t *knobs,
      * (cbm_setenv with overwrite=0), exactly as an explicit CBM_MEM_BUDGET_MB
      * outranks index_memory_budget_mb. */
     char env_buf[CBM_SZ_32];
-    size_t workers = cbm_config_index_workers(config);
+    size_t workers = 0;
+    cbm_config_index_knob_status_t workers_status = cbm_config_index_workers(config, &workers);
     const char *env_workers = cbm_safe_getenv("CBM_WORKERS", env_buf, sizeof(env_buf), NULL);
     if (workers > 0 && env_workers == NULL) {
         char text[CBM_SZ_32];
@@ -737,6 +755,16 @@ static bool host_runtime_knobs_load(cbm_daemon_host_runtime_knobs_t *knobs,
             (void)snprintf(knobs->index_workers_text, sizeof(knobs->index_workers_text), "%ld",
                            parsed);
         }
+    }
+    if (workers_status == CBM_CONFIG_INDEX_KNOB_INVALID) {
+        /* Same duty as the budget warning above: say which text was refused
+         * and what the workers will run with instead — the number just
+         * resolved, or "auto" when nothing pins them. */
+        char shown[CBM_SZ_32];
+        const char *stored = cbm_config_get(config, CBM_CONFIG_INDEX_WORKERS, "");
+        (void)snprintf(shown, sizeof(shown), "%s", stored ? stored : "");
+        cbm_log_warn("daemon.workers.config_invalid", "value", shown, "using",
+                     knobs->index_workers_text);
     }
     /* C8: the connection cap, with the same one-shot precedence as the two
      * knobs above. */

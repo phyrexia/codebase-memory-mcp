@@ -24,8 +24,11 @@
 /* Identity of one project DB file: what its single primary `projects` row
  * says, plus the persisted counts when the file carries them. */
 typedef struct {
-    char *name;       /* internal project name (may differ from the file name) */
-    char *root_path;  /* never NULL; empty when the row has none */
+    char *name; /* internal project name (may differ from the file name) */
+    /* Never NULL: empty when the row has none, or holds a NULL column (a
+     * foreign or hand-edited database can, the store schema notwithstanding).
+     * Consumers may dereference it without a guard. */
+    char *root_path;
     char *indexed_at; /* ISO 8601 UTC, NULL when unavailable */
     int64_t size_bytes;
     int64_t mtime_ns;

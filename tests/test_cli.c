@@ -15377,10 +15377,12 @@ TEST(cli_config_session_root_is_a_strict_enum) {
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-session-root-XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
 
-    ASSERT_EQ(cbm_config_session_root(NULL), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+    ASSERT_EQ(cbm_config_session_root(NULL, NULL), CBM_SESSION_ROOT_GIT_TOPLEVEL);
     cbm_config_t *cfg = cbm_config_open(tmpdir);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_session_root(cfg), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+    bool refused = true;
+    ASSERT_EQ(cbm_config_session_root(cfg, &refused), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+    ASSERT_FALSE(refused); /* absent key: the default, with nothing to report */
 
     /* Discoverable: `config list` and `config set` walk this table. */
     bool listed = false;
@@ -15397,18 +15399,24 @@ TEST(cli_config_session_root_is_a_strict_enum) {
 
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SESSION_ROOT, CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL),
               0);
-    ASSERT_EQ(cbm_config_session_root(cfg), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+    refused = true;
+    ASSERT_EQ(cbm_config_session_root(cfg, &refused), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+    ASSERT_FALSE(refused); /* the default spelled out is a valid stored value */
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SESSION_ROOT, CBM_CONFIG_SESSION_ROOT_CWD), 0);
-    ASSERT_EQ(cbm_config_session_root(cfg), CBM_SESSION_ROOT_CWD);
+    refused = true;
+    ASSERT_EQ(cbm_config_session_root(cfg, &refused), CBM_SESSION_ROOT_CWD);
+    ASSERT_FALSE(refused);
 
     /* Persisted: the value survives a reopen of the config store. */
     cbm_config_close(cfg);
     cfg = cbm_config_open(tmpdir);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_session_root(cfg), CBM_SESSION_ROOT_CWD);
+    ASSERT_EQ(cbm_config_session_root(cfg, NULL), CBM_SESSION_ROOT_CWD);
 
     /* Truncated, suffixed, padded, wrongly-cased and non-enum values never
-     * half-match a mode: they all read as the default. */
+     * half-match a mode: they all read as the default, and each one is a text
+     * `config set` refused — so the reader says so instead of looking like an
+     * unset key. */
     const char *invalid[] = {
         "",         "c",             "cw",           "cwd ",        " cwd",    "cwd2",
         "CWD",      "Cwd",           "git_tople",    "git_toplevel2", "git_toplevel ",
@@ -15417,7 +15425,9 @@ TEST(cli_config_session_root_is_a_strict_enum) {
     };
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
         ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SESSION_ROOT, invalid[i]), 0);
-        ASSERT_EQ(cbm_config_session_root(cfg), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+        refused = false;
+        ASSERT_EQ(cbm_config_session_root(cfg, &refused), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+        ASSERT_TRUE(refused);
     }
 
     /* A stored value with an embedded NUL is not the literal either: the reader
@@ -15437,7 +15447,9 @@ TEST(cli_config_session_root_is_a_strict_enum) {
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
     sqlite3_finalize(stmt);
     sqlite3_close(db);
-    ASSERT_EQ(cbm_config_session_root(cfg), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+    refused = false;
+    ASSERT_EQ(cbm_config_session_root(cfg, &refused), CBM_SESSION_ROOT_GIT_TOPLEVEL);
+    ASSERT_TRUE(refused);
 
     cbm_config_close(cfg);
     test_rmdir_r(tmpdir);
@@ -15690,6 +15702,15 @@ TEST(cli_config_index_workers_parse_is_strict_and_bounded) {
     ASSERT_EQ(out, 16);
     ASSERT_FALSE(cbm_config_parse_index_workers("0", 0, &out));
 
+    /* CBM_WORKERS_MAX is the number the workers themselves honour, so it caps
+     * the write even where the host reports more cores — and where core
+     * detection failed — instead of letting a >256-core host store a value
+     * the runtime then reports as "auto". */
+    ASSERT_TRUE(cbm_config_parse_index_workers("256", 1024, &out));
+    ASSERT_EQ(out, 256);
+    ASSERT_FALSE(cbm_config_parse_index_workers("257", 1024, &out));
+    ASSERT_FALSE(cbm_config_parse_index_workers("257", 0, &out));
+
     ASSERT_FALSE(cbm_config_parse_index_workers(NULL, 8, &out));
     ASSERT_FALSE(cbm_config_parse_index_workers("1", 8, NULL));
     PASS();
@@ -15761,8 +15782,12 @@ static int cli_config_index_budget_keys_round_trip_reset_and_persist_body(
 
     cbm_config_t *cfg = cbm_config_open(tmpdir);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg), 0);
-    ASSERT_EQ(cbm_config_index_workers(cfg), 0);
+    size_t budget_value = 12345;
+    size_t workers_value = 12345;
+    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg, &budget_value), CBM_CONFIG_INDEX_KNOB_UNSET);
+    ASSERT_EQ(budget_value, 0);
+    ASSERT_EQ(cbm_config_index_workers(cfg, &workers_value), CBM_CONFIG_INDEX_KNOB_UNSET);
+    ASSERT_EQ(workers_value, 0);
     cbm_config_close(cfg);
 
     /* A daemon-sized machine can hold 1536 MiB and 1 worker on any host this
@@ -15780,8 +15805,10 @@ static int cli_config_index_budget_keys_round_trip_reset_and_persist_body(
      * reopen of _config.db (this is the durability B1 exists for). */
     cfg = cbm_config_open(tmpdir);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg), 1536);
-    ASSERT_EQ(cbm_config_index_workers(cfg), 1);
+    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg, &budget_value), CBM_CONFIG_INDEX_KNOB_SET);
+    ASSERT_EQ(budget_value, 1536);
+    ASSERT_EQ(cbm_config_index_workers(cfg, &workers_value), CBM_CONFIG_INDEX_KNOB_SET);
+    ASSERT_EQ(workers_value, 1);
     cbm_config_close(cfg);
 
     /* Reset returns both keys to their sentinel. */
@@ -15880,20 +15907,24 @@ TEST(cli_config_index_budget_readers_reject_truncated_and_embedded_nul_values) {
     /* The readers take the stored TEXT by its exact byte length (no truncating
      * copy like cbm_config_get()'s 4 KiB TLS buffer), so a value whose visible
      * prefix is a valid 1536 but whose stored bytes continue is refused rather
-     * than read as its prefix. */
+     * than read as its prefix. Refused is not unset: the status tells the two
+     * apart, so the daemon can warn about the first. */
+    size_t value = 12345;
     char truncated_to_budget[4097];
     memset(truncated_to_budget, '0', sizeof(truncated_to_budget) - 6);
     memcpy(truncated_to_budget + sizeof(truncated_to_budget) - 6, "1536x", 5);
     truncated_to_budget[sizeof(truncated_to_budget) - 1] = '\0';
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, truncated_to_budget), 0);
-    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg), 0);
+    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg, &value), CBM_CONFIG_INDEX_KNOB_INVALID);
+    ASSERT_EQ(value, 0);
 
     char overlong[36];
     memset(overlong, '0', sizeof(overlong) - 2);
     overlong[sizeof(overlong) - 2] = '7';
     overlong[sizeof(overlong) - 1] = '\0';
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INDEX_WORKERS, overlong), 0);
-    ASSERT_EQ(cbm_config_index_workers(cfg), 0);
+    ASSERT_EQ(cbm_config_index_workers(cfg, &value), CBM_CONFIG_INDEX_KNOB_INVALID);
+    ASSERT_EQ(value, 0);
 
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/_config.db", tmpdir);
@@ -15911,11 +15942,19 @@ TEST(cli_config_index_budget_readers_reject_truncated_and_embedded_nul_values) {
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
     sqlite3_finalize(stmt);
     sqlite3_close(db);
-    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg), 0);
+    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg, &value), CBM_CONFIG_INDEX_KNOB_INVALID);
+    ASSERT_EQ(value, 0);
+
+    /* The sentinel is the unset fallback, not a refused value. */
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, "off"), 0);
+    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg, &value), CBM_CONFIG_INDEX_KNOB_UNSET);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INDEX_WORKERS, "auto"), 0);
+    ASSERT_EQ(cbm_config_index_workers(cfg, &value), CBM_CONFIG_INDEX_KNOB_UNSET);
 
     /* And a well-formed value still reads through the exact-byte path. */
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB, "1536"), 0);
-    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg), 1536);
+    ASSERT_EQ(cbm_config_index_memory_budget_mb(cfg, &value), CBM_CONFIG_INDEX_KNOB_SET);
+    ASSERT_EQ(value, 1536);
 
     cbm_config_close(cfg);
     test_rmdir_r(tmpdir);

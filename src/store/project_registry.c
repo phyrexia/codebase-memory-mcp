@@ -120,7 +120,15 @@ static cbm_project_registry_status_t project_identity_read(const char *db_path, 
                 out->node_count = stats.node_count;
                 out->edge_count = stats.edge_count;
                 /* root_path is NOT NULL in the store schema, so a missing copy
-                 * here is allocation failure, not an empty identity. */
+                 * here is usually allocation failure. But a foreign or
+                 * hand-edited database can hold a NULL column, and the store
+                 * reader reports both as the same NULL: this identity contract
+                 * is "never NULL, empty when the row has none", so restore the
+                 * empty spelling. If the allocator really is exhausted that
+                 * one-byte copy fails too and the row stays OOM. */
+                if (!out->root_path) {
+                    out->root_path = identity_strdup("");
+                }
                 if (!out->name || !out->root_path) {
                     cbm_project_identity_clear(out);
                     status = CBM_PROJECT_REGISTRY_OOM;

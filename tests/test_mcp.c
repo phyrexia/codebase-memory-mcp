@@ -20480,6 +20480,25 @@ TEST(detect_session_session_root_cwd_keeps_previous_behavior) {
     PASS();
 }
 
+/* A stored session_root the strict reader refuses is a hand edit `config set`
+ * would never have written. It must not silently rebind the session: the
+ * default git_toplevel takes over and the warn names the refused text and the
+ * mode used instead — the reader tri-state is covered by
+ * `cli_config_session_root_is_a_strict_enum`, this pins the warn. */
+TEST(detect_session_invalid_session_root_config_warns_and_uses_git_toplevel) {
+    detect_session_case_t probe = {.git_repo = true, .config_value = "GIT_TOPLEVEL"};
+    detect_session_result_t out;
+    detect_session_probe(&probe, &out);
+    if (!out.setup_ok) {
+        PASS(); /* fixture setup failed (tmpdir/cwd/git unavailable) — skip */
+    }
+    ASSERT_STR_EQ(out.detected, out.repo_root);
+    ASSERT_NOT_NULL(strstr(out.log, "msg=session_root.config_invalid"));
+    ASSERT_NOT_NULL(strstr(out.log, "value=GIT_TOPLEVEL"));
+    ASSERT_NOT_NULL(strstr(out.log, "using=git_toplevel"));
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════
  *  ignore_worktrees — explicit index_repository on a linked worktree
  * ═══════════════════════════════════════════════════════════════ */
@@ -22093,6 +22112,7 @@ SUITE(mcp) {
     RUN_TEST(detect_session_repo_at_home_falls_back_to_cwd);
     RUN_TEST(detect_session_without_git_keeps_cwd);
     RUN_TEST(detect_session_session_root_cwd_keeps_previous_behavior);
+    RUN_TEST(detect_session_invalid_session_root_config_warns_and_uses_git_toplevel);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
     /* ignore_worktrees gate */
     RUN_TEST(mcp_ignore_worktrees_gates_explicit_index_repository);
