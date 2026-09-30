@@ -108,7 +108,7 @@ Current keys:
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
 | `build_fingerprint_cache` | `false` | Cache the executable's SHA-256 keyed by `(dev, ino, size, mtime_ns)` in the cache directory. `true` skips rehashing the binary on every one-shot CLI run; the cache is invalidated whenever the identity tuple changes. |
 | `index_memory_budget_mb` | `off` | Aggregate index memory budget in MiB. Strict decimal range `512..`total RAM; `off` defers to `CBM_MEM_BUDGET_MB` or the RAM fraction. Read once when the daemon starts. |
-| `index_workers` | `auto` | Parallel workers inside each physical index process. Strict decimal range `1..`online cores; `auto` defers to `CBM_WORKERS` or detected core count. Read once when the daemon starts. |
+| `index_workers` | `auto` | Parallel workers inside each physical index process. Strict decimal range `1..`min(online cores, 256 — `CBM_WORKERS_MAX`, the number the workers honour); `auto` defers to `CBM_WORKERS` or detected core count. Read once when the daemon starts. |
 | `max_clients` | `auto` | Concurrent client connections the daemon admits at once, counting sockets accepted but not yet through HELLO. Strict decimal range `1..512` — the same range `CBM_MAX_CLIENTS` is clamped into, so a stored value is never one the daemon would have to clamp; `auto` defers to `CBM_MAX_CLIENTS` or the `128` default. Read once when the daemon starts. |
 
 > **`build_fingerprint_cache`.** Opt-in, off by default. The cached hash is only
@@ -230,7 +230,11 @@ index worker inherits the same value.
 `config set` refuses values outside the documented range and leaves the stored
 value untouched (the error names the bound this host enforces); anything a
 hand-edited database may hold falls back to the sentinel (`off` / `auto`) at
-read time.
+read time **and says so** — a value the strict parse refuses is not the same as
+an unset key, and the fallback it takes is what the daemon reports in
+`daemon.mem.config_invalid`, `daemon.workers.config_invalid`,
+`session_root.config_invalid` and `daemon.max_clients.config_invalid` (`value`
+is the refused text, `using` what took its place).
 
 Both keys are read **once, when the daemon starts**, before the memory ceiling
 is resolved — so the ceiling is derived from the configured budget in that same
