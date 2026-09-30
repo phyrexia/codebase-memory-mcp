@@ -7732,6 +7732,16 @@ bool cbm_config_parse_index_memory_budget_mb(const char *value, size_t total_ram
     return true;
 }
 
+/* Bounded by the smaller of the online core count and CBM_WORKERS_MAX: the
+ * workers clamp into 1..CBM_WORKERS_MAX (cbm_default_worker_count), so a
+ * larger core count must not make a stored value storable that the runtime
+ * would then ignore — a >256-core host used to accept up to its core count
+ * and report "auto" for everything above 256. */
+static size_t config_index_workers_bound(int core_count) {
+    size_t bound = core_count > 0 ? (size_t)core_count : SIZE_MAX;
+    return bound > (size_t)CBM_WORKERS_MAX ? (size_t)CBM_WORKERS_MAX : bound;
+}
+
 bool cbm_config_parse_index_workers(const char *value, int core_count, size_t *out_workers) {
     if (!value || !out_workers) {
         return false;
@@ -7741,8 +7751,7 @@ bool cbm_config_parse_index_workers(const char *value, int core_count, size_t *o
         return true;
     }
     size_t parsed = 0;
-    size_t bound = core_count > 0 ? (size_t)core_count : SIZE_MAX;
-    if (!config_parse_bounded_uint(value, bound, &parsed)) {
+    if (!config_parse_bounded_uint(value, config_index_workers_bound(core_count), &parsed)) {
         return false;
     }
     if (parsed < CBM_CONFIG_INDEX_WORKERS_MIN) {
@@ -8030,10 +8039,13 @@ static int config_runtime_knob_write(cbm_config_t *config, const char *key, cons
                        key, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB_OFF,
                        CBM_CONFIG_INDEX_MEMORY_BUDGET_MB_MIN, total_ram_mb);
     } else if (strcmp(key, CBM_CONFIG_INDEX_WORKERS) == 0) {
+        /* Name the bound the write is actually held to, not just the core
+         * count: above CBM_WORKERS_MAX the workers clamp, so a host with more
+         * cores must not be promised a range it cannot store. */
         valid = cbm_config_parse_index_workers(value, cbm_system_info().total_cores, &parsed);
-        (void)snprintf(error, sizeof(error), "%s must be %s or an integer from %u to %d", key,
+        (void)snprintf(error, sizeof(error), "%s must be %s or an integer from %u to %zu", key,
                        CBM_CONFIG_INDEX_WORKERS_AUTO, CBM_CONFIG_INDEX_WORKERS_MIN,
-                       cbm_system_info().total_cores);
+                       config_index_workers_bound(cbm_system_info().total_cores));
     } else {
         valid = cbm_config_parse_max_clients(value, &parsed);
         (void)snprintf(error, sizeof(error), "%s must be %s or an integer from %u to %u", key,

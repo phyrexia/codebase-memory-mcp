@@ -549,7 +549,8 @@ bool cbm_config_build_fingerprint_cache(cbm_config_t *cfg);
  * NUL-terminated string of at most 32 bytes that is exactly the sentinel or a
  * decimal integer in [MIN, bound]; `out_*` receives 0 for the sentinel.
  * A `bound`/`core_count` of 0 means "detection failed" and drops only the
- * upper bound — the floor still applies. */
+ * machine's upper bound — the floor still applies, and index_workers keeps
+ * CBM_WORKERS_MAX as its cap (see config_index_workers_bound). */
 bool cbm_config_parse_index_memory_budget_mb(const char *value, size_t total_ram_mb,
                                              size_t *out_mb);
 bool cbm_config_parse_index_workers(const char *value, int core_count, size_t *out_workers);

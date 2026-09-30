@@ -15702,6 +15702,15 @@ TEST(cli_config_index_workers_parse_is_strict_and_bounded) {
     ASSERT_EQ(out, 16);
     ASSERT_FALSE(cbm_config_parse_index_workers("0", 0, &out));
 
+    /* CBM_WORKERS_MAX is the number the workers themselves honour, so it caps
+     * the write even where the host reports more cores — and where core
+     * detection failed — instead of letting a >256-core host store a value
+     * the runtime then reports as "auto". */
+    ASSERT_TRUE(cbm_config_parse_index_workers("256", 1024, &out));
+    ASSERT_EQ(out, 256);
+    ASSERT_FALSE(cbm_config_parse_index_workers("257", 1024, &out));
+    ASSERT_FALSE(cbm_config_parse_index_workers("257", 0, &out));
+
     ASSERT_FALSE(cbm_config_parse_index_workers(NULL, 8, &out));
     ASSERT_FALSE(cbm_config_parse_index_workers("1", 8, NULL));
     PASS();
