@@ -10,6 +10,7 @@
 
 #include "cli/cli.h"
 #include "daemon/daemon.h"
+#include "daemon/runtime.h"
 #include "daemon/service.h"
 #include "daemon/service_internal.h"
 #include "foundation/compat.h"
@@ -100,6 +101,14 @@ static bool version_test_write_file(const char *path, const char *contents) {
     bool wrote = fwrite(contents, 1, length, file) == length;
     bool closed = fclose(file) == 0;
     return wrote && closed;
+}
+
+static uint64_t version_test_process_id(void) {
+#ifdef _WIN32
+    return (uint64_t)GetCurrentProcessId();
+#else
+    return (uint64_t)getpid();
+#endif
 }
 
 static bool version_test_is_sha256(const char *value) {
@@ -618,6 +627,61 @@ TEST(daemon_build_fingerprint_cache_rejects_corrupt_sidecar) {
     PASS();
 }
 
+TEST(daemon_runtime_process_fingerprint_uses_cache) {
+    char cache[VERSION_TEST_PATH_CAP] = {0};
+    char cold[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char warm[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char uncached[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+
+    bool setup_ok = (!old_cache || saved_cache) && version_test_temp_dir(cache, "fp-process-store") &&
+                    cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                    version_test_write_fingerprint_cache_value(cache, "true");
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+
+    /* The one-shot identity path hashes this process's own image twice: the
+     * capture every one-shot performs before HELLO. Only one capture may hash
+     * the executable; the second must be served from the sidecar. */
+    bool cold_ok =
+        setup_ok &&
+        cbm_daemon_runtime_process_build_fingerprint(version_test_process_id(), cold);
+    bool warm_ok =
+        cold_ok && cbm_daemon_runtime_process_build_fingerprint(version_test_process_id(), warm);
+    size_t cached_count = cbm_daemon_build_fingerprint_hash_count_for_test();
+
+    /* Cache off: a fresh hash must reproduce the cached value, proving the
+     * sidecar served the same SHA-256 hashing would compute. */
+    bool off_setup = warm_ok && version_test_write_fingerprint_cache_value(cache, NULL);
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+    bool off_ok = off_setup &&
+                  cbm_daemon_runtime_process_build_fingerprint(version_test_process_id(), uncached);
+    size_t off_count = cbm_daemon_build_fingerprint_hash_count_for_test();
+
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        free(saved_cache);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+    (void)th_rmtree(cache);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(cold_ok);
+    ASSERT_TRUE(warm_ok);
+    ASSERT_TRUE(version_test_is_sha256(cold));
+    ASSERT_STR_EQ(warm, cold);
+    ASSERT_EQ(cached_count, 1);
+    ASSERT_TRUE(off_ok);
+    ASSERT_STR_EQ(uncached, cold);
+    ASSERT_EQ(off_count, 1);
+    PASS();
+}
+
 TEST(daemon_hello_accepts_only_the_exact_active_build_identity) {
     cbm_daemon_build_identity_t active = version_test_identity("2.4.0", BUILD_A);
     cbm_daemon_build_identity_t exact = version_test_identity("2.4.0", BUILD_A);
@@ -989,6 +1053,7 @@ SUITE(daemon_version) {
     RUN_TEST(daemon_build_fingerprint_cache_skips_rehash_on_identical_tuple);
     RUN_TEST(daemon_build_fingerprint_cache_detects_replacement_by_inode_or_size);
     RUN_TEST(daemon_build_fingerprint_cache_rejects_corrupt_sidecar);
+    RUN_TEST(daemon_runtime_process_fingerprint_uses_cache);
     RUN_TEST(daemon_hello_accepts_only_the_exact_active_build_identity);
     RUN_TEST(daemon_hello_version_conflict_exposes_active_and_requested_builds);
     RUN_TEST(daemon_hello_rejects_each_abi_mismatch);
