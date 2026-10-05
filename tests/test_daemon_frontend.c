@@ -1658,6 +1658,28 @@ TEST(daemon_local_participant_monitor_joins_before_manager_teardown) {
     PASS();
 }
 
+/* Stopping the maintenance monitor joins an observer that may be sleeping out
+ * its idle cadence, and every one-shot CLI pays that whole remainder on exit.
+ * Stop must land inside the idle window without waiting out the sleep. */
+TEST(daemon_local_participant_monitor_stop_is_immediate_in_idle_window) {
+    frontend_maintenance_fixture_t fixture;
+    ASSERT_TRUE(frontend_maintenance_fixture_start(&fixture, "monitor-stop-latency"));
+    cbm_daemon_maintenance_monitor_t *monitor = cbm_daemon_maintenance_monitor_start(
+        fixture.manager, NULL, NULL, EXIT_FAILURE, "test-latency-command");
+    ASSERT_TRUE(monitor != NULL);
+    /* Land the observer inside its 250 ms idle sleep before stopping. */
+    cbm_usleep(50000);
+    uint64_t started_ms = cbm_now_ms();
+    bool stopped = cbm_daemon_maintenance_monitor_stop(&monitor);
+    uint64_t elapsed_ms = cbm_now_ms() - started_ms;
+    frontend_maintenance_fixture_finish(&fixture);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(monitor == NULL);
+    /* The idle cadence is 250 ms; stop must not wait out the sleep. */
+    ASSERT_TRUE(elapsed_ms < 125);
+    PASS();
+}
+
 typedef struct {
     cbm_mutex_t mutex;
     cbm_thread_condition_t condition;
@@ -1755,4 +1777,5 @@ SUITE(daemon_frontend) {
     RUN_TEST(daemon_frontend_stdout_backpressure_maintenance_stops_and_cancels_session);
 #endif
     RUN_TEST(daemon_local_participant_monitor_joins_before_manager_teardown);
+    RUN_TEST(daemon_local_participant_monitor_stop_is_immediate_in_idle_window);
 }
