@@ -353,10 +353,12 @@ static bool conflict_log_record(const cbm_daemon_conflict_t *conflict,
  * build mismatches between honest peers; it does not authenticate a hostile
  * one.
  *
- * cbm_daemon_build_fingerprint_native_file does not look up or store yet: its
- * caller cbm_daemon_build_fingerprint_file drives the cache around the hash.
- * Both entry points hash through a live kernel-bound handle, so no pathname
- * takes part in the cache at all. */
+ * cbm_daemon_build_fingerprint_native_file is the cached hasher — the one
+ * function both entry points share — so nothing is keyed by pathname:
+ * cbm_daemon_build_fingerprint_file is just "open by path, hand the fd to
+ * native_file, close". Callers bracket the hash with their own before/after
+ * snapshots of the live handle, cached or not, so a hit can only skip
+ * RECOMPUTING a hash, never the proof that one image was held throughout. */
 
 enum { FINGERPRINT_CACHE_CAP = 512 };
 
@@ -672,6 +674,16 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
         return false;
     }
 
+    /* The cache lives here, keyed by the identity of this very handle: a hit
+     * skips reading the image and never counts as a hash. An unusable identity
+     * only means "always hash". */
+    fingerprint_file_identity_t identity;
+    bool identified = fingerprint_identity_posix(fd, &identity);
+    if (identified && fingerprint_cache_lookup(&identity, out)) {
+        return true;
+    }
+    out[0] = '\0';
+
     cbm_sha256_ctx context;
     cbm_sha256_init(&context);
     unsigned char buffer[DAEMON_SERVICE_IO_CAP];
@@ -703,6 +715,9 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     cbm_sha256_final(&context, digest);
     digest_to_hex(digest, out);
     atomic_fetch_add(&g_fingerprint_hash_count, 1);
+    if (identified) {
+        fingerprint_cache_store(&identity, out);
+    }
     return true;
 }
 
@@ -718,10 +733,9 @@ bool cbm_daemon_build_fingerprint_file(const char *path,
     }
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     bool ok = fd >= 0 && fd_cloexec(fd);
-    fingerprint_file_identity_t identity;
-    bool identified = ok && fingerprint_identity_posix(fd, &identity);
-    bool cached = ok && identified && fingerprint_cache_lookup(&identity, out);
-    if (ok && !cached) {
+    /* open/close is this wrapper's whole job: the hash and the cache decision
+     * live in native_file, keyed by the identity of the handle passed here. */
+    if (ok) {
         ok = cbm_daemon_build_fingerprint_native_file((uintptr_t)fd, out);
     }
     if (fd >= 0 && close(fd) != 0) {
@@ -730,9 +744,6 @@ bool cbm_daemon_build_fingerprint_file(const char *path,
     if (!ok) {
         out[0] = '\0';
         return false;
-    }
-    if (!cached && identified) {
-        fingerprint_cache_store(&identity, out);
     }
     return true;
 }
@@ -1051,6 +1062,17 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     if (!original || original == INVALID_HANDLE_VALUE) {
         return false;
     }
+
+    /* The cache lives here, keyed by the identity of this very handle: a hit
+     * skips reading the image and never counts as a hash. An unusable identity
+     * only means "always hash". */
+    fingerprint_file_identity_t identity;
+    bool identified = fingerprint_identity_windows(original, &identity);
+    if (identified && fingerprint_cache_lookup(&identity, out)) {
+        return true;
+    }
+    out[0] = '\0';
+
     BY_HANDLE_FILE_INFORMATION original_info;
     HANDLE file = ReOpenFile(original, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
                              FILE_FLAG_SEQUENTIAL_SCAN);
@@ -1097,6 +1119,9 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     cbm_sha256_final(&context, digest);
     digest_to_hex(digest, out);
     atomic_fetch_add(&g_fingerprint_hash_count, 1);
+    if (identified) {
+        fingerprint_cache_store(&identity, out);
+    }
     return true;
 }
 
@@ -1118,11 +1143,10 @@ bool cbm_daemon_build_fingerprint_file(const char *path,
         CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                     FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     free(wide);
-    fingerprint_file_identity_t identity;
     bool ok = file != INVALID_HANDLE_VALUE;
-    bool identified = ok && fingerprint_identity_windows(file, &identity);
-    bool cached = ok && identified && fingerprint_cache_lookup(&identity, out);
-    if (ok && !cached) {
+    /* open/close is this wrapper's whole job: the hash and the cache decision
+     * live in native_file, keyed by the identity of the handle passed here. */
+    if (ok) {
         ok = cbm_daemon_build_fingerprint_native_file((uintptr_t)file, out);
     }
     if (file != INVALID_HANDLE_VALUE && !CloseHandle(file)) {
@@ -1131,9 +1155,6 @@ bool cbm_daemon_build_fingerprint_file(const char *path,
     if (!ok) {
         out[0] = '\0';
         return false;
-    }
-    if (!cached && identified) {
-        fingerprint_cache_store(&identity, out);
     }
     return true;
 }
