@@ -17,9 +17,10 @@
 /* Hash an already-open regular file without closing it. native_file is an int
  * file descriptor on POSIX and a HANDLE cast through uintptr_t on Windows.
  * Callers use this after binding the handle to kernel process-image metadata,
- * avoiding a second lookup through a replaceable pathname. Deliberately NOT
- * cached by the build-fingerprint cache: it has no stable pathname to name in a
- * sidecar and its callers already hash through a live, kernel-bound handle. */
+ * avoiding a second lookup through a replaceable pathname. It does not touch
+ * the build-fingerprint cache itself: its caller cbm_daemon_build_fingerprint
+ * _file drives the lookup/store, keyed by the identity captured from this same
+ * handle — no pathname takes part in the cache. */
 bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
                                               char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 

@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -327,20 +328,23 @@ static bool conflict_log_record(const cbm_daemon_conflict_t *conflict,
 
 /* ── Build-fingerprint cache (opt-in) ──────────────────────────────────────
  *
- * cbm_daemon_build_fingerprint_file hashes the full executable image (hundreds
- * of MB in release builds), which dominates every one-shot CLI invocation. With
- * build_fingerprint_cache=true the resulting SHA-256 is memoized in a sidecar
- * under the resolved cache directory, revalidated against the executable's
- * (device, inode, size, mtime_ns) identity before it can be reused.
+ * Hashing the full executable image (hundreds of MB in release builds)
+ * dominates every one-shot CLI invocation. With build_fingerprint_cache=true
+ * the resulting SHA-256 is memoized in a sidecar under the resolved cache
+ * directory, revalidated against the (device, inode, size, mtime_ns) identity
+ * captured from the very handle being hashed before it can be reused. The
+ * sidecar is named by that identity, never by pathname: a binary replaced
+ * under a new inode gets a fresh entry instead of overwriting the previous
+ * cohort's.
  *
  * Version-cohort security. The fingerprint decides daemon admission by exact
  * build, so the cache may only skip RECOMPUTING a hash that remains the single
  * source of truth: a sidecar entry is used only when the identity tuple
  * captured from the very handle being hashed matches exactly, the HELLO
  * comparison keeps comparing exact hashes between peers, and any E/S failure
- * falls back to hashing. Residual risk: an executable replaced in situ with the
- * same size, a forged identical mtime_ns, and a filesystem that hands back a
- * reused inode would be accepted as the previous build. Mitigations:
+ * falls back to hashing. Residual risk: an executable replaced in situ with
+ * the same size, a forged identical mtime_ns, and a filesystem that hands
+ * back a reused inode would be accepted as the previous build. Mitigations:
  * nanosecond mtime precision plus size, device, and inode in the tuple; no
  * usable inode means no cache at all (always hash); the sidecar lives in the
  * account cache root and is never authoritative. None of this weakens the
@@ -349,9 +353,10 @@ static bool conflict_log_record(const cbm_daemon_conflict_t *conflict,
  * build mismatches between honest peers; it does not authenticate a hostile
  * one.
  *
- * cbm_daemon_build_fingerprint_native_file is deliberately NOT cached (see
- * service_internal.h): no stable pathname to name in a sidecar, and its callers
- * already hash through a live kernel-bound handle. */
+ * cbm_daemon_build_fingerprint_native_file does not look up or store yet: its
+ * caller cbm_daemon_build_fingerprint_file drives the cache around the hash.
+ * Both entry points hash through a live kernel-bound handle, so no pathname
+ * takes part in the cache at all. */
 
 enum { FINGERPRINT_CACHE_CAP = 512 };
 
@@ -368,49 +373,55 @@ static const char FINGERPRINT_CACHE_MAGIC[] = "cbm-fp-cache 1 ";
 
 /* Resolved once per process (tristate) so the SQLite lookup cannot run on
  * every fingerprint call. */
-static int g_fingerprint_cache_state; /* 0 unknown, >0 enabled, <0 disabled */
-static size_t g_fingerprint_hash_count; /* completed file hash computations */
+static atomic_int g_fingerprint_cache_state; /* 0 unknown, >0 enabled, <0 disabled */
+static atomic_size_t g_fingerprint_hash_count; /* completed file hash computations */
+/* Per-process sequence feeding fingerprint_cache_writer_id. */
+static atomic_uint_fast64_t g_fingerprint_cache_writer_sequence;
 
 static bool fingerprint_cache_enabled(void) {
-    if (g_fingerprint_cache_state == 0) {
+    if (atomic_load(&g_fingerprint_cache_state) == 0) {
         cbm_config_t *config = cbm_config_open(cbm_resolve_cache_dir());
         bool enabled = config && cbm_config_build_fingerprint_cache(config);
         cbm_config_close(config);
-        g_fingerprint_cache_state = enabled ? 1 : -1;
+        int expected = 0;
+        /* First resolution wins the CAS; a losing racer discards its own
+         * reading. In practice the first call is main_build_identity's
+         * auto-fingerprint on the main thread, before any worker exists, so
+         * concurrent resolution does not occur. */
+        (void)atomic_compare_exchange_strong(&g_fingerprint_cache_state, &expected,
+                                             enabled ? 1 : -1);
     }
-    return g_fingerprint_cache_state > 0;
+    return atomic_load(&g_fingerprint_cache_state) > 0;
 }
 
 static uint64_t fingerprint_cache_writer_id(void) {
-    /* Only uniquifies the store's temp name across processes and crashed
-     * leftovers; correctness never depends on it. */
+    /* One id per store call. The pid keeps processes and crash leftovers
+     * apart; the atomic sequence keeps concurrent stores within one process
+     * apart, so a cold miss shared by workers cannot interleave bytes in one
+     * temp file. Correctness never depends on it: an exclusive create that
+     * finds the name taken simply skips caching. */
+    uint64_t sequence = atomic_fetch_add(&g_fingerprint_cache_writer_sequence, 1);
 #ifdef _WIN32
-    return (uint64_t)GetCurrentProcessId();
+    uint64_t process = (uint64_t)GetCurrentProcessId();
 #else
-    return (uint64_t)getpid();
+    uint64_t process = (uint64_t)getpid();
 #endif
+    return (process << 32) | (sequence & UINT64_C(0xffffffff));
 }
 
-static uint64_t fingerprint_cache_name_hash(const char *path) {
-    /* FNV-1a 64 over the path bytes; lowercase hex names the sidecar. A
-     * collision costs one wasted rehash at worst — correctness rests on the
-     * stored identity tuple, never on the file name. */
-    uint64_t hash = UINT64_C(14695981039346656037);
-    for (const unsigned char *cursor = (const unsigned char *)path; *cursor; cursor++) {
-        hash ^= (uint64_t)*cursor;
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
-static bool fingerprint_cache_path(const char *path, char out[DAEMON_SERVICE_PATH_CAP]) {
+static bool fingerprint_cache_path(const fingerprint_file_identity_t *identity,
+                                   char out[DAEMON_SERVICE_PATH_CAP]) {
     const char *cache = cbm_resolve_cache_dir();
-    if (!path || !out || !cache || !cache[0]) {
+    if (!identity || !out || !cache || !cache[0]) {
         return false;
     }
+    /* The name IS the key: an executable replaced under a new inode gets a
+     * fresh sidecar instead of overwriting the previous cohort's entry. A
+     * collision costs one wasted rehash at worst — correctness rests on the
+     * stored identity tuple, never on the file name. */
     int written = snprintf(out, DAEMON_SERVICE_PATH_CAP,
-                           "%s/build-fingerprint.%016" PRIx64 ".cache", cache,
-                           fingerprint_cache_name_hash(path));
+                           "%s/build-fingerprint.%016" PRIx64 "-%016" PRIx64 ".cache", cache,
+                           identity->device, identity->inode);
     return written > 0 && written < DAEMON_SERVICE_PATH_CAP;
 }
 
@@ -478,13 +489,19 @@ static bool fingerprint_cache_parse(const char *data, size_t length,
     return true;
 }
 
-static bool fingerprint_cache_lookup(const char *path, const fingerprint_file_identity_t *identity,
+/* Defined per platform: creates tmp_path exclusively (O_CREAT|O_EXCL 0600 on
+ * POSIX, CREATE_NEW on Windows) and writes the complete payload. On a name
+ * collision it fails without touching the file (the name may belong to a
+ * concurrent store); on any later failure it removes its own partial output. */
+static bool fingerprint_cache_write_tmp(const char *tmp_path, const char *data, size_t length);
+
+static bool fingerprint_cache_lookup(const fingerprint_file_identity_t *identity,
                                      char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
-    if (!path || !identity || !identity->has_inode || !out || !fingerprint_cache_enabled()) {
+    if (!identity || !identity->has_inode || !out || !fingerprint_cache_enabled()) {
         return false;
     }
     char cache_path[DAEMON_SERVICE_PATH_CAP];
-    if (!fingerprint_cache_path(path, cache_path)) {
+    if (!fingerprint_cache_path(identity, cache_path)) {
         return false;
     }
     FILE *file = cbm_fopen(cache_path, "rb");
@@ -498,19 +515,21 @@ static bool fingerprint_cache_lookup(const char *path, const fingerprint_file_id
     return complete && fingerprint_cache_parse(data, length, identity, out);
 }
 
-static void fingerprint_cache_store(const char *path, const fingerprint_file_identity_t *identity,
+static void fingerprint_cache_store(const fingerprint_file_identity_t *identity,
                                     const char *fingerprint) {
-    if (!path || !identity || !identity->has_inode || !fingerprint ||
-        !fingerprint_cache_enabled()) {
+    if (!identity || !identity->has_inode || !fingerprint || !fingerprint_cache_enabled()) {
         return;
     }
     char cache_path[DAEMON_SERVICE_PATH_CAP];
-    if (!fingerprint_cache_path(path, cache_path)) {
+    if (!fingerprint_cache_path(identity, cache_path)) {
         return;
     }
+    /* "<cache_path>.<pid>.<seq>.tmp": unique per store call across processes
+     * and threads alike. */
+    uint64_t writer = fingerprint_cache_writer_id();
     char tmp_path[DAEMON_SERVICE_PATH_CAP];
-    int written = snprintf(tmp_path, sizeof(tmp_path), "%s.%" PRIu64 ".tmp", cache_path,
-                           fingerprint_cache_writer_id());
+    int written = snprintf(tmp_path, sizeof(tmp_path), "%s.%" PRIu64 ".%" PRIu64 ".tmp", cache_path,
+                           writer >> 32, writer & UINT64_C(0xffffffff));
     if (written <= 0 || (size_t)written >= sizeof(tmp_path)) {
         return;
     }
@@ -522,33 +541,29 @@ static void fingerprint_cache_store(const char *path, const fingerprint_file_ide
     if (length <= 0 || (size_t)length >= sizeof(line)) {
         return;
     }
-    /* Atomic publish through a unique temp name; every E/S failure is ignored
-     * (no cache, no error) because the hash itself is the source of truth. */
-    FILE *file = cbm_fopen(tmp_path, "wb");
-    if (!file) {
+    /* Atomic publish through a temp name only this call may own; every E/S
+     * failure is ignored (no cache, no error) because the hash itself is the
+     * source of truth. A reader only ever sees complete .cache files (rename
+     * is atomic) and a .tmp is never read. */
+    if (!fingerprint_cache_write_tmp(tmp_path, line, (size_t)length)) {
         return;
     }
-    bool ok = fwrite(line, 1, (size_t)length, file) == (size_t)length;
-    ok = fclose(file) == 0 && ok;
-    if (ok && cbm_rename_replace(tmp_path, cache_path) != 0) {
-        ok = false;
-    }
-    if (!ok) {
+    if (cbm_rename_replace(tmp_path, cache_path) != 0) {
         (void)cbm_unlink(tmp_path);
     }
 }
 
 #if defined(CBM_CLI_ENABLE_TEST_API)
 void cbm_daemon_build_fingerprint_cache_reset_for_test(void) {
-    g_fingerprint_cache_state = 0;
+    atomic_store(&g_fingerprint_cache_state, 0);
 }
 
 size_t cbm_daemon_build_fingerprint_hash_count_for_test(void) {
-    return g_fingerprint_hash_count;
+    return atomic_load(&g_fingerprint_hash_count);
 }
 
 void cbm_daemon_build_fingerprint_hash_count_reset_for_test(void) {
-    g_fingerprint_hash_count = 0;
+    atomic_store(&g_fingerprint_hash_count, 0);
 }
 #endif /* CBM_CLI_ENABLE_TEST_API */
 
@@ -586,6 +601,36 @@ static bool fd_regular(int fd, struct stat *status_out) {
         *status_out = status;
     }
     return true;
+}
+
+static bool fingerprint_cache_write_tmp(const char *tmp_path, const char *data, size_t length) {
+    /* O_EXCL makes the name a claim only this call holds; a collision (a
+     * concurrent store, a crash leftover on a wrapped sequence) fails without
+     * touching the file because it may not be ours. */
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = true;
+    size_t written = 0;
+    while (written < length) {
+        ssize_t count = write(fd, data + written, length - written);
+        if (count > 0) {
+            written += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            ok = false;
+            break;
+        }
+    }
+    if (close(fd) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        (void)cbm_unlink(tmp_path);
+    }
+    return ok;
 }
 
 static bool fingerprint_identity_posix(int fd, fingerprint_file_identity_t *identity) {
@@ -657,7 +702,7 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
     cbm_sha256_final(&context, digest);
     digest_to_hex(digest, out);
-    g_fingerprint_hash_count++;
+    atomic_fetch_add(&g_fingerprint_hash_count, 1);
     return true;
 }
 
@@ -675,7 +720,7 @@ bool cbm_daemon_build_fingerprint_file(const char *path,
     bool ok = fd >= 0 && fd_cloexec(fd);
     fingerprint_file_identity_t identity;
     bool identified = ok && fingerprint_identity_posix(fd, &identity);
-    bool cached = ok && identified && fingerprint_cache_lookup(path, &identity, out);
+    bool cached = ok && identified && fingerprint_cache_lookup(&identity, out);
     if (ok && !cached) {
         ok = cbm_daemon_build_fingerprint_native_file((uintptr_t)fd, out);
     }
@@ -687,7 +732,7 @@ bool cbm_daemon_build_fingerprint_file(const char *path,
         return false;
     }
     if (!cached && identified) {
-        fingerprint_cache_store(path, &identity, out);
+        fingerprint_cache_store(&identity, out);
     }
     return true;
 }
@@ -962,6 +1007,40 @@ static bool fingerprint_identity_windows(HANDLE file, fingerprint_file_identity_
     return true;
 }
 
+static bool fingerprint_cache_write_tmp(const char *tmp_path, const char *data, size_t length) {
+    /* CREATE_NEW makes the name a claim only this call holds; a collision (a
+     * concurrent store, a crash leftover on a wrapped sequence) fails without
+     * touching the file because it may not be ours. */
+    wchar_t *wide = cbm_path_to_wide(tmp_path);
+    if (!wide) {
+        return false;
+    }
+    HANDLE file =
+        CreateFileW(wide, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wide);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    bool ok = true;
+    size_t written = 0;
+    while (written < length) {
+        DWORD count = 0;
+        if (!WriteFile(file, data + written, (DWORD)(length - written), &count, NULL) ||
+            count == 0) {
+            ok = false;
+            break;
+        }
+        written += count;
+    }
+    if (!CloseHandle(file)) {
+        ok = false;
+    }
+    if (!ok) {
+        (void)cbm_unlink(tmp_path);
+    }
+    return ok;
+}
+
 bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
                                               char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
     if (!out) {
@@ -1017,7 +1096,7 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
     cbm_sha256_final(&context, digest);
     digest_to_hex(digest, out);
-    g_fingerprint_hash_count++;
+    atomic_fetch_add(&g_fingerprint_hash_count, 1);
     return true;
 }
 
@@ -1042,7 +1121,7 @@ bool cbm_daemon_build_fingerprint_file(const char *path,
     fingerprint_file_identity_t identity;
     bool ok = file != INVALID_HANDLE_VALUE;
     bool identified = ok && fingerprint_identity_windows(file, &identity);
-    bool cached = ok && identified && fingerprint_cache_lookup(path, &identity, out);
+    bool cached = ok && identified && fingerprint_cache_lookup(&identity, out);
     if (ok && !cached) {
         ok = cbm_daemon_build_fingerprint_native_file((uintptr_t)file, out);
     }
@@ -1054,7 +1133,7 @@ bool cbm_daemon_build_fingerprint_file(const char *path,
         return false;
     }
     if (!cached && identified) {
-        fingerprint_cache_store(path, &identity, out);
+        fingerprint_cache_store(&identity, out);
     }
     return true;
 }

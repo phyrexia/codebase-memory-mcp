@@ -138,9 +138,10 @@ static bool version_test_write_fingerprint_cache_value(const char *cache_dir, co
     return rc == 0;
 }
 
-/* Locate the one build-fingerprint sidecar the cache wrote. The FNV name is an
- * implementation detail; scanning keeps the tests honest about where the
- * sidecar lives without mirroring the naming hash. */
+/* Locate the one build-fingerprint sidecar the cache wrote. The name encodes
+ * the hashed file's identity and is an implementation detail; scanning keeps
+ * the tests honest about where the sidecar lives without mirroring the naming
+ * format. */
 static bool version_test_find_fingerprint_sidecar(const char *cache_dir, char *out, size_t cap) {
     static const char prefix[] = "build-fingerprint.";
     static const char suffix[] = ".cache";
