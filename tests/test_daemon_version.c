@@ -10,6 +10,7 @@
 
 #include "cli/cli.h"
 #include "daemon/daemon.h"
+#include "daemon/runtime.h"
 #include "daemon/service.h"
 #include "daemon/service_internal.h"
 #include "foundation/compat.h"
@@ -102,6 +103,14 @@ static bool version_test_write_file(const char *path, const char *contents) {
     return wrote && closed;
 }
 
+static uint64_t version_test_process_id(void) {
+#ifdef _WIN32
+    return (uint64_t)GetCurrentProcessId();
+#else
+    return (uint64_t)getpid();
+#endif
+}
+
 static bool version_test_is_sha256(const char *value) {
     if (!value || strlen(value) != CBM_DAEMON_BUILD_FINGERPRINT_SIZE - 1) {
         return false;
@@ -129,9 +138,10 @@ static bool version_test_write_fingerprint_cache_value(const char *cache_dir, co
     return rc == 0;
 }
 
-/* Locate the one build-fingerprint sidecar the cache wrote. The FNV name is an
- * implementation detail; scanning keeps the tests honest about where the
- * sidecar lives without mirroring the naming hash. */
+/* Locate the one build-fingerprint sidecar the cache wrote. The name encodes
+ * the hashed file's identity and is an implementation detail; scanning keeps
+ * the tests honest about where the sidecar lives without mirroring the naming
+ * format. */
 static bool version_test_find_fingerprint_sidecar(const char *cache_dir, char *out, size_t cap) {
     static const char prefix[] = "build-fingerprint.";
     static const char suffix[] = ".cache";
@@ -153,6 +163,132 @@ static bool version_test_find_fingerprint_sidecar(const char *cache_dir, char *o
     }
     cbm_closedir(dir);
     return found;
+}
+
+/* Device/inode the cache names a sidecar by, read from the path itself. */
+static bool version_test_file_identity(const char *path, uint64_t *device_out,
+                                       uint64_t *inode_out) {
+    if (!path || !device_out || !inode_out) {
+        return false;
+    }
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    HANDLE file = wide ? CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+                                     OPEN_EXISTING,
+                                     FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+                                     NULL)
+                       : INVALID_HANDLE_VALUE;
+    free(wide);
+    BY_HANDLE_FILE_INFORMATION info;
+    bool ok = file != INVALID_HANDLE_VALUE && GetFileInformationByHandle(file, &info) != 0;
+    if (file != INVALID_HANDLE_VALUE) {
+        (void)CloseHandle(file);
+    }
+    if (!ok) {
+        return false;
+    }
+    *device_out = (uint64_t)info.dwVolumeSerialNumber;
+    *inode_out = ((uint64_t)info.nFileIndexHigh << 32) | (uint64_t)info.nFileIndexLow;
+    return true;
+#else
+    struct stat status;
+    if (stat(path, &status) != 0) {
+        return false;
+    }
+    *device_out = (uint64_t)status.st_dev;
+    *inode_out = (uint64_t)status.st_ino;
+    return true;
+#endif
+}
+
+/* The exact sidecar name the cache must use for one identity. */
+static bool version_test_identity_sidecar(const char *cache_dir, uint64_t device, uint64_t inode,
+                                          char out[VERSION_TEST_PATH_CAP]) {
+    char name[VERSION_TEST_PATH_CAP];
+    int written = snprintf(name, sizeof(name), "build-fingerprint.%016llx-%016llx.cache",
+                           (unsigned long long)device, (unsigned long long)inode);
+    return written > 0 && written < (int)sizeof(name) &&
+           version_test_child_path(out, cache_dir, name);
+}
+
+/* Count cache-directory entries the fingerprint cache owns: finished sidecars
+ * end .cache, in-flight stores end .tmp. */
+static int version_test_count_fingerprint_entries(const char *cache_dir, const char *suffix) {
+    static const char prefix[] = "build-fingerprint.";
+    cbm_dir_t *dir = cbm_opendir(cache_dir);
+    if (!dir || !suffix) {
+        cbm_closedir(dir);
+        return -1;
+    }
+    int count = 0;
+    size_t suffix_length = strlen(suffix);
+    const cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        size_t length = strlen(entry->name);
+        if (length > (sizeof(prefix) - 1) + suffix_length &&
+            strncmp(entry->name, prefix, sizeof(prefix) - 1) == 0 &&
+            strcmp(entry->name + length - suffix_length, suffix) == 0) {
+            count++;
+        }
+    }
+    cbm_closedir(dir);
+    return count;
+}
+
+typedef struct {
+#ifdef _WIN32
+    HANDLE handle;
+#else
+    int fd;
+#endif
+} version_test_native_t;
+
+/* The kind of handle native_file consumes: an int fd on POSIX, a HANDLE on
+ * Windows. */
+static bool version_test_native_open(const char *path, version_test_native_t *out) {
+    if (!path || !out) {
+        return false;
+    }
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    HANDLE file = wide ? CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+                                     OPEN_EXISTING,
+                                     FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+                                     NULL)
+                       : INVALID_HANDLE_VALUE;
+    free(wide);
+    out->handle = file;
+    return file != INVALID_HANDLE_VALUE;
+#else
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    out->fd = fd;
+    return fd >= 0;
+#endif
+}
+
+static uintptr_t version_test_native_value(const version_test_native_t *file) {
+#ifdef _WIN32
+    return (uintptr_t)file->handle;
+#else
+    return (uintptr_t)file->fd;
+#endif
+}
+
+static void version_test_native_close(version_test_native_t *file) {
+    if (!file) {
+        return;
+    }
+#ifdef _WIN32
+    if (file->handle != INVALID_HANDLE_VALUE) {
+        (void)CloseHandle(file->handle);
+        file->handle = INVALID_HANDLE_VALUE;
+    }
+#else
+    if (file->fd >= 0) {
+        (void)close(file->fd);
+        file->fd = -1;
+    }
+#endif
 }
 
 /* Portable mtime_ns read/force for cache-invalidation fixtures. The force path
@@ -618,6 +754,397 @@ TEST(daemon_build_fingerprint_cache_rejects_corrupt_sidecar) {
     PASS();
 }
 
+TEST(daemon_runtime_process_fingerprint_uses_cache) {
+    char cache[VERSION_TEST_PATH_CAP] = {0};
+    char cold[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char warm[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char uncached[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+
+    bool setup_ok = (!old_cache || saved_cache) && version_test_temp_dir(cache, "fp-process-store") &&
+                    cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                    version_test_write_fingerprint_cache_value(cache, "true");
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+
+    /* The one-shot identity path hashes this process's own image twice: the
+     * capture every one-shot performs before HELLO. Only one capture may hash
+     * the executable; the second must be served from the sidecar. */
+    bool cold_ok =
+        setup_ok &&
+        cbm_daemon_runtime_process_build_fingerprint(version_test_process_id(), cold);
+    bool warm_ok =
+        cold_ok && cbm_daemon_runtime_process_build_fingerprint(version_test_process_id(), warm);
+    size_t cached_count = cbm_daemon_build_fingerprint_hash_count_for_test();
+
+    /* Cache off: a fresh hash must reproduce the cached value, proving the
+     * sidecar served the same SHA-256 hashing would compute. */
+    bool off_setup = warm_ok && version_test_write_fingerprint_cache_value(cache, NULL);
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+    bool off_ok = off_setup &&
+                  cbm_daemon_runtime_process_build_fingerprint(version_test_process_id(), uncached);
+    size_t off_count = cbm_daemon_build_fingerprint_hash_count_for_test();
+
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        free(saved_cache);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+    (void)th_rmtree(cache);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(cold_ok);
+    ASSERT_TRUE(warm_ok);
+    ASSERT_TRUE(version_test_is_sha256(cold));
+    ASSERT_STR_EQ(warm, cold);
+    ASSERT_EQ(cached_count, 1);
+    ASSERT_TRUE(off_ok);
+    ASSERT_STR_EQ(uncached, cold);
+    ASSERT_EQ(off_count, 1);
+    PASS();
+}
+
+TEST(daemon_native_fingerprint_cache_serves_identical_handle) {
+    char dir[VERSION_TEST_PATH_CAP] = {0};
+    char cache[VERSION_TEST_PATH_CAP] = {0};
+    char image[VERSION_TEST_PATH_CAP] = {0};
+    char sidecar[VERSION_TEST_PATH_CAP] = {0};
+    char cold[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char warm[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    uint64_t device = 0;
+    uint64_t inode = 0;
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+
+    bool setup_ok = (!old_cache || saved_cache) && version_test_temp_dir(dir, "fp-native") &&
+                    version_test_temp_dir(cache, "fp-native-store") &&
+                    version_test_child_path(image, dir, "build.bin") &&
+                    version_test_write_file(image, "native-fingerprint-cache-bytes") &&
+                    version_test_file_identity(image, &device, &inode) &&
+                    version_test_identity_sidecar(cache, device, inode, sidecar) &&
+                    cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                    version_test_write_fingerprint_cache_value(cache, "true");
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+
+    /* Two hashes of one live handle: the second must be served from the
+     * sidecar named by that handle's (device, inode) without reading the
+     * image again. */
+    version_test_native_t file = {0};
+    bool opened = setup_ok && version_test_native_open(image, &file);
+    bool cold_ok = opened &&
+                   cbm_daemon_build_fingerprint_native_file(version_test_native_value(&file), cold);
+    bool warm_ok =
+        cold_ok && cbm_daemon_build_fingerprint_native_file(version_test_native_value(&file), warm);
+    size_t hash_count = cbm_daemon_build_fingerprint_hash_count_for_test();
+    if (opened) {
+        version_test_native_close(&file);
+    }
+
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        free(saved_cache);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+    long sidecar_bytes = version_test_file_size(sidecar);
+    int sidecars = version_test_count_fingerprint_entries(cache, ".cache");
+    int temps = version_test_count_fingerprint_entries(cache, ".tmp");
+    (void)th_rmtree(dir);
+    (void)th_rmtree(cache);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(opened);
+    ASSERT_TRUE(cold_ok);
+    ASSERT_TRUE(warm_ok);
+    ASSERT_TRUE(version_test_is_sha256(cold));
+    ASSERT_STR_EQ(warm, cold);
+    ASSERT_EQ(hash_count, 1);
+    /* Exactly one sidecar, named by the hashed handle's identity, and no
+     * temp file left behind. */
+    ASSERT_EQ(sidecars, 1);
+    ASSERT_EQ(temps, 0);
+    ASSERT_GT(sidecar_bytes, 0);
+    PASS();
+}
+
+TEST(daemon_native_fingerprint_cache_never_stores_without_inode) {
+#ifdef _WIN32
+    static const char NULL_DEVICE[] = "NUL";
+#else
+    static const char NULL_DEVICE[] = "/dev/null";
+#endif
+    char cache[VERSION_TEST_PATH_CAP] = {0};
+    char observed[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+
+    bool setup_ok = (!old_cache || saved_cache) && version_test_temp_dir(cache, "fp-nodev-store") &&
+                    cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                    version_test_write_fingerprint_cache_value(cache, "true");
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+
+    /* A device file carries no usable image identity: native_file must fail
+     * closed and the cache must never be written. */
+    version_test_native_t device_file = {0};
+    bool opened = setup_ok && version_test_native_open(NULL_DEVICE, &device_file);
+    bool rejected =
+        opened && !cbm_daemon_build_fingerprint_native_file(version_test_native_value(&device_file),
+                                                            observed);
+    size_t hash_count = cbm_daemon_build_fingerprint_hash_count_for_test();
+    if (opened) {
+        version_test_native_close(&device_file);
+    }
+
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        free(saved_cache);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+    int sidecars = version_test_count_fingerprint_entries(cache, ".cache");
+    int temps = version_test_count_fingerprint_entries(cache, ".tmp");
+    (void)th_rmtree(cache);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(opened);
+    ASSERT_TRUE(rejected);
+    ASSERT_STR_EQ(observed, "");
+    ASSERT_EQ(hash_count, 0);
+    ASSERT_EQ(sidecars, 0);
+    ASSERT_EQ(temps, 0);
+    PASS();
+}
+
+TEST(daemon_native_fingerprint_cache_rehashes_in_place_rewrite) {
+    /* An in-place rewrite keeps the sidecar name (same device and inode), so
+     * only the stored tuple can detect it: same-size new bytes with a fresh
+     * mtime_ns must rehash. */
+    static const char CONTENT_A[] = "cache-rewritten-same-size-a";
+    static const char CONTENT_B[] = "cache-rewritten-same-size-b";
+    char dir[VERSION_TEST_PATH_CAP] = {0};
+    char cache[VERSION_TEST_PATH_CAP] = {0};
+    char image[VERSION_TEST_PATH_CAP] = {0};
+    char reference[VERSION_TEST_PATH_CAP] = {0};
+    char fp_expected_b[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char fp_original[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char fp_after[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+
+    bool setup_ok = (!old_cache || saved_cache) && version_test_temp_dir(dir, "fp-inplace") &&
+                    version_test_temp_dir(cache, "fp-inplace-store") &&
+                    version_test_child_path(image, dir, "build.bin") &&
+                    version_test_child_path(reference, dir, "reference-b.bin") &&
+                    version_test_write_file(image, CONTENT_A) &&
+                    version_test_write_file(reference, CONTENT_B) &&
+                    cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                    version_test_write_fingerprint_cache_value(cache, "true");
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+
+    /* Reference hash: the exact bytes the in-place rewrite will install. */
+    bool references_ok = setup_ok && cbm_daemon_build_fingerprint_file(reference, fp_expected_b);
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+
+    /* Baseline: the original bytes hash once and populate the sidecar. */
+    bool baseline_ok = references_ok && cbm_daemon_build_fingerprint_file(image, fp_original);
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+
+    uint64_t device_before = 0;
+    uint64_t device_after = 0;
+    uint64_t inode_before = 0;
+    uint64_t inode_after = 0;
+    uint64_t original_mtime = 0;
+    uint64_t forced_mtime = 0;
+    uint64_t observed_mtime = 0;
+    long original_size = baseline_ok ? version_test_file_size(image) : -1;
+    bool stamped =
+        baseline_ok && version_test_file_identity(image, &device_before, &inode_before) &&
+        version_test_file_mtime_ns(image, &original_mtime);
+    /* Same length, one byte differs, and a forced stamp beyond any filesystem
+     * timestamp granularity: the tuple changes only in mtime_ns. */
+    forced_mtime = stamped ? original_mtime + UINT64_C(2000000000) : 0;
+    bool rewritten = stamped && version_test_write_file(image, CONTENT_B) &&
+                     version_test_set_mtime_ns(image, forced_mtime) &&
+                     version_test_file_mtime_ns(image, &observed_mtime) &&
+                     version_test_file_identity(image, &device_after, &inode_after);
+    long rewritten_size = rewritten ? version_test_file_size(image) : -1;
+    bool rehash_ok = rewritten && cbm_daemon_build_fingerprint_file(image, fp_after);
+    size_t rewrite_count = cbm_daemon_build_fingerprint_hash_count_for_test();
+
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        free(saved_cache);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+    (void)th_rmtree(dir);
+    (void)th_rmtree(cache);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(references_ok);
+    ASSERT_TRUE(baseline_ok);
+    ASSERT_STR_NEQ(fp_original, fp_expected_b);
+    ASSERT_TRUE(stamped);
+    ASSERT_TRUE(rewritten);
+    /* The premises the claim rests on must really hold on this filesystem. */
+    ASSERT_EQ(device_after, device_before);
+    ASSERT_EQ(inode_after, inode_before);
+    ASSERT_EQ(rewritten_size, original_size);
+    ASSERT_EQ(observed_mtime, forced_mtime);
+    ASSERT_TRUE(rehash_ok);
+    ASSERT_EQ(rewrite_count, 1);
+    ASSERT_STR_EQ(fp_after, fp_expected_b);
+    ASSERT_STR_NEQ(fp_after, fp_original);
+    PASS();
+}
+
+typedef struct {
+    uintptr_t handle;
+    atomic_int *ready;
+    atomic_bool *go;
+    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    bool served;
+} version_test_fingerprint_writer_t;
+
+static void *version_test_fingerprint_writer_thread(void *opaque) {
+    version_test_fingerprint_writer_t *writer = opaque;
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
+    (void)atomic_fetch_add_explicit(writer->ready, 1, memory_order_acq_rel);
+    while (!atomic_load_explicit(writer->go, memory_order_acquire)) {
+        (void)cbm_nanosleep(&pause, NULL);
+    }
+    writer->served =
+        cbm_daemon_build_fingerprint_native_file(writer->handle, writer->fingerprint);
+    return NULL;
+}
+
+TEST(daemon_native_fingerprint_cache_concurrent_writers_do_not_collide) {
+    enum { FP_WRITER_COUNT = 8 };
+    char dir[VERSION_TEST_PATH_CAP] = {0};
+    char cache[VERSION_TEST_PATH_CAP] = {0};
+    char image[VERSION_TEST_PATH_CAP] = {0};
+    char sidecar[VERSION_TEST_PATH_CAP] = {0};
+    char sidecar_data[VERSION_TEST_FILE_CAP] = {0};
+    char warm[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    uint64_t device = 0;
+    uint64_t inode = 0;
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+
+    bool setup_ok = (!old_cache || saved_cache) && version_test_temp_dir(dir, "fp-race") &&
+                    version_test_temp_dir(cache, "fp-race-store") &&
+                    version_test_child_path(image, dir, "build.bin") &&
+                    version_test_write_file(image, "concurrent-fingerprint-cache-bytes") &&
+                    version_test_file_identity(image, &device, &inode) &&
+                    version_test_identity_sidecar(cache, device, inode, sidecar) &&
+                    cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                    version_test_write_fingerprint_cache_value(cache, "true");
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+
+    /* Eight cold misses over one live handle at once: every writer must
+     * return the cold hash, exactly one record may survive in the sidecar,
+     * and no temp file may remain. */
+    version_test_native_t file = {0};
+    cbm_thread_t threads[FP_WRITER_COUNT];
+    version_test_fingerprint_writer_t writers[FP_WRITER_COUNT];
+    atomic_int ready = 0;
+    atomic_bool go = false;
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
+    memset(writers, 0, sizeof(writers));
+    bool opened = setup_ok && version_test_native_open(image, &file);
+    size_t started = 0;
+    for (; opened && started < FP_WRITER_COUNT; started++) {
+        writers[started].handle = version_test_native_value(&file);
+        writers[started].ready = &ready;
+        writers[started].go = &go;
+        if (cbm_thread_create(&threads[started], 0, version_test_fingerprint_writer_thread,
+                              &writers[started]) != 0) {
+            break;
+        }
+    }
+    /* Release the cohort only once every writer is waiting at the barrier. */
+    bool barrier_reached = false;
+    for (int spin = 0; spin < 2000; spin++) {
+        if (atomic_load_explicit(&ready, memory_order_acquire) >= (int)started) {
+            barrier_reached = true;
+            break;
+        }
+        (void)cbm_nanosleep(&pause, NULL);
+    }
+    atomic_store_explicit(&go, true, memory_order_release);
+    for (size_t i = 0; i < started; i++) {
+        (void)cbm_thread_join(&threads[i]);
+    }
+
+    bool all_served = started == FP_WRITER_COUNT;
+    for (size_t i = 0; i < started && all_served; i++) {
+        all_served = writers[i].served && version_test_is_sha256(writers[i].fingerprint) &&
+                     strcmp(writers[i].fingerprint, writers[0].fingerprint) == 0;
+    }
+    size_t shared_count = cbm_daemon_build_fingerprint_hash_count_for_test();
+
+    /* A ninth call is warm: whatever the race did, the surviving record must
+     * parse strictly and match this tuple without rehashing. */
+    bool warm_ok =
+        opened &&
+        cbm_daemon_build_fingerprint_native_file(version_test_native_value(&file), warm);
+    size_t warm_count = cbm_daemon_build_fingerprint_hash_count_for_test();
+    uint64_t writer_first = cbm_daemon_build_fingerprint_writer_id_for_test();
+    uint64_t writer_second = cbm_daemon_build_fingerprint_writer_id_for_test();
+    if (opened) {
+        version_test_native_close(&file);
+    }
+
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        free(saved_cache);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+    bool sidecar_read = version_test_read_file(sidecar, sidecar_data);
+    long sidecar_bytes = version_test_file_size(sidecar);
+    int sidecars = version_test_count_fingerprint_entries(cache, ".cache");
+    int temps = version_test_count_fingerprint_entries(cache, ".tmp");
+    (void)th_rmtree(dir);
+    (void)th_rmtree(cache);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(opened);
+    ASSERT_TRUE(barrier_reached);
+    ASSERT_TRUE(all_served);
+    ASSERT_GTE(shared_count, 1);
+    ASSERT_LTE(shared_count, FP_WRITER_COUNT);
+    ASSERT_TRUE(warm_ok);
+    ASSERT_STR_EQ(warm, writers[0].fingerprint);
+    ASSERT_EQ(warm_count, shared_count);
+    ASSERT_NEQ(writer_first, writer_second);
+    /* Exactly one sidecar with one strict record, and zero surviving temps. */
+    ASSERT_EQ(sidecars, 1);
+    ASSERT_EQ(temps, 0);
+    ASSERT_GT(sidecar_bytes, 0);
+    ASSERT_TRUE(sidecar_read);
+    ASSERT_EQ(strncmp(sidecar_data, "cbm-fp-cache 1 ", sizeof("cbm-fp-cache 1 ") - 1), 0);
+    ASSERT_NOT_NULL(strstr(sidecar_data, warm));
+    PASS();
+}
+
 TEST(daemon_hello_accepts_only_the_exact_active_build_identity) {
     cbm_daemon_build_identity_t active = version_test_identity("2.4.0", BUILD_A);
     cbm_daemon_build_identity_t exact = version_test_identity("2.4.0", BUILD_A);
@@ -989,6 +1516,11 @@ SUITE(daemon_version) {
     RUN_TEST(daemon_build_fingerprint_cache_skips_rehash_on_identical_tuple);
     RUN_TEST(daemon_build_fingerprint_cache_detects_replacement_by_inode_or_size);
     RUN_TEST(daemon_build_fingerprint_cache_rejects_corrupt_sidecar);
+    RUN_TEST(daemon_runtime_process_fingerprint_uses_cache);
+    RUN_TEST(daemon_native_fingerprint_cache_serves_identical_handle);
+    RUN_TEST(daemon_native_fingerprint_cache_never_stores_without_inode);
+    RUN_TEST(daemon_native_fingerprint_cache_rehashes_in_place_rewrite);
+    RUN_TEST(daemon_native_fingerprint_cache_concurrent_writers_do_not_collide);
     RUN_TEST(daemon_hello_accepts_only_the_exact_active_build_identity);
     RUN_TEST(daemon_hello_version_conflict_exposes_active_and_requested_builds);
     RUN_TEST(daemon_hello_rejects_each_abi_mismatch);

@@ -17,9 +17,14 @@
 /* Hash an already-open regular file without closing it. native_file is an int
  * file descriptor on POSIX and a HANDLE cast through uintptr_t on Windows.
  * Callers use this after binding the handle to kernel process-image metadata,
- * avoiding a second lookup through a replaceable pathname. Deliberately NOT
- * cached by the build-fingerprint cache: it has no stable pathname to name in a
- * sidecar and its callers already hash through a live, kernel-bound handle. */
+ * avoiding a second lookup through a replaceable pathname. This is the one
+ * place the build-fingerprint cache lives: the sidecar is keyed by the
+ * (device, inode, size, mtime_ns) identity captured from this very handle
+ * with fstat / GetFileInformationByHandle, so a hit needs no pathname and
+ * skips reading the image. An unusable identity or any E/S failure falls back
+ * to hashing, and callers keep their own before/after snapshots of the handle
+ * — the cache only skips RECOMPUTING a hash, never the proof that one image
+ * was held. */
 bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
                                               char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 
@@ -29,10 +34,13 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
  * memo so a test can change build_fingerprint_cache between cases; the hash
  * counter counts completed executable hash computations so a test can prove
  * an identical (device, inode, size, mtime_ns) tuple was served without
- * rehashing. */
+ * rehashing. writer_id_for_test draws one store temp-name id (process,
+ * per-call sequence) exactly as a store does, so a test can prove two stores
+ * in one thread never share a temp file. */
 void cbm_daemon_build_fingerprint_cache_reset_for_test(void);
 size_t cbm_daemon_build_fingerprint_hash_count_for_test(void);
 void cbm_daemon_build_fingerprint_hash_count_reset_for_test(void);
+uint64_t cbm_daemon_build_fingerprint_writer_id_for_test(void);
 #endif
 
 typedef enum {
