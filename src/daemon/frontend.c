@@ -97,6 +97,13 @@ struct cbm_daemon_maintenance_monitor {
     cbm_daemon_maintenance_cancel_fn cancel;
     void *cancel_context;
     atomic_bool stopping;
+    /* Stop wakes the observer through this pair instead of letting it sleep
+     * out its idle wait: every one-shot CLI joins this thread on exit and paid
+     * the leftover sleep as fixed exit latency. The idle timeout stays
+     * 250 ms, so idle CPU and probe cadence are unchanged (the August
+     * no-active-polling rule): the wake is an event, not a faster poll. */
+    cbm_mutex_t wait_mutex;
+    cbm_thread_condition_t wake;
     bool exit_when_cancel_not_needed;
     int exit_code;
     char participant[FRONTEND_PARTICIPANT_NAME_CAP];
@@ -126,6 +133,23 @@ uint64_t cbm_daemon_frontend_test_worker_idle_cycles(void) {
 }
 #endif
 
+/* Wait up to timeout_ms for stop to wake the observer. stopping is re-read
+ * under wait_mutex so the stop broadcast cannot slip between the check and
+ * the wait (missed wakeup). A broken wait falls back to the plain sleep so a
+ * condition failure never turns the observer into an active poller. */
+static void frontend_maintenance_monitor_wait(cbm_daemon_maintenance_monitor_t *monitor,
+                                              uint32_t timeout_ms) {
+    cbm_mutex_lock(&monitor->wait_mutex);
+    cbm_condition_wait_result_t waited = CBM_CONDITION_TIMED_OUT;
+    if (!atomic_load_explicit(&monitor->stopping, memory_order_acquire)) {
+        waited = cbm_condition_timed_wait(&monitor->wake, &monitor->wait_mutex, timeout_ms);
+    }
+    cbm_mutex_unlock(&monitor->wait_mutex);
+    if (waited == CBM_CONDITION_ERROR) {
+        cbm_usleep(timeout_ms * 1000U);
+    }
+}
+
 static void *frontend_maintenance_monitor_worker(void *opaque) {
     cbm_daemon_maintenance_monitor_t *monitor = opaque;
     while (!atomic_load_explicit(&monitor->stopping, memory_order_acquire)) {
@@ -141,7 +165,7 @@ static void *frontend_maintenance_monitor_worker(void *opaque) {
         cbm_version_cohort_maintenance_presence_t presence =
             cbm_version_cohort_maintenance_presence_terminal(monitor->manager);
         if (presence == CBM_VERSION_COHORT_MAINTENANCE_ABSENT) {
-            cbm_usleep(FRONTEND_MAINTENANCE_IDLE_POLL_MS * 1000U);
+            frontend_maintenance_monitor_wait(monitor, FRONTEND_MAINTENANCE_IDLE_POLL_MS);
             continue;
         }
 
@@ -165,7 +189,7 @@ static void *frontend_maintenance_monitor_worker(void *opaque) {
                                     : now + FRONTEND_MAINTENANCE_GRACE_MS;
             while (!atomic_load_explicit(&monitor->stopping, memory_order_acquire) &&
                    cbm_now_ms() < deadline) {
-                cbm_usleep(FRONTEND_MAINTENANCE_POLL_MS * 1000U);
+                frontend_maintenance_monitor_wait(monitor, FRONTEND_MAINTENANCE_POLL_MS);
             }
             if (atomic_load_explicit(&monitor->stopping, memory_order_acquire)) {
                 return NULL;
@@ -198,9 +222,17 @@ static cbm_daemon_maintenance_monitor_t *frontend_maintenance_monitor_start(
     monitor->exit_when_cancel_not_needed = exit_when_cancel_not_needed;
     monitor->exit_code = exit_code;
     atomic_init(&monitor->stopping, false);
+    cbm_mutex_init(&monitor->wait_mutex);
+    if (!cbm_condition_init(&monitor->wake)) {
+        cbm_mutex_destroy(&monitor->wait_mutex);
+        free(monitor);
+        return NULL;
+    }
     int written = snprintf(monitor->participant, sizeof(monitor->participant), "%s", participant);
     if (written <= 0 || written >= (int)sizeof(monitor->participant) ||
         cbm_thread_create(&monitor->thread, 0, frontend_maintenance_monitor_worker, monitor) != 0) {
+        cbm_condition_destroy(&monitor->wake);
+        cbm_mutex_destroy(&monitor->wait_mutex);
         free(monitor);
         return NULL;
     }
@@ -220,9 +252,16 @@ bool cbm_daemon_maintenance_monitor_stop(cbm_daemon_maintenance_monitor_t **moni
     }
     cbm_daemon_maintenance_monitor_t *monitor = *monitor_io;
     atomic_store_explicit(&monitor->stopping, true, memory_order_release);
+    /* Wake the observer out of its idle wait: this join sits on every
+     * one-shot CLI's exit path and paid the leftover sleep as latency. */
+    cbm_mutex_lock(&monitor->wait_mutex);
+    cbm_condition_broadcast(&monitor->wake);
+    cbm_mutex_unlock(&monitor->wait_mutex);
     if (cbm_thread_join(&monitor->thread) != 0) {
         return false;
     }
+    cbm_condition_destroy(&monitor->wake);
+    cbm_mutex_destroy(&monitor->wait_mutex);
     free(monitor);
     *monitor_io = NULL;
     return true;
