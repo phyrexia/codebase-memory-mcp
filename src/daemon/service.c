@@ -567,6 +567,11 @@ size_t cbm_daemon_build_fingerprint_hash_count_for_test(void) {
 void cbm_daemon_build_fingerprint_hash_count_reset_for_test(void) {
     atomic_store(&g_fingerprint_hash_count, 0);
 }
+
+uint64_t cbm_daemon_build_fingerprint_writer_id_for_test(void) {
+    /* Draws one store temp-name id exactly as fingerprint_cache_store does. */
+    return fingerprint_cache_writer_id();
+}
 #endif /* CBM_CLI_ENABLE_TEST_API */
 
 #ifndef _WIN32

@@ -34,10 +34,13 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
  * memo so a test can change build_fingerprint_cache between cases; the hash
  * counter counts completed executable hash computations so a test can prove
  * an identical (device, inode, size, mtime_ns) tuple was served without
- * rehashing. */
+ * rehashing. writer_id_for_test draws one store temp-name id (process,
+ * per-call sequence) exactly as a store does, so a test can prove two stores
+ * in one thread never share a temp file. */
 void cbm_daemon_build_fingerprint_cache_reset_for_test(void);
 size_t cbm_daemon_build_fingerprint_hash_count_for_test(void);
 void cbm_daemon_build_fingerprint_hash_count_reset_for_test(void);
+uint64_t cbm_daemon_build_fingerprint_writer_id_for_test(void);
 #endif
 
 typedef enum {

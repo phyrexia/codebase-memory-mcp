@@ -1012,6 +1012,139 @@ TEST(daemon_native_fingerprint_cache_rehashes_in_place_rewrite) {
     PASS();
 }
 
+typedef struct {
+    uintptr_t handle;
+    atomic_int *ready;
+    atomic_bool *go;
+    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    bool served;
+} version_test_fingerprint_writer_t;
+
+static void *version_test_fingerprint_writer_thread(void *opaque) {
+    version_test_fingerprint_writer_t *writer = opaque;
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
+    (void)atomic_fetch_add_explicit(writer->ready, 1, memory_order_acq_rel);
+    while (!atomic_load_explicit(writer->go, memory_order_acquire)) {
+        (void)cbm_nanosleep(&pause, NULL);
+    }
+    writer->served =
+        cbm_daemon_build_fingerprint_native_file(writer->handle, writer->fingerprint);
+    return NULL;
+}
+
+TEST(daemon_native_fingerprint_cache_concurrent_writers_do_not_collide) {
+    enum { FP_WRITER_COUNT = 8 };
+    char dir[VERSION_TEST_PATH_CAP] = {0};
+    char cache[VERSION_TEST_PATH_CAP] = {0};
+    char image[VERSION_TEST_PATH_CAP] = {0};
+    char sidecar[VERSION_TEST_PATH_CAP] = {0};
+    char sidecar_data[VERSION_TEST_FILE_CAP] = {0};
+    char warm[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    uint64_t device = 0;
+    uint64_t inode = 0;
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+
+    bool setup_ok = (!old_cache || saved_cache) && version_test_temp_dir(dir, "fp-race") &&
+                    version_test_temp_dir(cache, "fp-race-store") &&
+                    version_test_child_path(image, dir, "build.bin") &&
+                    version_test_write_file(image, "concurrent-fingerprint-cache-bytes") &&
+                    version_test_file_identity(image, &device, &inode) &&
+                    version_test_identity_sidecar(cache, device, inode, sidecar) &&
+                    cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                    version_test_write_fingerprint_cache_value(cache, "true");
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+
+    /* Eight cold misses over one live handle at once: every writer must
+     * return the cold hash, exactly one record may survive in the sidecar,
+     * and no temp file may remain. */
+    version_test_native_t file = {0};
+    cbm_thread_t threads[FP_WRITER_COUNT];
+    version_test_fingerprint_writer_t writers[FP_WRITER_COUNT];
+    atomic_int ready = 0;
+    atomic_bool go = false;
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
+    memset(writers, 0, sizeof(writers));
+    bool opened = setup_ok && version_test_native_open(image, &file);
+    size_t started = 0;
+    for (; opened && started < FP_WRITER_COUNT; started++) {
+        writers[started].handle = version_test_native_value(&file);
+        writers[started].ready = &ready;
+        writers[started].go = &go;
+        if (cbm_thread_create(&threads[started], 0, version_test_fingerprint_writer_thread,
+                              &writers[started]) != 0) {
+            break;
+        }
+    }
+    /* Release the cohort only once every writer is waiting at the barrier. */
+    bool barrier_reached = false;
+    for (int spin = 0; spin < 2000; spin++) {
+        if (atomic_load_explicit(&ready, memory_order_acquire) >= (int)started) {
+            barrier_reached = true;
+            break;
+        }
+        (void)cbm_nanosleep(&pause, NULL);
+    }
+    atomic_store_explicit(&go, true, memory_order_release);
+    for (size_t i = 0; i < started; i++) {
+        (void)cbm_thread_join(&threads[i]);
+    }
+
+    bool all_served = started == FP_WRITER_COUNT;
+    for (size_t i = 0; i < started && all_served; i++) {
+        all_served = writers[i].served && version_test_is_sha256(writers[i].fingerprint) &&
+                     strcmp(writers[i].fingerprint, writers[0].fingerprint) == 0;
+    }
+    size_t shared_count = cbm_daemon_build_fingerprint_hash_count_for_test();
+
+    /* A ninth call is warm: whatever the race did, the surviving record must
+     * parse strictly and match this tuple without rehashing. */
+    bool warm_ok =
+        opened &&
+        cbm_daemon_build_fingerprint_native_file(version_test_native_value(&file), warm);
+    size_t warm_count = cbm_daemon_build_fingerprint_hash_count_for_test();
+    uint64_t writer_first = cbm_daemon_build_fingerprint_writer_id_for_test();
+    uint64_t writer_second = cbm_daemon_build_fingerprint_writer_id_for_test();
+    if (opened) {
+        version_test_native_close(&file);
+    }
+
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        free(saved_cache);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_daemon_build_fingerprint_cache_reset_for_test();
+    cbm_daemon_build_fingerprint_hash_count_reset_for_test();
+    bool sidecar_read = version_test_read_file(sidecar, sidecar_data);
+    long sidecar_bytes = version_test_file_size(sidecar);
+    int sidecars = version_test_count_fingerprint_entries(cache, ".cache");
+    int temps = version_test_count_fingerprint_entries(cache, ".tmp");
+    (void)th_rmtree(dir);
+    (void)th_rmtree(cache);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(opened);
+    ASSERT_TRUE(barrier_reached);
+    ASSERT_TRUE(all_served);
+    ASSERT_GTE(shared_count, 1);
+    ASSERT_LTE(shared_count, FP_WRITER_COUNT);
+    ASSERT_TRUE(warm_ok);
+    ASSERT_STR_EQ(warm, writers[0].fingerprint);
+    ASSERT_EQ(warm_count, shared_count);
+    ASSERT_NEQ(writer_first, writer_second);
+    /* Exactly one sidecar with one strict record, and zero surviving temps. */
+    ASSERT_EQ(sidecars, 1);
+    ASSERT_EQ(temps, 0);
+    ASSERT_GT(sidecar_bytes, 0);
+    ASSERT_TRUE(sidecar_read);
+    ASSERT_EQ(strncmp(sidecar_data, "cbm-fp-cache 1 ", sizeof("cbm-fp-cache 1 ") - 1), 0);
+    ASSERT_NOT_NULL(strstr(sidecar_data, warm));
+    PASS();
+}
+
 TEST(daemon_hello_accepts_only_the_exact_active_build_identity) {
     cbm_daemon_build_identity_t active = version_test_identity("2.4.0", BUILD_A);
     cbm_daemon_build_identity_t exact = version_test_identity("2.4.0", BUILD_A);
@@ -1387,6 +1520,7 @@ SUITE(daemon_version) {
     RUN_TEST(daemon_native_fingerprint_cache_serves_identical_handle);
     RUN_TEST(daemon_native_fingerprint_cache_never_stores_without_inode);
     RUN_TEST(daemon_native_fingerprint_cache_rehashes_in_place_rewrite);
+    RUN_TEST(daemon_native_fingerprint_cache_concurrent_writers_do_not_collide);
     RUN_TEST(daemon_hello_accepts_only_the_exact_active_build_identity);
     RUN_TEST(daemon_hello_version_conflict_exposes_active_and_requested_builds);
     RUN_TEST(daemon_hello_rejects_each_abi_mismatch);
