@@ -1599,6 +1599,8 @@ TEST(cli_install_recovers_markerless_stale_rendezvous) {
  * gone, so a short budget confirms the same fact a long one would -- it just
  * stops charging the suite for the wait. */
 #define CLI_SCOPE_HOST_DRAINED_PROBE_MS 2000U
+/* Harness lifetime, not a product property: 5 cold hashes of the sanitized image under load. */
+#define CLI_SCOPE_HOST_LIFETIME_MS 600000U
 
 typedef struct {
     char tmpdir[256];
@@ -1654,7 +1656,7 @@ static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, i
     (void)write(ready_fd, &ready, 1);
     close(ready_fd);
     bool drained = false;
-    uint64_t deadline = cbm_now_ms() + 120000U;
+    uint64_t deadline = cbm_now_ms() + CLI_SCOPE_HOST_LIFETIME_MS;
     while (ready_ok && cbm_now_ms() < deadline) {
         if (cbm_daemon_runtime_service_wait_exited(service, 50U)) {
             drained = true;
