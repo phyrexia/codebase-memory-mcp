@@ -3204,6 +3204,33 @@ static bool ipc_test_socket_pending_path(char out[TEST_PATH_CAP], const char *so
     return written > 0 && written < TEST_PATH_CAP;
 }
 
+static bool ipc_test_lifetime_lock_path(char out[TEST_PATH_CAP], const char *runtime_dir,
+                                        const char *key) {
+    if (!runtime_dir || !key) {
+        return false;
+    }
+    int written = snprintf(out, TEST_PATH_CAP, "%s/cbm-%s.lifetime.lock", runtime_dir, key);
+    return written > 0 && written < TEST_PATH_CAP;
+}
+
+enum { IPC_TEST_LOG_CAPTURE_CAP = 16384 };
+static char ipc_test_log_capture[IPC_TEST_LOG_CAPTURE_CAP];
+static size_t ipc_test_log_capture_used;
+
+static void ipc_test_log_capture_sink(const char *line) {
+    if (!line) {
+        return;
+    }
+    size_t length = strlen(line);
+    if (ipc_test_log_capture_used + length + 2 > sizeof(ipc_test_log_capture)) {
+        return;
+    }
+    memcpy(ipc_test_log_capture + ipc_test_log_capture_used, line, length);
+    ipc_test_log_capture_used += length;
+    ipc_test_log_capture[ipc_test_log_capture_used++] = '\n';
+    ipc_test_log_capture[ipc_test_log_capture_used] = '\0';
+}
+
 #ifndef _WIN32
 static bool ipc_test_record_temp_path(char out[TEST_PATH_CAP], const char *runtime_dir,
                                       const char *record_path) {
@@ -4434,8 +4461,9 @@ TEST(daemon_ipc_posix_active_listener_is_never_cleaned_under_queue_pressure) {
             lstat(identity_path, &identity_before) == 0 && S_ISREG(identity_before.st_mode);
     }
     /* Never accept: pressure the listen queue into the BSD case where a live
-     * listener can reject further connects with ECONNREFUSED. Cleanup must
-     * rely only on the retained lifetime reservation, never on connect(). */
+     * listener can reject further connects with ECONNREFUSED. A refused
+     * connect() is never proof of death: here the retained lifetime
+     * reservation alone must keep the names (connect() can only veto). */
     while (listener && client_count < CLIENT_CAP) {
         cbm_daemon_ipc_connection_t *client = cbm_daemon_ipc_connect(endpoint, 1);
         if (!client) {
@@ -4475,6 +4503,175 @@ TEST(daemon_ipc_posix_active_listener_is_never_cleaned_under_queue_pressure) {
     ASSERT_EQ(cleanup_result, 0);
     ASSERT_TRUE(artifacts_unchanged);
     ASSERT_EQ(endpoint_after_cleanup, 1);
+    PASS();
+}
+
+/* qf-infra 2026-10-19: something outside CBM unlinked rendezvous files it
+ * judged old, `.lifetime.lock` among them. The permanent daemon kept its record
+ * lock on the orphaned inode, so the next one-shot CLI that sealed the legacy
+ * transition found an unlocked lifetime file, judged the generation dead and
+ * unlinked `.sock`, `.anc` and `.sock.identity` while the daemon was still
+ * listening. Every later client then waited out its 30 s startup budget for an
+ * endpoint that no longer existed. The lifetime lock can be fooled this way; a
+ * listener answering on the generation's own socket cannot. */
+TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_replaced) {
+    static const char key[] = "c7d8e9f0a1b2c3d4";
+    static const char preserved_line[] = "level=warn msg=daemon.ipc.stale_cleanup_preserved";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char socket_path[TEST_PATH_CAP] = {0};
+    char anchor_path[TEST_PATH_CAP] = {0};
+    char identity_path[TEST_PATH_CAP] = {0};
+    char lifetime_path[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_local_transition_t *transition = NULL;
+    cbm_daemon_ipc_connection_t *client = NULL;
+    int ready_pipe[2] = {-1, -1};
+    int stop_pipe[2] = {-1, -1};
+    pid_t child = -1;
+    int child_status = -1;
+    uint8_t ready = 0;
+    struct stat socket_before = {0};
+    struct stat anchor_before = {0};
+    struct stat identity_before = {0};
+    struct stat socket_after = {0};
+    struct stat anchor_after = {0};
+    struct stat identity_after = {0};
+    bool paths_ok = false;
+    bool child_ready = false;
+    bool artifacts_before = false;
+    int lifetime_while_owned = -1;
+    bool lifetime_replaced = false;
+    int lifetime_after_replacement = -1;
+    int transition_result = -1;
+    int seal_result = -1;
+    bool artifacts_unchanged = false;
+    bool client_connected = false;
+    bool preservation_logged = false;
+    CBMLogLevel saved_level = cbm_log_get_level();
+    CBMLogFormat saved_format = cbm_log_get_format();
+
+    if (ipc_test_parent_new(parent, "lifetime-replaced")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        ipc_test_copy_path(socket_path, cbm_daemon_ipc_endpoint_address(endpoint));
+        paths_ok = ipc_test_socket_anchor_path(anchor_path, runtime_dir, key) &&
+                   ipc_test_socket_identity_path(identity_path, socket_path) &&
+                   ipc_test_lifetime_lock_path(lifetime_path, runtime_dir, key) &&
+                   pipe(ready_pipe) == 0 && pipe(stop_pipe) == 0;
+    }
+    if (paths_ok) {
+        child = fork();
+    }
+    if (child == 0) {
+        /* The permanent daemon, in its own process so its record lock and the
+         * in-process lock registry stay out of the cleaner's way: publish the
+         * endpoint, hold the lifetime reservation, never accept, and keep
+         * listening until the parent says stop (or goes away). */
+        (void)close(ready_pipe[0]);
+        (void)close(stop_pipe[1]);
+        cbm_daemon_ipc_listener_t *listener = cbm_daemon_ipc_listen(endpoint);
+        uint8_t result = listener ? 'R' : 'E';
+        bool reported = ipc_test_fd_write_all(ready_pipe[1], &result, sizeof(result));
+        (void)close(ready_pipe[1]);
+        uint8_t stop = 0;
+        (void)ipc_test_fd_read_all(stop_pipe[0], &stop, sizeof(stop));
+        (void)close(stop_pipe[0]);
+        cbm_daemon_ipc_listener_close(listener);
+        _exit(listener && reported ? 0 : 1);
+    }
+    if (child > 0) {
+        (void)close(ready_pipe[1]);
+        ready_pipe[1] = -1;
+        (void)close(stop_pipe[0]);
+        stop_pipe[0] = -1;
+        child_ready = ipc_test_fd_read_all(ready_pipe[0], &ready, sizeof(ready)) && ready == 'R';
+    }
+    if (child_ready) {
+        artifacts_before =
+            lstat(socket_path, &socket_before) == 0 && S_ISSOCK(socket_before.st_mode) &&
+            lstat(anchor_path, &anchor_before) == 0 && S_ISSOCK(anchor_before.st_mode) &&
+            anchor_before.st_dev == socket_before.st_dev &&
+            anchor_before.st_ino == socket_before.st_ino &&
+            lstat(identity_path, &identity_before) == 0 && S_ISREG(identity_before.st_mode);
+        lifetime_while_owned = cbm_daemon_ipc_lifetime_reservation_probe(endpoint);
+    }
+    if (artifacts_before && lifetime_while_owned == 1 && unlink(lifetime_path) == 0) {
+        /* The external cleaner: the name now points at a fresh, unlocked inode
+         * while the daemon's record lock stays on the orphaned one. */
+        int replacement =
+            open(lifetime_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        lifetime_replaced = replacement >= 0 && fchmod(replacement, 0600) == 0;
+        if (replacement >= 0) {
+            (void)close(replacement);
+        }
+        lifetime_after_replacement =
+            lifetime_replaced ? cbm_daemon_ipc_lifetime_reservation_probe(endpoint) : -1;
+    }
+    if (lifetime_after_replacement == 0) {
+        /* Exactly what every one-shot CLI and every index worker runs first. */
+        ipc_test_log_capture_used = 0;
+        ipc_test_log_capture[0] = '\0';
+        cbm_log_set_level(CBM_LOG_WARN);
+        cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+        cbm_log_set_sink_ex(ipc_test_log_capture_sink, CBM_LOG_SINK_REPLACE);
+        transition_result = cbm_daemon_ipc_local_transition_try_acquire(endpoint, &transition);
+        seal_result =
+            transition_result == 1 ? cbm_daemon_ipc_local_transition_seal_legacy(transition) : -1;
+        cbm_log_set_sink(NULL);
+        cbm_log_set_format(saved_format);
+        cbm_log_set_level(saved_level);
+        (void)cbm_daemon_ipc_local_transition_release(&transition);
+        artifacts_unchanged =
+            lstat(socket_path, &socket_after) == 0 && S_ISSOCK(socket_after.st_mode) &&
+            socket_after.st_dev == socket_before.st_dev &&
+            socket_after.st_ino == socket_before.st_ino && lstat(anchor_path, &anchor_after) == 0 &&
+            S_ISSOCK(anchor_after.st_mode) && anchor_after.st_dev == anchor_before.st_dev &&
+            anchor_after.st_ino == anchor_before.st_ino &&
+            lstat(identity_path, &identity_after) == 0 && S_ISREG(identity_after.st_mode) &&
+            identity_after.st_dev == identity_before.st_dev &&
+            identity_after.st_ino == identity_before.st_ino;
+        client = cbm_daemon_ipc_connect(endpoint, 200);
+        client_connected = client != NULL;
+        preservation_logged = strstr(ipc_test_log_capture, preserved_line) != NULL;
+    }
+
+    cbm_daemon_ipc_connection_close(client);
+    (void)cbm_daemon_ipc_local_transition_release(&transition);
+    if (stop_pipe[1] >= 0) {
+        uint8_t stop = 'S';
+        (void)ipc_test_fd_write_all(stop_pipe[1], &stop, sizeof(stop));
+    }
+    for (size_t index = 0; index < 2; index++) {
+        if (ready_pipe[index] >= 0) {
+            (void)close(ready_pipe[index]);
+        }
+        if (stop_pipe[index] >= 0) {
+            (void)close(stop_pipe[index]);
+        }
+    }
+    if (child > 0) {
+        while (waitpid(child, &child_status, 0) < 0 && errno == EINTR) {}
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_GT(child, 0);
+    ASSERT_TRUE(child_ready);
+    ASSERT_TRUE(artifacts_before);
+    ASSERT_EQ(lifetime_while_owned, 1);
+    ASSERT_TRUE(lifetime_replaced);
+    ASSERT_EQ(lifetime_after_replacement, 0);
+    ASSERT_EQ(transition_result, 1);
+    ASSERT_EQ(seal_result, 0);
+    ASSERT_TRUE(artifacts_unchanged);
+    ASSERT_TRUE(client_connected);
+    ASSERT_TRUE(preservation_logged);
+    ASSERT_TRUE(WIFEXITED(child_status));
+    ASSERT_EQ(WEXITSTATUS(child_status), 0);
     PASS();
 }
 
@@ -5480,24 +5677,6 @@ TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
 #endif /* !_WIN32 */
 
 #ifndef _WIN32
-enum { IPC_TEST_LOG_CAPTURE_CAP = 16384 };
-static char ipc_test_log_capture[IPC_TEST_LOG_CAPTURE_CAP];
-static size_t ipc_test_log_capture_used;
-
-static void ipc_test_log_capture_sink(const char *line) {
-    if (!line) {
-        return;
-    }
-    size_t length = strlen(line);
-    if (ipc_test_log_capture_used + length + 2 > sizeof(ipc_test_log_capture)) {
-        return;
-    }
-    memcpy(ipc_test_log_capture + ipc_test_log_capture_used, line, length);
-    ipc_test_log_capture_used += length;
-    ipc_test_log_capture[ipc_test_log_capture_used++] = '\n';
-    ipc_test_log_capture[ipc_test_log_capture_used] = '\0';
-}
-
 /* #1828: a full /tmp made every daemon start die at pending publication, and
  * the only durable trace was `daemon.ipc.listen_failed stage=pending_publication`
  * -- no syscall, no errno, no path. The reporter needed hours (and a wrong
@@ -5620,6 +5799,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_markerless_linked_socket_recovers_under_startup_lock);
     RUN_TEST(daemon_ipc_posix_markerless_mismatched_socket_and_anchor_are_preserved);
     RUN_TEST(daemon_ipc_posix_active_listener_is_never_cleaned_under_queue_pressure);
+    RUN_TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_replaced);
     RUN_TEST(daemon_ipc_posix_partial_frame_timeout_poisons_connection);
 #ifdef __APPLE__
     RUN_TEST(daemon_ipc_macos_clears_inherited_deny_acl_from_new_runtime);
