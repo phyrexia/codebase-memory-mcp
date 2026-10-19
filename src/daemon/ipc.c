@@ -2703,6 +2703,30 @@ static bool posix_startup_lock_matches_endpoint(const cbm_daemon_ipc_endpoint_t 
                                         startup_lock->owner_pid);
 }
 
+/* Ask one published socket name whether a listener still answers: a single
+ * non-blocking connect(), closed at once. 1: a listener answered (connected,
+ * queued in its backlog, or still in progress); 0: the kernel proved nobody
+ * listens there (ECONNREFUSED) or the name is gone (ENOENT); -1: unknown. */
+static int posix_socket_name_listener_probe(const char *address) {
+    struct sockaddr_un socket_address;
+    socklen_t address_length;
+    if (!unix_address_set(&socket_address, address, &address_length)) {
+        return -1;
+    }
+    int fd = local_socket_new();
+    if (fd < 0) {
+        return -1;
+    }
+    int connected = local_socket_connect(fd, &socket_address, address_length);
+    int connect_error = connected == 0 ? 0 : errno;
+    (void)close(fd);
+    if (connected == 0 || connect_error == EINPROGRESS || connect_error == EAGAIN ||
+        connect_error == EWOULDBLOCK || connect_error == EINTR) {
+        return 1;
+    }
+    return connect_error == ECONNREFUSED || connect_error == ENOENT ? 0 : -1;
+}
+
 static int posix_stale_generation_cleanup_locked(const cbm_daemon_ipc_endpoint_t *endpoint) {
     /* Holding the startup lock excludes compliant starters. Reserving the
      * endpoint lifetime as well closes the check/unlink race against a caller
@@ -2753,6 +2777,38 @@ static int posix_stale_generation_cleanup_locked(const cbm_daemon_ipc_endpoint_t
         (marker_state == POSIX_RECORD_VALID && pending_state == POSIX_RECORD_VALID &&
          !posix_socket_inode_equal(&marker.identity, &pending.identity))) {
         result = 0;
+        goto cleanup_done;
+    }
+
+    /* The reservation above only proves that nobody holds a record lock on
+     * the inode the lifetime lock *name* points at now. Once that file is
+     * unlinked and recreated (an external /tmp cleaner, an operator), a live
+     * daemon keeps its lock on the orphaned inode and the reservation is
+     * granted anyway. So, before any name is unlinked, ask the generation's
+     * own sockets: a listener that still answers vetoes the collection. The
+     * probe can only preserve, never authorize: BSD-derived kernels also
+     * refuse connects to a live listener whose queue is full, and there the
+     * reservation stays the only guard. The anchor is always this
+     * generation's; the stable name counts as well when a durable record
+     * names its inode, which matters once someone else has unlinked the
+     * anchor. Any other stable socket is never collected below, so its
+     * liveness vetoes nothing. */
+    bool stable_marked = marker_state == POSIX_RECORD_VALID &&
+                         posix_socket_inode_equal(&stable_identity, &marker.identity);
+    bool stable_pending = pending_state == POSIX_RECORD_VALID &&
+                          posix_socket_inode_equal(&stable_identity, &pending.identity);
+    const char *probed_socket = "anchor";
+    int listener_state =
+        anchor_state == 1 ? posix_socket_name_listener_probe(endpoint->socket_anchor_address) : 0;
+    if (listener_state == 0 && stable_state == 1 && (stable_marked || stable_pending)) {
+        probed_socket = "stable";
+        listener_state = posix_socket_name_listener_probe(endpoint->address);
+    }
+    if (listener_state != 0) {
+        const char *listener = listener_state == 1 ? "answered" : "undetermined";
+        cbm_log_warn("daemon.ipc.stale_cleanup_preserved", "socket", probed_socket, "listener",
+                     listener, "lifetime_lock", "unheld");
+        result = listener_state == 1 ? 0 : -1;
         goto cleanup_done;
     }
 

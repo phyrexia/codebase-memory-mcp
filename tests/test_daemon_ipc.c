@@ -4461,8 +4461,9 @@ TEST(daemon_ipc_posix_active_listener_is_never_cleaned_under_queue_pressure) {
             lstat(identity_path, &identity_before) == 0 && S_ISREG(identity_before.st_mode);
     }
     /* Never accept: pressure the listen queue into the BSD case where a live
-     * listener can reject further connects with ECONNREFUSED. Cleanup must
-     * rely only on the retained lifetime reservation, never on connect(). */
+     * listener can reject further connects with ECONNREFUSED. A refused
+     * connect() is never proof of death: here the retained lifetime
+     * reservation alone must keep the names (connect() can only veto). */
     while (listener && client_count < CLIENT_CAP) {
         cbm_daemon_ipc_connection_t *client = cbm_daemon_ipc_connect(endpoint, 1);
         if (!client) {

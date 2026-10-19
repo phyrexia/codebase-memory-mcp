@@ -630,6 +630,21 @@ process that should share one daemon must see the same value — set it in the
 environment of your MCP client and your shell alike, or a CLI invocation without
 it will coordinate through the default location instead.
 
+**Keep temporary-file cleaners out of the rendezvous directory.** It holds the
+running daemon's socket names (`cbm-<key>.sock`, `.anc`, `.sock.identity`) and
+its lock files, and on a daemon that has been up for days they look old. If a
+cleaner unlinks and recreates `cbm-<key>.lifetime.lock`, the daemon keeps its
+lock on the deleted file, so other CBM processes can no longer see that it is
+alive. A CLI command or index worker that then finds the lock free still asks
+the daemon's socket before it removes anything: when a listener answers, every
+name stays in place, the process logs
+`daemon.ipc.stale_cleanup_preserved socket=anchor listener=answered lifetime_lock=unheld`,
+and it refuses to start, reporting that a pre-coordination or unverified CBM
+generation is active. Restart the daemon to give it a fresh lock (close its
+sessions, run `codebase-memory-mcp daemon stop`, and let the next session start
+it), and exclude the directory from the cleaner — on systemd hosts, an
+`x /tmp/cbm-daemon-*` line in `/etc/tmpfiles.d/`.
+
 Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
 
 
