@@ -2,6 +2,7 @@
 
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 
@@ -81,16 +82,16 @@ static int git_exit_status(int pclose_rc) {
 #endif
 }
 
-/* First output line of `git -C <repo_path> <git_args>`. Returns 0 with a heap
- * copy in *out only when git exited 0 and printed a non-empty line; *exit_status
- * receives git's exit status, GIT_EXIT_UNKNOWN when git could not be run or
- * did not exit normally. */
-static int git_capture_status(const char *repo_path, const char *git_args, char **out,
-                              int *exit_status) {
-    if (!out || !exit_status) {
+/* First output line of `git -C <repo_path> <git_args>`, into buf. Returns 0
+ * only when git exited 0 and printed a non-empty line; *exit_status receives
+ * git's exit status, GIT_EXIT_UNKNOWN when git could not be run or did not
+ * exit normally. */
+static int git_capture_status(const char *repo_path, const char *git_args, char *buf,
+                              size_t buf_size, int *exit_status) {
+    if (!buf || buf_size == 0 || !exit_status) {
         return CBM_NOT_FOUND;
     }
-    *out = NULL;
+    buf[0] = '\0';
     *exit_status = GIT_EXIT_UNKNOWN;
     if (!repo_path || !git_args || !git_validate_repo_path(repo_path)) {
         return CBM_NOT_FOUND;
@@ -114,8 +115,7 @@ static int git_capture_status(const char *repo_path, const char *git_args, char 
         return CBM_NOT_FOUND;
     }
 
-    char buf[GIT_OUTPUT_MAX];
-    bool got_line = fgets(buf, sizeof(buf), fp) != NULL;
+    bool got_line = fgets(buf, (int)buf_size, fp) != NULL;
     *exit_status = git_exit_status(cbm_pclose(fp));
     if (!got_line) {
         return CBM_NOT_FOUND;
@@ -124,14 +124,22 @@ static int git_capture_status(const char *repo_path, const char *git_args, char 
     if (*exit_status != 0 || buf[0] == '\0') {
         return CBM_NOT_FOUND;
     }
-
-    *out = git_strdup(buf);
-    return *out ? 0 : CBM_NOT_FOUND;
+    return 0;
 }
 
+/* The same line as a heap copy in *out (NULL unless 0 is returned). */
 static int git_capture(const char *repo_path, const char *git_args, char **out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    *out = NULL;
+    char buf[GIT_OUTPUT_MAX];
     int exit_status = 0;
-    return git_capture_status(repo_path, git_args, out, &exit_status);
+    if (git_capture_status(repo_path, git_args, buf, sizeof(buf), &exit_status) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    *out = git_strdup(buf);
+    return *out ? 0 : CBM_NOT_FOUND;
 }
 
 static bool path_is_absolute(const char *path) {
@@ -561,12 +569,11 @@ static head_lookup_t parse_head(char *content, char *out, size_t out_size) {
  * is the branch, "not a symbolic ref" is the detached marker, and any other
  * failure (no repository, no git) reports no branch. */
 static bool head_branch_from_git(const char *path, char *out, size_t out_size) {
-    char *branch = NULL;
+    char branch[GIT_OUTPUT_MAX];
     int exit_status = GIT_EXIT_UNKNOWN;
-    if (git_capture_status(path, "symbolic-ref --quiet --short HEAD", &branch, &exit_status) == 0) {
-        bool copied = text_is_printable(branch) && copy_whole(out, out_size, branch);
-        free(branch);
-        return copied;
+    if (git_capture_status(path, "symbolic-ref --quiet --short HEAD", branch, sizeof(branch),
+                           &exit_status) == 0) {
+        return text_is_printable(branch) && copy_whole(out, out_size, branch);
     }
     return exit_status == GIT_SYMREF_NOT_SYMBOLIC && copy_whole(out, out_size, GIT_DETACHED_BRANCH);
 }
@@ -958,16 +965,17 @@ static void status_add_sample(int *total, char ***samples, int *sample_count,
         *truncated = true;
         return;
     }
-    char *copy = (char *)malloc(path_len + 1);
+    char *copy = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, path_len + 1);
     if (!copy) {
         *truncated = true;
         return;
     }
     memcpy(copy, path, path_len);
     copy[path_len] = '\0';
-    char **grown = (char **)realloc(*samples, (size_t)(*sample_count + 1) * sizeof(char *));
+    char **grown = (char **)cbm_realloc(CBM_MEM_CLASS_OTHER, *samples,
+                                        (size_t)(*sample_count + 1) * sizeof(char *));
     if (!grown) {
-        free(copy);
+        cbm_free(CBM_MEM_CLASS_OTHER, copy);
         *truncated = true;
         return;
     }
@@ -1100,12 +1108,12 @@ void cbm_git_worktree_status_free(cbm_worktree_status_t *st) {
         return;
     }
     for (int i = 0; i < st->tracked_sample_count; i++) {
-        free(st->tracked_paths[i]);
+        cbm_free(CBM_MEM_CLASS_OTHER, st->tracked_paths[i]);
     }
-    free(st->tracked_paths);
+    cbm_free(CBM_MEM_CLASS_OTHER, st->tracked_paths);
     for (int i = 0; i < st->untracked_sample_count; i++) {
-        free(st->untracked_paths[i]);
+        cbm_free(CBM_MEM_CLASS_OTHER, st->untracked_paths[i]);
     }
-    free(st->untracked_paths);
+    cbm_free(CBM_MEM_CLASS_OTHER, st->untracked_paths);
     memset(st, 0, sizeof(*st));
 }
