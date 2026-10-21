@@ -1479,10 +1479,12 @@ static bool host_generation_already_served(const cbm_daemon_host_config_t *confi
         status.stopping) {
         return false;
     }
+    /* pid and serving_permanent describe the generation that serves, not
+     * this one, which leaves. */
     char pid_text[32];
     (void)snprintf(pid_text, sizeof(pid_text), "%lu", (unsigned long)status.daemon_pid);
     cbm_log_info("daemon.start_skipped", "reason", "generation_already_served", "pid", pid_text,
-                 "permanent", status.permanent ? "1" : "0");
+                 "serving_permanent", status.permanent ? "1" : "0");
     return true;
 }
 

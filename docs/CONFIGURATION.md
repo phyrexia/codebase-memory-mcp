@@ -669,7 +669,8 @@ A daemon started directly in its permanent role
 supervisor such as a systemd user unit runs it) that finds another generation
 already serving the account — one a session launched, for instance — leaves
 that one alone: it logs
-`daemon.start_skipped reason=generation_already_served pid=<pid> permanent=<0|1>`
+`daemon.start_skipped reason=generation_already_served pid=<pid> serving_permanent=<0|1>`
+(both fields describe the generation that serves)
 and exits at once with status 73 (`EX_CANTCREAT`), where it used to wait out a
 12-second handoff window and fail. A supervisor should treat 73 as success and
 not restart on it (`SuccessExitStatus=73`, `RestartPreventExitStatus=73`), and
