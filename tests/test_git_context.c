@@ -1058,6 +1058,19 @@ TEST(head_branch_matches_git_context_branch) {
         hb_compare(path, &rows[count++]);
         hb_compare(wt, &rows[count++]);
     }
+    /* A gitlink whose path carries trailing blanks. git's read_gitfile_raw()
+     * strips only '\n' and '\r', so it looks for "<repo>/.git  " and finds no
+     * repository; the helper must not "tolerate" the blanks and read
+     * <repo>/.git/HEAD, or it would invent a branch git does not report. */
+    char spaced_gitlink[1200];
+    snprintf(spaced_gitlink, sizeof(spaced_gitlink), "gitdir: %s/.git \t\n", repo);
+    char spaced_root[1024];
+    snprintf(spaced_root, sizeof(spaced_root), "%s/spaced", repo);
+    hb_row_t spaced = {{0}, {0}};
+    bool spaced_ready = steps && hb_file(repo, "spaced/.git", spaced_gitlink);
+    if (spaced_ready) {
+        hb_compare(spaced_root, &spaced);
+    }
     /* After the comparisons above: detaching moves the main checkout's HEAD. */
     steps = steps && git_run(repo, "checkout -q --detach") == 0;
     if (steps) {
@@ -1093,6 +1106,69 @@ TEST(head_branch_matches_git_context_branch) {
         ASSERT_EQ(count, HB_ROWS);
         ASSERT_STR_EQ(rows[5].via_head, "DETACHED");
     }
+    ASSERT_TRUE(spaced_ready);
+    ASSERT_STR_EQ(spaced.via_git, "(none)");
+    ASSERT_STR_EQ(spaced.via_head, spaced.via_git);
+    PASS();
+#endif /* _WIN32 */
+}
+
+/* HEAD and gitlink files are read only as regular files, through the
+ * descriptor that is then checked: a HEAD that is a symlink to a well-formed
+ * "ref:" file, or a FIFO, is left to git instead of being read through (a FIFO
+ * must not block the listing either), and a `.git` symlink to a gitlink file
+ * is not taken as a gitlink. The fake git answers "not a repository", so each
+ * case reports no branch after at most one git process. */
+TEST(head_branch_reads_head_and_gitlink_only_as_regular_files) {
+#ifdef _WIN32
+    SKIP_PLATFORM("the fake git on PATH is a /bin/sh script");
+#else
+    char base[256];
+    if (!hb_make_tempdir(base, sizeof(base), "cbm_headbr_files")) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    char path[1024];
+    char text[1024];
+    bool fixtures = hb_git_dir(base, "target/.git", "ref: refs/heads/followed\n") &&
+                    hb_file(base, "head-target", "ref: refs/heads/followed\n") &&
+                    hb_git_dir(base, "symhead/.git", "placeholder\n");
+    snprintf(path, sizeof(path), "%s/symhead/.git/HEAD", base);
+    fixtures = fixtures && unlink(path) == 0 && symlink("../../head-target", path) == 0;
+    fixtures = fixtures && hb_git_dir(base, "fifohead/.git", "placeholder\n");
+    snprintf(path, sizeof(path), "%s/fifohead/.git/HEAD", base);
+    fixtures = fixtures && unlink(path) == 0 && mkfifo(path, 0600) == 0;
+    /* A regular gitlink file that would resolve to target's branch. */
+    snprintf(text, sizeof(text), "gitdir: %s/target/.git\n", base);
+    fixtures = fixtures && hb_file(base, "gitlink-file", text) && hb_dir(base, "symgitlink");
+    snprintf(path, sizeof(path), "%s/symgitlink/.git", base);
+    fixtures = fixtures && symlink("../gitlink-file", path) == 0 && hb_dir(base, "fifogitlink");
+    snprintf(path, sizeof(path), "%s/fifogitlink/.git", base);
+    fixtures = fixtures && mkfifo(path, 0600) == 0;
+    th_fake_git_t fake = {0};
+    bool fake_ready = fixtures && th_fake_git_install(&fake, base, NULL, 128);
+
+    static const char *const roots[] = {"symhead", "fifohead", "symgitlink", "fifogitlink"};
+    enum { HB_ROOTS = sizeof(roots) / sizeof(roots[0]) };
+    char got[HB_ROOTS][256];
+    int calls[HB_ROOTS];
+    for (int i = 0; i < HB_ROOTS; i++) {
+        th_fake_git_reset_calls(&fake);
+        hb_query(base, roots[i], got[i], sizeof(got[i]));
+        calls[i] = th_fake_git_calls(&fake);
+    }
+    char got_target[256];
+    hb_query(base, "target", got_target, sizeof(got_target));
+
+    th_fake_git_remove(&fake);
+    th_rmtree(base);
+
+    ASSERT_TRUE(fixtures);
+    ASSERT_TRUE(fake_ready);
+    ASSERT_STR_EQ(got_target, "followed"); /* the content itself is well-formed */
+    for (int i = 0; i < HB_ROOTS; i++) {
+        ASSERT_STR_EQ(got[i], "(none)");
+        ASSERT_LTE(calls[i], 1);
+    }
     PASS();
 #endif /* _WIN32 */
 }
@@ -1117,4 +1193,5 @@ SUITE(git_context) {
     RUN_TEST(head_branch_asks_git_once_for_unparsed_forms);
     RUN_TEST(head_branch_bounds_hostile_content);
     RUN_TEST(head_branch_matches_git_context_branch);
+    RUN_TEST(head_branch_reads_head_and_gitlink_only_as_regular_files);
 }
