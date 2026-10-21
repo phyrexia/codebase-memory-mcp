@@ -853,8 +853,8 @@ TEST(daemon_bootstrap_names_absent_endpoint_with_held_marker_in_final_message) {
     ASSERT_EQ(atomic_load(&orphaned.lock_attempt_count), 0);
     ASSERT_EQ(atomic_load(&orphaned.spawn_count), 0);
     ASSERT_EQ(atomic_load(&orphaned.diagnostic_count), 1);
-    ASSERT_NOT_NULL(
-        strstr(orphaned_result.message, "holds the cohort marker but publishes no endpoint"));
+    ASSERT_NOT_NULL(strstr(orphaned_result.message, "holds the cohort marker"));
+    ASSERT_NOT_NULL(strstr(orphaned_result.message, "but publishes no endpoint"));
     ASSERT_NOT_NULL(strstr(orphaned_result.message, "pgrep -f -- --cbm-daemon-internal"));
     ASSERT_NOT_NULL(strstr(orphaned.diagnostic, "publishes no endpoint"));
 

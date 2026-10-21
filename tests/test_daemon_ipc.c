@@ -3231,12 +3231,19 @@ static void ipc_test_log_capture_sink(const char *line) {
     ipc_test_log_capture[ipc_test_log_capture_used] = '\0';
 }
 
+static bool ipc_test_path_has_inode(const char *path, const struct stat *expected) {
+    struct stat status;
+    return lstat(path, &status) == 0 && status.st_dev == expected->st_dev &&
+           status.st_ino == expected->st_ino;
+}
+
 static size_t ipc_test_log_capture_count(const char *needle) {
     size_t count = 0;
-    size_t length = needle ? strlen(needle) : 0;
-    for (const char *at = length ? strstr(ipc_test_log_capture, needle) : NULL; at;
-         at = strstr(at + length, needle)) {
+    size_t length = strlen(needle);
+    const char *at = strstr(ipc_test_log_capture, needle);
+    while (length > 0 && at) {
         count++;
+        at = strstr(at + length, needle);
     }
     return count;
 }
@@ -4681,10 +4688,10 @@ TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_
         cbm_log_set_sink_ex(ipc_test_log_capture_sink, CBM_LOG_SINK_REPLACE);
         held_transition_result = cbm_daemon_ipc_local_transition_try_acquire(endpoint, &transition);
         uint64_t started_ms = cbm_now_ms();
-        held_wait_result = held_transition_result == 1
-                               ? cbm_daemon_ipc_local_transition_seal_legacy_wait(transition,
-                                                                                 SEAL_WAIT_MS)
-                               : -1;
+        if (held_transition_result == 1) {
+            held_wait_result =
+                cbm_daemon_ipc_local_transition_seal_legacy_wait(transition, SEAL_WAIT_MS);
+        }
         held_wait_ms = cbm_now_ms() - started_ms;
         held_wait_preserved =
             cbm_daemon_ipc_local_transition_seal_preserved_live_listener(transition);
@@ -4693,17 +4700,9 @@ TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_
         cbm_log_set_level(saved_level);
         (void)cbm_daemon_ipc_local_transition_release(&transition);
         held_wait_logged = ipc_test_log_capture_count(preserved_line);
-        struct stat held_socket = {0};
-        struct stat held_anchor = {0};
-        struct stat held_identity = {0};
-        held_artifacts_unchanged =
-            lstat(socket_path, &held_socket) == 0 && held_socket.st_dev == socket_before.st_dev &&
-            held_socket.st_ino == socket_before.st_ino && lstat(anchor_path, &held_anchor) == 0 &&
-            held_anchor.st_dev == anchor_before.st_dev &&
-            held_anchor.st_ino == anchor_before.st_ino &&
-            lstat(identity_path, &held_identity) == 0 &&
-            held_identity.st_dev == identity_before.st_dev &&
-            held_identity.st_ino == identity_before.st_ino;
+        held_artifacts_unchanged = ipc_test_path_has_inode(socket_path, &socket_before) &&
+                                   ipc_test_path_has_inode(anchor_path, &anchor_before) &&
+                                   ipc_test_path_has_inode(identity_path, &identity_before);
     }
     if (held_wait_result == 0 && held_artifacts_unchanged) {
         /* The daemon exits half a second into the bound: the retry seals. */
@@ -4715,16 +4714,17 @@ TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_
         released_transition_result =
             cbm_daemon_ipc_local_transition_try_acquire(endpoint, &transition);
         uint8_t stop = 'D';
-        release_requested = released_transition_result == 1 &&
-                            ipc_test_fd_write_all(stop_pipe[1], &stop, sizeof(stop));
+        if (released_transition_result == 1) {
+            release_requested = ipc_test_fd_write_all(stop_pipe[1], &stop, sizeof(stop));
+        }
         /* The child reads one byte; never write to its pipe again. */
         (void)close(stop_pipe[1]);
         stop_pipe[1] = -1;
         uint64_t started_ms = cbm_now_ms();
-        released_wait_result =
-            release_requested
-                ? cbm_daemon_ipc_local_transition_seal_legacy_wait(transition, SEAL_WAIT_MS)
-                : -1;
+        if (release_requested) {
+            released_wait_result =
+                cbm_daemon_ipc_local_transition_seal_legacy_wait(transition, SEAL_WAIT_MS);
+        }
         released_wait_ms = cbm_now_ms() - started_ms;
         released_wait_preserved =
             cbm_daemon_ipc_local_transition_seal_preserved_live_listener(transition);
@@ -4733,9 +4733,10 @@ TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_
         cbm_log_set_level(saved_level);
         (void)cbm_daemon_ipc_local_transition_release(&transition);
         struct stat gone = {0};
-        released_names_removed = lstat(socket_path, &gone) != 0 && errno == ENOENT &&
-                                 lstat(anchor_path, &gone) != 0 && errno == ENOENT &&
-                                 lstat(identity_path, &gone) != 0 && errno == ENOENT;
+        bool socket_gone = lstat(socket_path, &gone) != 0 && errno == ENOENT;
+        bool anchor_gone = lstat(anchor_path, &gone) != 0 && errno == ENOENT;
+        bool identity_gone = lstat(identity_path, &gone) != 0 && errno == ENOENT;
+        released_names_removed = socket_gone && anchor_gone && identity_gone;
     }
 
     cbm_daemon_ipc_connection_close(client);
