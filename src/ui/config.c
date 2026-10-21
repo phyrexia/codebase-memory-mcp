@@ -15,6 +15,7 @@
 #include <yyjson/yyjson.h>
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,28 +43,43 @@ void cbm_ui_config_path(char *buf, int bufsz) {
 
 /* ── Load ────────────────────────────────────────────────────── */
 
-static char *config_read_file(const char *path, size_t *length_out, bool *opened_out) {
+/* Read config.json. *absent_out is set only when the file does not exist —
+ * the one case that lets a UI build auto-enable on first run. A file that
+ * exists but cannot be opened sets *open_error_out (errno on POSIX,
+ * GetLastError() on Windows) instead: it may be the operator's
+ * ui_enabled=false, so it must not read as "no file yet". */
+static char *config_read_file(const char *path, size_t *length_out, bool *absent_out,
+                              int *open_error_out) {
     if (length_out) {
         *length_out = 0;
     }
-    if (opened_out) {
-        *opened_out = false;
+    if (absent_out) {
+        *absent_out = false;
     }
-    if (!path || !length_out || !opened_out) {
+    if (open_error_out) {
+        *open_error_out = 0;
+    }
+    if (!path || !length_out || !absent_out || !open_error_out) {
         return NULL;
     }
 #ifdef _WIN32
     wchar_t *wide_path = cbm_path_to_wide(path);
     if (!wide_path) {
+        *open_error_out = ERROR_INVALID_NAME;
         return NULL;
     }
     HANDLE file = CreateFileW(wide_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD open_error = file == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
     free(wide_path);
     if (file == INVALID_HANDLE_VALUE) {
+        if (open_error == ERROR_FILE_NOT_FOUND || open_error == ERROR_PATH_NOT_FOUND) {
+            *absent_out = true;
+        } else {
+            *open_error_out = (int)open_error;
+        }
         return NULL;
     }
-    *opened_out = true;
     LARGE_INTEGER size;
     if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 4096) {
         (void)CloseHandle(file);
@@ -82,9 +98,13 @@ static char *config_read_file(const char *path, size_t *length_out, bool *opened
 #else
     FILE *file = cbm_fopen(path, "rb");
     if (!file) {
+        if (errno == ENOENT) {
+            *absent_out = true;
+        } else {
+            *open_error_out = errno;
+        }
         return NULL;
     }
-    *opened_out = true;
     if (fseek(file, 0, SEEK_END) != 0) {
         (void)fclose(file);
         return NULL;
@@ -108,6 +128,25 @@ static char *config_read_file(const char *path, size_t *length_out, bool *opened
     return buffer;
 }
 
+/* The open error last reported by this process, 0 once the file opens or is
+ * absent again. The daemon re-reads config.json about once a second, so one
+ * line per distinct failure, not one per poll. */
+static atomic_int g_config_unreadable_reported;
+
+static void config_report_open_error(const char *path, int open_error) {
+    if (open_error == 0) {
+        atomic_store(&g_config_unreadable_reported, 0);
+        return;
+    }
+    if (atomic_exchange(&g_config_unreadable_reported, open_error) == open_error) {
+        return;
+    }
+    char error_text[16];
+    snprintf(error_text, sizeof(error_text), "%d", open_error);
+    cbm_log_warn("ui.config.unreadable", "path", path, "os_error", error_text, "ui_enabled",
+                 "false");
+}
+
 void cbm_ui_config_load(cbm_ui_config_t *cfg) {
     if (!cfg) {
         return;
@@ -119,9 +158,11 @@ void cbm_ui_config_load(cbm_ui_config_t *cfg) {
     cbm_ui_config_path(path, (int)sizeof(path));
 
     size_t length = 0;
-    bool opened = false;
-    char *buffer = config_read_file(path, &length, &opened);
-    if (!opened) {
+    bool absent = false;
+    int open_error = 0;
+    char *buffer = config_read_file(path, &length, &absent, &open_error);
+    config_report_open_error(path, open_error);
+    if (absent) {
         /* No config file — auto-enable UI if binary has embedded assets */
         if (CBM_EMBEDDED_FILE_COUNT > 0) {
             cfg->ui_enabled = true;
@@ -129,6 +170,8 @@ void cbm_ui_config_load(cbm_ui_config_t *cfg) {
         return;
     }
     if (!buffer) {
+        /* Unreadable (fail closed: defaults, ui_enabled=false), empty, or
+         * larger than any config this code writes. */
         return;
     }
 
