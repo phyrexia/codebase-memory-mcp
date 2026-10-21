@@ -664,6 +664,17 @@ from the cleaner remains the first line of defence and also protects older
 binaries — on systemd hosts, an `x /tmp/cbm-daemon-*` line in
 `/etc/tmpfiles.d/`, placed before any rule that ages `/tmp`.
 
+A daemon started directly in its permanent role
+(`codebase-memory-mcp --cbm-daemon-internal --cbm-daemon-permanent`, the way a
+supervisor such as a systemd user unit runs it) that finds another generation
+already serving the account — one a session launched, for instance — leaves
+that one alone: it logs
+`daemon.start_skipped reason=generation_already_served pid=<pid> permanent=<0|1>`
+and exits at once with status 73 (`EX_CANTCREAT`), where it used to wait out a
+12-second handoff window and fail. A supervisor should treat 73 as success and
+not restart on it (`SuccessExitStatus=73`, `RestartPreventExitStatus=73`), and
+restart on failure, which includes 75.
+
 Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
 
 

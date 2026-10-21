@@ -60,6 +60,11 @@ enum {
      * rather than failing startup on a transient BUSY. Bounded well under the
      * client's 30 s daemon-start budget. */
     HOST_DAEMON_CLAIM_TIMEOUT_MS = 12000,
+    /* While the claim is BUSY, how long to wait for the generation that holds
+     * it to answer a status probe. The budget the client bootstrap gives a
+     * HELLO: a serving daemon answers well inside it, and a stopping one never
+     * answers at all, so a longer wait would only delay the handoff. */
+    HOST_SERVED_PROBE_TIMEOUT_MS = 1000,
     HOST_WAIT_TICK_MS = 100,
     HOST_HTTP_CONFIG_POLL_MS = 1000,
     HOST_METRICS_FLUSH_MS = 60000,
@@ -1458,6 +1463,30 @@ static void host_prepare_descriptor_limit(uint32_t max_clients) {
                  effective_text);
 }
 
+/* With the daemon claim BUSY, whether a generation is already serving the
+ * endpoint, asked the way `daemon status` asks. Only a present socket is
+ * probed: between generations the name is absent and a status request would
+ * spend its whole timeout retrying the connect. A RUNNING generation answers
+ * at once; a stopping one no longer accepts, never answers, and reads as not
+ * served, so the existing handoff wait continues. The first generation to
+ * claim the marker serves; this one then leaves without noise. */
+static bool host_generation_already_served(const cbm_daemon_host_config_t *config) {
+    if (cbm_daemon_ipc_endpoint_probe(config->endpoint, 0) != 1) {
+        return false;
+    }
+    cbm_daemon_runtime_status_t status;
+    if (!cbm_daemon_runtime_request_status(config->endpoint, &config->identity,
+                                           HOST_SERVED_PROBE_TIMEOUT_MS, &status) ||
+        status.stopping) {
+        return false;
+    }
+    char pid_text[32];
+    (void)snprintf(pid_text, sizeof(pid_text), "%lu", (unsigned long)status.daemon_pid);
+    cbm_log_info("daemon.start_skipped", "reason", "generation_already_served", "pid", pid_text,
+                 "permanent", status.permanent ? "1" : "0");
+    return true;
+}
+
 int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     if (!config || !config->endpoint || !config->executable_path ||
         !config->identity.semantic_version || !config->identity.build_fingerprint) {
@@ -1508,19 +1537,29 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     uint64_t claim_deadline = host_deadline_after(HOST_DAEMON_CLAIM_TIMEOUT_MS);
     cbm_version_cohort_status_t claim_status =
         cbm_version_cohort_daemon_claim_acquire(cohort_manager, &daemon_claim);
+    bool already_served = false;
     while (claim_status == CBM_VERSION_COHORT_BUSY && cbm_now_ms() < claim_deadline) {
-        /* The previous generation is releasing; retry until the claim is free
+        /* A generation that answers already serves: leave it alone. Otherwise
+         * the previous generation is releasing; retry until the claim is free
          * or the handoff window elapses (a persistent BUSY = a real conflict). */
+        already_served = host_generation_already_served(config);
+        if (already_served) {
+            break;
+        }
         cbm_usleep(HOST_WAIT_TICK_MS * 1000);
         claim_status = cbm_version_cohort_daemon_claim_acquire(cohort_manager, &daemon_claim);
     }
     if (claim_status != CBM_VERSION_COHORT_OK) {
-        cbm_log_error("daemon.start_failed", "component", "claim");
+        /* Nothing is published yet (no lifetime reservation, service or
+         * application exists), so the same cleanup serves both exits. */
+        if (!already_served) {
+            cbm_log_error("daemon.start_failed", "component", "claim");
+        }
         host_participant_guard_close(&participant_guard);
         host_daemon_claim_close(&daemon_claim);
         host_cohort_close(&cohort_lease, &cohort_manager);
         host_log_close();
-        return -1;
+        return already_served ? CBM_DAEMON_HOST_EXIT_ALREADY_SERVED : -1;
     }
     cbm_daemon_ipc_lifetime_reservation_t *lifetime_reservation = NULL;
     if (host_lifetime_reservation_acquire(config->endpoint, &lifetime_reservation) != 1) {

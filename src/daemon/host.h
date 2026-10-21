@@ -24,6 +24,11 @@ typedef struct {
  * -1 (startup or teardown failure). The process passes them through and a
  * supervisor keys on them, so the values are fixed (sysexits.h). */
 enum {
+    /* Another generation already serves this endpoint (one a client launched
+     * while a supervisor was starting this one, for instance). This one
+     * published nothing and left without a trace; a supervisor should treat
+     * it as success and not restart. EX_CANTCREAT. */
+    CBM_DAEMON_HOST_EXIT_ALREADY_SERVED = 73,
     /* The runtime directory stopped naming what this generation holds (a
      * cleaner removed or replaced a lock, a socket name or the identity
      * record): it stopped serving and left so a fresh generation can take
