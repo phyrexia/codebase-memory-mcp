@@ -13,7 +13,10 @@
 #include <string.h>
 #include <sys/stat.h>
 #ifndef _WIN32
+#include <errno.h>
+#include <fcntl.h>
 #include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 enum {
@@ -243,6 +246,9 @@ static const char REF_FORBIDDEN_BYTES[] = " ~^:?*[\\";
 
 /* Copy text into out whole; false, with out emptied, when it does not fit. */
 static bool copy_whole(char *out, size_t out_size, const char *text) {
+    if (out_size == 0) {
+        return false;
+    }
     size_t len = strlen(text);
     if (len >= out_size) {
         out[0] = '\0';
@@ -315,13 +321,48 @@ static void trim_trailing_space(char *s) {
     }
 }
 
+#ifndef _WIN32
+/* Read fd to EOF into buf. True only when all of it fit below buf_size: a
+ * full buffer means the file grew past the bound since it was measured. */
+static bool read_fd_bounded(int fd, char *buf, size_t buf_size, size_t *len_out) {
+    size_t len = 0;
+    while (len < buf_size) {
+        ssize_t got = read(fd, buf + len, buf_size - len);
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got < 0) {
+            return false;
+        }
+        if (got == 0) {
+            break;
+        }
+        len += (size_t)got;
+    }
+    *len_out = len;
+    return len < buf_size;
+}
+#endif
+
 /* Read a small regular file whole, NUL-terminated. False when the path is not
  * a regular file (a symlink is not followed), cannot be read, holds a NUL
- * byte, or does not fit buf — never a truncated prefix. */
+ * byte, or does not fit buf — never a truncated prefix.
+ *
+ * POSIX judges the file by the descriptor it reads: O_NOFOLLOW refuses a final
+ * symlink at open time and fstat() of that same descriptor decides "regular"
+ * and the size, so a file swapped for a symlink after the caller's lstat() is
+ * never read through. O_NONBLOCK keeps a FIFO from blocking the open; fstat()
+ * then rejects it. Windows keeps inspect-then-open (it has no O_NOFOLLOW, and
+ * this line ships no Windows build). */
 static bool read_small_regular_file(const char *path, char *buf, size_t buf_size) {
+    if (buf_size == 0) {
+        return false;
+    }
+    size_t n = 0;
+#ifdef _WIN32
     cbm_path_info_t info;
-    if (buf_size == 0 || cbm_path_info_utf8(path, &info) != CBM_PATH_INFO_OK || !info.is_regular ||
-        info.size < 0 || (uint64_t)info.size >= buf_size) {
+    if (cbm_path_info_utf8(path, &info) != CBM_PATH_INFO_OK || !info.is_regular || info.size < 0 ||
+        (uint64_t)info.size >= buf_size) {
         return false;
     }
     FILE *f = cbm_fopen(path, "rb");
@@ -329,9 +370,23 @@ static bool read_small_regular_file(const char *path, char *buf, size_t buf_size
         return false;
     }
     /* Ask for a full buffer: filling it means the file grew past the bound. */
-    size_t n = fread(buf, sizeof(char), buf_size, f);
+    n = fread(buf, sizeof(char), buf_size, f);
     bool complete = !ferror(f) && n < buf_size;
     fclose(f);
+#else
+    int flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = open(path, flags);
+    if (fd < 0) {
+        return false;
+    }
+    struct stat st;
+    bool complete = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
+                    (uint64_t)st.st_size < buf_size && read_fd_bounded(fd, buf, buf_size, &n);
+    (void)close(fd);
+#endif
     if (!complete || memchr(buf, '\0', n) != NULL) {
         return false;
     }
@@ -350,10 +405,11 @@ static bool dir_is_git_directory(const char *dir) {
 }
 
 /* The git directory a gitlink file (linked worktree, submodule) names, read
- * the way git's read_gitfile() reads it: "gitdir: <path>" with trailing
- * newlines dropped, a relative path taken from the directory holding the
- * file. The target must be a directory, and it is used as the git directory
- * itself — never read as a further gitlink. */
+ * the way git's read_gitfile_raw() reads it: "gitdir: <path>" with trailing
+ * '\n'/'\r' dropped and nothing else — trailing blanks stay in the path, so a
+ * gitlink git rejects is not accepted here either. A relative path is taken
+ * from the directory holding the file. The target must be a directory, and it
+ * is used as the git directory itself — never read as a further gitlink. */
 static bool gitlink_git_dir(const char *gitlink, const char *dir, char *out, size_t out_size) {
     char content[GIT_SMALL_FILE_MAX];
     if (!read_small_regular_file(gitlink, content, sizeof(content))) {
