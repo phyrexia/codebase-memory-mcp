@@ -2349,6 +2349,13 @@ static bool main_daemon_ctl_wait_for_ui(int port, const main_daemon_ctl_ui_readi
 static int main_daemon_ctl_finish_ui_open(cbm_daemon_runtime_client_t **client_io, int port,
                                           bool open_browser);
 
+/* A bare `daemon start` no longer turns a disabled UI on, so the way back is
+ * the switch itself. The daemon re-reads it about once a second, so it also
+ * takes effect on a daemon that is already running. */
+static void main_daemon_ctl_print_ui_disabled(void) {
+    printf("  ui: disabled (`codebase-memory-mcp config set ui_enabled true` enables it)\n");
+}
+
 static void main_daemon_ctl_print_ui_configuration(void) {
     if (!(CBM_EMBEDDED_FILE_COUNT > 0)) {
         return;
@@ -2360,7 +2367,7 @@ static void main_daemon_ctl_print_ui_configuration(void) {
                "`daemon start --open` verifies it)\n",
                ui_config.ui_port);
     } else {
-        printf("  ui: disabled (enable with `daemon start` in a UI build)\n");
+        main_daemon_ctl_print_ui_disabled();
     }
 }
 
@@ -2670,20 +2677,32 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     }
 
     /* The committed control connection satisfied the daemon's no-client
-     * startup window; configure the UI before departing. */
+     * startup window; configure the UI before departing.
+     *
+     * Only `--port`/`--open` make the UI the point of the command. A bare
+     * `daemon start` asks for a daemon, so a UI the operator switched off
+     * (`config set ui_enabled false`, #1558) stays off and the daemon is sent
+     * nothing: without --port the port would be the persisted one, so there is
+     * nothing to apply. This used to send enabled=true unconditionally, and the
+     * daemon persisted it, so every start quietly re-enabled the listener. */
+    bool ui_requested = requested_port > 0 || open_browser;
     int ui_port = 0;
     bool ui_configured = false;
+    bool ui_left_disabled = false;
     if ((CBM_EMBEDDED_FILE_COUNT > 0)) {
         cbm_ui_config_t ui_config;
         cbm_ui_config_load(&ui_config);
         ui_port = requested_port > 0 ? requested_port : ui_config.ui_port;
-        uint8_t update_mask = 0x03U; /* enabled + port */
-        bool context_set =
-            main_set_client_context(start_result.client, ".", CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL,
-                                    MAIN_CONNECT_TIMEOUT_MS);
-        ui_configured = context_set &&
-                        main_daemon_ctl_apply_ui_config(start_result.client, update_mask, ui_port);
-        if (!ui_configured) {
+        ui_left_disabled = !ui_requested && !ui_config.ui_enabled;
+        if (!ui_left_disabled) {
+            uint8_t update_mask = 0x03U; /* enabled + port */
+            bool context_set =
+                main_set_client_context(start_result.client, ".", CBM_MCP_TOOL_PROFILE_ALL, NULL,
+                                        NULL, MAIN_CONNECT_TIMEOUT_MS);
+            ui_configured = context_set && main_daemon_ctl_apply_ui_config(start_result.client,
+                                                                           update_mask, ui_port);
+        }
+        if (!ui_left_disabled && !ui_configured) {
             /* Reaching here means the daemon is up: the control connection above
              * already satisfied its startup window. Only the UI handshake — two
              * requests bounded by MAIN_CONNECT_TIMEOUT_MS — came back short.
@@ -2695,7 +2714,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
              * was in fact running and healthy. It also made a loaded machine look
              * like a broken one, because a second of scheduling delay after an
              * abrupt shutdown is enough to miss this handshake. */
-            if (requested_port > 0 || open_browser) {
+            if (ui_requested) {
                 (void)fprintf(stderr,
                               "error: the daemon did not accept the UI configuration; browser was "
                               "not opened\n");
@@ -2706,7 +2725,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
                           "warning: the daemon started but did not accept the UI configuration; "
                           "the UI is unavailable until the next `daemon start`\n");
         }
-    } else if (requested_port > 0 || open_browser) {
+    } else if (ui_requested) {
         (void)fprintf(stderr, "warning: this binary was built without UI support; "
                               "--port/--open have no effect\n");
     }
@@ -2721,8 +2740,11 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     }
     printf("It survives idle periods and session ends; `codebase-memory-mcp daemon stop` "
            "retires it.\n");
-    /* Skipped when the handshake was refused: that path announces the port as
-     * warming, which would be a promise nothing is keeping. */
+    if (ui_left_disabled) {
+        main_daemon_ctl_print_ui_disabled();
+    }
+    /* Skipped when the handshake was refused or never sent: that path announces
+     * the port as warming, which would be a promise nothing is keeping. */
     int ui_result =
         (CBM_EMBEDDED_FILE_COUNT > 0 && ui_configured)
             ? main_daemon_ctl_finish_ui_open(&start_result.client, ui_port, open_browser)

@@ -495,9 +495,22 @@ Current format:
 }
 ```
 
+Change it with the CLI rather than by editing the file:
+
+```bash
+codebase-memory-mcp config set ui_enabled false   # switch the loopback HTTP listener off
+codebase-memory-mcp config set ui_enabled true    # and back on
+codebase-memory-mcp config set ui_port 9750       # move it
+```
+
+The daemon re-reads this file about once a second, so a change reaches a
+running daemon without a restart: it closes or opens the listener on its own.
+
 Notes:
 
 - If a UI-enabled binary finds its verified external asset pack and no UI config file exists yet, the UI auto-enables on first run. Missing or invalid assets leave the MCP/daemon service available and keep the UI disabled.
+- `daemon start` respects `ui_enabled`. A plain `daemon start` leaves a disabled UI disabled — it neither opens the listener nor rewrites the setting, and reports `ui: disabled`. `daemon start --port=N` and `daemon start --open` ask for the UI explicitly: when they start the daemon they turn the UI on and persist `ui_enabled: true` (and, with `--port`, the new port). Against a daemon that is already running they do not change the setting; use `config set ui_enabled true` there.
+- When the listener cannot be created, the daemon log carries a `ui.unavailable` line whose `reason` names the step that failed: `in_use` (another socket holds the port — choose another with `--port=N` or `config set ui_port`), `bind_failed` (the bind was refused for another reason, such as a privileged or reserved port), `socket_failed` (the system refused a new socket: descriptor limit, sandbox, no IPv4) or `setup_failed`. `os_error` carries the `errno` (the Winsock error code on Windows). The daemon keeps retrying with backoff and logs each attempt as `ui.retry_scheduled`.
 - `CBM_CACHE_DIR` changes both the UI config location and the runtime settings database location.
 - CBM resolves `CBM_CACHE_DIR` to one canonical per-account cache root. A process configured with a different root fails while any CBM session or command is active; close them before switching roots.
 

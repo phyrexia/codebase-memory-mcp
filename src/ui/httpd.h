@@ -67,8 +67,32 @@ typedef struct {
 /* ── Listener lifecycle ───────────────────────────────────────── */
 
 /* Listen on 127.0.0.1:<port>. port 0 binds an ephemeral port (tests).
- * Returns NULL if the port is unavailable. */
+ * Returns NULL if no listener could be created; cbm_httpd_listen_ex says why. */
 cbm_httpd_t *cbm_httpd_listen(int port);
+
+/* The step at which a listen attempt stopped. Only IN_USE means another socket
+ * holds the port: a refused socket() is not cured by choosing another one. */
+typedef enum {
+    CBM_HTTPD_LISTEN_OK = 0,
+    CBM_HTTPD_LISTEN_SOCKET_FAILED, /* socket(): no descriptor left, sandbox, no IPv4 */
+    CBM_HTTPD_LISTEN_IN_USE,        /* EADDRINUSE from bind() or listen() */
+    CBM_HTTPD_LISTEN_BIND_FAILED,   /* any other bind() refusal: privileged/reserved port */
+    CBM_HTTPD_LISTEN_SETUP_FAILED,  /* listen(), non-blocking mode, getsockname, allocation */
+} cbm_httpd_listen_reason_t;
+
+typedef struct {
+    cbm_httpd_listen_reason_t reason;
+    /* errno on POSIX, WSAGetLastError() on Windows, read at the failing step; 0 on success. */
+    int os_error;
+} cbm_httpd_listen_failure_t;
+
+/* cbm_httpd_listen that also reports why it returned NULL. failure_out may be
+ * NULL; when given it is always written (reason OK on success). */
+cbm_httpd_t *cbm_httpd_listen_ex(int port, cbm_httpd_listen_failure_t *failure_out);
+
+/* Stable log token for a reason: "ok", "socket_failed", "in_use",
+ * "bind_failed" or "setup_failed". */
+const char *cbm_httpd_listen_reason_name(cbm_httpd_listen_reason_t reason);
 
 /* The actually-bound port (differs from the requested one for port 0). */
 int cbm_httpd_port(const cbm_httpd_t *d);
