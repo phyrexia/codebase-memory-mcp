@@ -2314,6 +2314,25 @@ static char *http_read_only_index_rejected(void *context, const char *repo_path,
                                true);
 }
 
+/* ui.unavailable names the step that failed. Every failure used to read
+ * reason=in_use with a hint to change ports, so a socket() the kernel refused
+ * (no descriptor left, a sandbox) sent the operator after a port conflict that
+ * did not exist. The hint now goes only with the failures a port change cures. */
+static void http_server_log_unavailable(int port, const cbm_httpd_listen_failure_t *failure) {
+    char port_str[16];
+    char error_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    snprintf(error_str, sizeof(error_str), "%d", failure->os_error);
+    const char *reason = cbm_httpd_listen_reason_name(failure->reason);
+    if (failure->reason == CBM_HTTPD_LISTEN_IN_USE ||
+        failure->reason == CBM_HTTPD_LISTEN_BIND_FAILED) {
+        cbm_log_warn("ui.unavailable", "port", port_str, "reason", reason, "os_error", error_str,
+                     "hint", "use --port=N to override");
+    } else {
+        cbm_log_warn("ui.unavailable", "port", port_str, "reason", reason, "os_error", error_str);
+    }
+}
+
 cbm_http_server_t *cbm_http_server_new(int port) {
     cbm_http_server_t *srv = calloc(1, sizeof(*srv));
     if (!srv)
@@ -2336,12 +2355,10 @@ cbm_http_server_t *cbm_http_server_new(int port) {
     cbm_mcp_server_set_index_executor(srv->mcp, http_read_only_index_rejected, srv);
 
     /* Bind to localhost only (httpd refuses anything else by construction) */
-    srv->listener = cbm_httpd_listen(port);
+    cbm_httpd_listen_failure_t listen_failure;
+    srv->listener = cbm_httpd_listen_ex(port, &listen_failure);
     if (!srv->listener) {
-        char port_str[16];
-        snprintf(port_str, sizeof(port_str), "%d", port);
-        cbm_log_warn("ui.unavailable", "port", port_str, "reason", "in_use", "hint",
-                     "use --port=N to override");
+        http_server_log_unavailable(port, &listen_failure);
         cbm_mcp_server_free(srv->mcp);
         free(srv);
         return NULL;

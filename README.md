@@ -141,6 +141,8 @@ codebase-memory-mcp --ui=true --port=9749
 
 Open `http://localhost:9749` in your browser. The UI is owned by the shared coordination daemon, so concurrent agent sessions do not start duplicate HTTP servers.
 
+To switch the loopback HTTP listener off, run `codebase-memory-mcp config set ui_enabled false` (`true` turns it back on; a running daemon picks the change up within a second). A plain `codebase-memory-mcp daemon start` respects that setting; only `daemon start --port=N` or `daemon start --open` turn the UI back on when they start the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#3-ui-settings).
+
 ### Auto-Index
 
 Enable automatic indexing on MCP session start:

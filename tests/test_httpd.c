@@ -53,7 +53,10 @@ typedef SOCKET th_sock_t;
 #define TH_SOCK_BAD INVALID_SOCKET
 #else
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/resource.h> /* RLIMIT_NOFILE: a socket() refused for want of a descriptor */
 #include <sys/socket.h>
 #include <sys/time.h> /* struct timeval for the SO_RCVTIMEO watchdog (#798 follow-up) */
 #include <sys/wait.h> /* fork/waitpid crash-isolation for the browse overflow guard */
@@ -1845,6 +1848,113 @@ TEST(ui_server_access_log_redacts_query) {
     PASS();
 }
 
+/* ui.unavailable has to name the step that failed. Every NULL from the
+ * listener used to be logged as reason=in_use with a "use --port=N" hint, so a
+ * socket() the kernel refused (no descriptor left, a sandbox, no IPv4) sent the
+ * operator hunting for a port conflict that did not exist — the Cortex E2E of
+ * 2026-10-12 read it that way. The child caps its descriptor table at its
+ * lowest free slot, so the listener's socket() is the call that meets EMFILE;
+ * the cap is process-wide, hence the fork. */
+TEST(ui_server_unavailable_names_socket_failure) {
+#ifdef _WIN32
+    SKIP_PLATFORM("RLIMIT_NOFILE exhaustion is POSIX-only; the reason mapping is shared");
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        httpd_log_buf[0] = '\0';
+        cbm_log_set_level(CBM_LOG_DEBUG);
+        cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+        cbm_log_set_sink_ex(httpd_capture_log, CBM_LOG_SINK_REPLACE);
+        int lowest_free = open("/dev/null", O_RDONLY);
+        struct rlimit limit;
+        if (lowest_free < 0 || close(lowest_free) != 0 || getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+            _exit(2);
+        }
+        limit.rlim_cur = (rlim_t)lowest_free;
+        if (setrlimit(RLIMIT_NOFILE, &limit) != 0) {
+            _exit(2);
+        }
+        cbm_http_server_t *server = cbm_http_server_new(0);
+        char os_error[32];
+        snprintf(os_error, sizeof(os_error), "os_error=%d", EMFILE);
+        if (server) {
+            _exit(3);
+        }
+        if (!strstr(httpd_log_buf, "msg=ui.unavailable")) {
+            _exit(4);
+        }
+        if (strstr(httpd_log_buf, "reason=in_use")) {
+            _exit(5);
+        }
+        if (strstr(httpd_log_buf, "--port=N")) {
+            _exit(6);
+        }
+        if (!strstr(httpd_log_buf, "reason=socket_failed")) {
+            _exit(7);
+        }
+        _exit(strstr(httpd_log_buf, os_error) ? 0 : 8);
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    if (WIFSIGNALED(status)) {
+        char m[96];
+        snprintf(m, sizeof(m), "listener probe killed by signal %d", WTERMSIG(status));
+        FAIL(m);
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    switch (WEXITSTATUS(status)) {
+    case 0:
+        PASS();
+    case 2:
+        FAIL("fixture: could not cap the child's descriptor table");
+    case 3:
+        FAIL("the UI server came up although socket() had no descriptor left");
+    case 4:
+        FAIL("a refused socket() was not reported as ui.unavailable");
+    case 5:
+        FAIL("ui.unavailable blamed an occupied port (reason=in_use) for a refused socket()");
+    case 6:
+        FAIL("ui.unavailable told the operator to change ports for a refused socket()");
+    case 7:
+        FAIL("ui.unavailable did not name the refused socket() as reason=socket_failed");
+    default:
+        FAIL("ui.unavailable did not carry the socket() errno (os_error=EMFILE)");
+    }
+#endif
+}
+
+/* The other half of the contract: a port that another socket holds is still
+ * reported as in_use, with the hint to pick another port. */
+TEST(ui_server_unavailable_names_port_in_use) {
+    cbm_http_server_t *holder = cbm_http_server_new(0);
+    ASSERT_NOT_NULL(holder);
+    int port = cbm_http_server_port(holder);
+
+    httpd_log_buf[0] = '\0';
+    CBMLogLevel prev_level = cbm_log_get_level();
+    CBMLogFormat prev_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_sink_ex(httpd_capture_log, CBM_LOG_SINK_REPLACE);
+    cbm_http_server_t *second = cbm_http_server_new(port);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_format(prev_format);
+    cbm_log_set_level(prev_level);
+
+    bool second_created = second != NULL;
+    if (second) {
+        (void)cbm_http_server_free(second);
+    }
+    ASSERT_TRUE(cbm_http_server_free(holder));
+    ASSERT_FALSE(second_created);
+    ASSERT_NOT_NULL(strstr(httpd_log_buf, "msg=ui.unavailable"));
+    ASSERT_NOT_NULL(strstr(httpd_log_buf, "reason=in_use"));
+    ASSERT_NOT_NULL(strstr(httpd_log_buf, "--port=N"));
+    PASS();
+}
+
 TEST(ui_server_stop_joins_cleanly) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -3425,6 +3535,8 @@ SUITE(httpd) {
     RUN_TEST(ui_server_ui_config_prefers_config_lang);
     RUN_TEST(ui_server_slow_request_hits_deadline);
     RUN_TEST(ui_server_access_log_redacts_query);
+    RUN_TEST(ui_server_unavailable_names_socket_failure);
+    RUN_TEST(ui_server_unavailable_names_port_in_use);
     RUN_TEST(ui_server_stop_joins_cleanly);
     RUN_TEST(ui_server_free_refuses_active_loop);
     RUN_TEST(ui_server_free_refuses_scheduled_run_before_child_starts);

@@ -5,6 +5,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/log.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "ui/config.h"
@@ -15,6 +16,7 @@
 #include "foundation/win_utf8.h"
 #endif
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +24,18 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #endif
+
+static char ui_log_buf[4096];
+
+static void ui_capture_log(const char *line) {
+    size_t used = strlen(ui_log_buf);
+    size_t avail = sizeof(ui_log_buf) - used;
+    if (avail <= 1)
+        return;
+    int n = snprintf(ui_log_buf + used, avail, "%s\n", line ? line : "");
+    if (n < 0 || (size_t)n >= avail)
+        ui_log_buf[sizeof(ui_log_buf) - 1] = '\0';
+}
 
 /* ── Config tests ─────────────────────────────────────────────── */
 
@@ -257,6 +271,79 @@ TEST(config_missing_fields) {
     }
 
     PASS();
+}
+
+/* An unreadable config.json is not an absent one. Only ENOENT means "no file
+ * yet" and lets a UI build auto-enable on first run; every other open failure
+ * used to take that same branch, so a UI the operator had switched off came
+ * back on in a UI build. It must load ui_enabled=false and say why, once,
+ * however often the daemon re-reads the file (about once a second).
+ * CBM_CACHE_DIR naming a regular file makes the open fail with ENOTDIR, which
+ * needs no privileges and works under root. This runner carries no UI assets,
+ * so ui_enabled reads false either way here; the log is what tells the
+ * branches apart, and tests/test_daemon_open_readiness.py (case
+ * unreadable-config) checks the UI build itself. */
+TEST(config_unreadable_file_loads_disabled_and_logs_once) {
+#ifdef _WIN32
+    SKIP_PLATFORM("a path through a regular file is ERROR_PATH_NOT_FOUND there, which is absent");
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_test_config_unreadable_XXXXXX");
+    char *td = cbm_mkdtemp(tmpdir);
+    ASSERT_NOT_NULL(td);
+    char not_a_directory[512];
+    snprintf(not_a_directory, sizeof(not_a_directory), "%s/cache-is-a-file", td);
+    FILE *f = fopen(not_a_directory, "w");
+    bool made = f != NULL && fputs("x", f) >= 0;
+    if (f && fclose(f) != 0) {
+        made = false;
+    }
+
+    char *old_cache = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
+    CBMLogLevel prev_level = cbm_log_get_level();
+    CBMLogFormat prev_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    /* An absent file first, so no unreadable episode from earlier is pending. */
+    (void)cbm_setenv("CBM_CACHE_DIR", td, 1);
+    cbm_ui_config_t absent;
+    cbm_ui_config_load(&absent);
+
+    ui_log_buf[0] = '\0';
+    cbm_log_set_sink_ex(ui_capture_log, CBM_LOG_SINK_REPLACE);
+    (void)cbm_setenv("CBM_CACHE_DIR", not_a_directory, 1);
+    cbm_ui_config_t first = {.ui_enabled = true, .ui_port = 1};
+    cbm_ui_config_t second = {.ui_enabled = true, .ui_port = 1};
+    cbm_ui_config_load(&first);
+    cbm_ui_config_load(&second);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_format(prev_format);
+    cbm_log_set_level(prev_level);
+
+    /* Restore before asserting: a leaked CBM_CACHE_DIR cascades into every
+     * later test in the process. */
+    if (old_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", old_cache, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(old_cache);
+    (void)th_rmtree(td);
+
+    ASSERT_TRUE(made);
+    ASSERT_FALSE(first.ui_enabled);
+    ASSERT_EQ(first.ui_port, CBM_UI_DEFAULT_PORT);
+    ASSERT_FALSE(second.ui_enabled);
+    char expected_error[32];
+    snprintf(expected_error, sizeof(expected_error), "os_error=%d", ENOTDIR);
+    const char *logged = strstr(ui_log_buf, "msg=ui.config.unreadable");
+    ASSERT_NOT_NULL(logged);
+    ASSERT_NOT_NULL(strstr(logged, expected_error));
+    ASSERT_NOT_NULL(strstr(logged, "cache-is-a-file/config.json"));
+    /* Two loads of the same failure, one line. */
+    ASSERT_NULL(strstr(logged + 1, "msg=ui.config.unreadable"));
+    PASS();
+#endif
 }
 
 /* ── Embedded asset tests ─────────────────────────────────────── */
@@ -869,6 +956,7 @@ SUITE(ui) {
     RUN_TEST(config_overwrite);
     RUN_TEST(config_corrupt_file);
     RUN_TEST(config_missing_fields);
+    RUN_TEST(config_unreadable_file_loads_disabled_and_logs_once);
 
     /* Embedded assets (stub) */
     RUN_TEST(embedded_lookup_not_found);
