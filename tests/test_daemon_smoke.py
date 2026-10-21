@@ -7,6 +7,14 @@ invocations may skip an occupied endpoint; the Make target requires a clean
 rendezvous and fails instead of reporting a false-green skip.
 Linux and macOS are covered; Windows named-pipe/mutex behavior remains covered
 by the deterministic C IPC/runtime tests.
+
+``--runtime-dir-resilience`` runs only the runtime-directory checks instead
+(D1: keepalive, orphan exit, already-served exit). Each scenario gets its own
+CBM_RUNTIME_DIR and CBM_CACHE_DIR, so that mode never touches the account-wide
+rendezvous and can run next to a live daemon. It needs a test-seam build:
+
+    make -f Makefile.cbm cbm TEST_SEAMS=1
+    python3 tests/test_daemon_smoke.py build/c/codebase-memory-mcp --runtime-dir-resilience
 """
 
 import hashlib
@@ -2391,8 +2399,378 @@ def main():
                     time.sleep(0.1)
 
 
+# ── D1: runtime-directory resilience (private rendezvous) ────────────────
+
+RUNTIME_DIR_FLAG = "--runtime-dir-resilience"
+EXIT_ALREADY_SERVED = 73
+EXIT_RUNTIME_DIR_ORPHANED = 75
+AGED_SECONDS = 10 * 24 * 3600
+FRESH_SECONDS = 2.0
+
+
+class PrivateDaemonRuntime:
+    """One scenario's own rendezvous, cache and home.
+
+    The permanent role is launched directly, the way a supervisor unit runs
+    it, so its exit status is the test's to read."""
+
+    def __init__(self, binary, root, extra_env=None):
+        self.binary = binary
+        self.root = root
+        runtime_parent = root / "rt"
+        cache = root / "cache"
+        home = root / "home"
+        for directory in (runtime_parent, cache, home):
+            directory.mkdir(mode=0o700)
+        self.runtime_dir = runtime_parent / ("cbm-daemon-" + str(os.geteuid()))
+        self.daemon_log = cache / "logs/cbm-daemon.log"
+        self.daemon_output = root / "daemon.out"
+        self.env = os.environ.copy()
+        for name in (
+            "CBM_TEST_DAEMON_RUNTIME_PARENT",
+            "CBM_TEST_KEEPALIVE_MS",
+            "CBM_TEST_NAMES_INTACT_MS",
+        ):
+            self.env.pop(name, None)
+        self.env.update(
+            {
+                "HOME": str(home),
+                "CBM_RUNTIME_DIR": str(runtime_parent),
+                "CBM_CACHE_DIR": str(cache),
+                "CBM_LOG_LEVEL": "info",
+                "CBM_LOG_FORMAT": "json",
+            }
+        )
+        self.env.update(extra_env or {})
+        self.process = None
+        self.output_stream = None
+
+    def name(self, suffix):
+        return self.runtime_dir / ("cbm-" + RENDEZVOUS_KEY + suffix)
+
+    def held_names(self):
+        """The five regular files a serving daemon holds open (D1 §A)."""
+        return [
+            self.name(".lifetime.lock"),
+            self.name(".lock"),
+            self.name(".sock.identity"),
+            self.runtime_dir / "cbm-version-cohort-daemon-v1.lock",
+            self.runtime_dir / "cbm-version-cohort-lifetime-v1.lock",
+        ]
+
+    def run(self, *arguments, timeout=15):
+        return subprocess.run(
+            [str(self.binary), *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self.env,
+            cwd=str(self.root),
+            timeout=timeout,
+            check=False,
+        )
+
+    def serving_pid(self):
+        """The pid `daemon status` reports, or None while nothing serves."""
+        result = self.run("daemon", "status")
+        if result.returncode != 0 or "daemon: active" not in result.stdout:
+            return None
+        for line in result.stdout.splitlines():
+            field = line.strip()
+            if field.startswith("pid:"):
+                try:
+                    return int(field.split(":", 1)[1])
+                except ValueError:
+                    return None
+        return None
+
+    def start_permanent(self):
+        self.output_stream = self.daemon_output.open("a", encoding="utf-8")
+        self.process = subprocess.Popen(
+            [str(self.binary), "--cbm-daemon-internal", "--cbm-daemon-permanent"],
+            stdin=subprocess.DEVNULL,
+            stdout=self.output_stream,
+            stderr=subprocess.STDOUT,
+            env=self.env,
+            cwd=str(self.root),
+        )
+        return self.process
+
+    def wait_serving(self):
+        wait_until(
+            lambda: self.serving_pid() is not None
+            and all(path.exists() for path in self.held_names()),
+            START_TIMEOUT,
+            "the private daemon to serve with all five held names",
+        )
+
+    def events(self, event):
+        return json_events(self.daemon_log, event)
+
+    def logged(self, event, field, value):
+        return any(record.get(field) == value for record in self.events(event))
+
+    def diagnostics(self):
+        parts = []
+        for path in (self.daemon_log, self.daemon_output):
+            if path.exists():
+                parts.append(
+                    "{}:\n{}".format(
+                        path.name, path.read_text(encoding="utf-8", errors="replace")
+                    )
+                )
+        return "\n".join(parts)
+
+    def cleanup(self):
+        try:
+            if self.runtime_dir.exists():
+                os.chmod(str(self.runtime_dir), 0o700)
+        except OSError:
+            pass
+        if self.process is not None and self.process.poll() is None:
+            try:
+                self.run("daemon", "stop", timeout=SHUTDOWN_TIMEOUT)
+                self.process.wait(timeout=SHUTDOWN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        if self.output_stream is not None:
+            self.output_stream.close()
+
+
+def age_to_days_ago(path):
+    aged = time.time() - AGED_SECONDS
+    os.utime(str(path), (aged, aged))
+
+
+def replace_like_a_cleaner(path):
+    """Unlink the name and leave a fresh empty file under it, as the next
+    process that wanted the lock does after a cleaner pass."""
+    os.unlink(str(path))
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    os.close(os.open(str(path), flags, 0o600))
+
+
+def test_permanent_daemon_refreshes_runtime_names_each_interval(binary, root):
+    """D1 §A: every held name is refreshed each keepalive interval (shortened
+    to 500 ms by the seam); the socket names are never touched."""
+    runtime = PrivateDaemonRuntime(binary, root, {"CBM_TEST_KEEPALIVE_MS": "500"})
+    try:
+        process = runtime.start_permanent()
+        runtime.wait_serving()
+        sockets = (runtime.name(".sock"), runtime.name(".anc"))
+        sockets_before = {path: os.lstat(str(path)) for path in sockets}
+        # os.utime raises on failure; a refresh racing this loop only makes the
+        # wait below observe a later one.
+        for path in runtime.held_names():
+            age_to_days_ago(path)
+        wait_until(
+            lambda: all(
+                os.stat(str(path)).st_mtime >= time.time() - FRESH_SECONDS
+                for path in runtime.held_names()
+            ),
+            3.0,
+            "the daemon to refresh every held runtime name",
+        )
+        for path, before in sockets_before.items():
+            after = os.lstat(str(path))
+            check(
+                after.st_ino == before.st_ino and after.st_ctime_ns == before.st_ctime_ns,
+                "keepalive touched the socket name " + path.name,
+            )
+        check(process.poll() is None, "the daemon exited while refreshing its names")
+        check(
+            not runtime.events("daemon.runtime_dir.keepalive_failed"),
+            "keepalive reported a failure",
+        )
+        stopped = runtime.run("daemon", "stop", timeout=SHUTDOWN_TIMEOUT)
+        check(stopped.returncode == 0, "daemon stop failed: " + stopped.stdout + stopped.stderr)
+        check(process.wait(timeout=SHUTDOWN_TIMEOUT) == 0, "daemon stop no longer exits 0")
+    except (SmokeFailure, subprocess.TimeoutExpired, OSError):
+        print(runtime.diagnostics(), file=sys.stderr)
+        raise
+    finally:
+        runtime.cleanup()
+
+
+def test_permanent_daemon_exits_within_2s_when_lifetime_lock_is_replaced(binary, root):
+    """D1 §B: the incident of 2026-10-15. The daemon notices within a check
+    period, stops serving, removes only the names that are still its own and
+    exits 75; the next command does not wait out a 30 s budget."""
+    runtime = PrivateDaemonRuntime(binary, root)
+    try:
+        process = runtime.start_permanent()
+        runtime.wait_serving()
+        replace_like_a_cleaner(runtime.name(".lifetime.lock"))
+        try:
+            code = process.wait(timeout=3.0)
+        except subprocess.TimeoutExpired as exc:
+            raise SmokeFailure(
+                "the daemon kept serving 3 s after its lifetime lock was replaced"
+            ) from exc
+        check(code == EXIT_RUNTIME_DIR_ORPHANED, "orphaned daemon exited {}".format(code))
+        check(
+            runtime.logged("daemon.runtime_dir.orphaned", "detail", "lifetime_replaced"),
+            "no daemon.runtime_dir.orphaned detail=lifetime_replaced",
+        )
+        check(
+            runtime.logged("daemon.lifetime_end", "reason", "runtime_dir_orphaned"),
+            "no daemon.lifetime_end reason=runtime_dir_orphaned",
+        )
+        for suffix in (".sock", ".anc", ".sock.identity"):
+            check(
+                not os.path.lexists(str(runtime.name(suffix))),
+                "the orphaned daemon left its " + suffix + " behind",
+            )
+        started = time.monotonic()
+        listed = runtime.run("cli", "--json", "list_projects", timeout=15)
+        elapsed = time.monotonic() - started
+        check(listed.returncode == 0, "cli after the orphan exit failed: " + listed.stderr)
+        json.loads(listed.stdout)
+        check(elapsed < 8.0, "cli after the orphan exit took {:.1f} s".format(elapsed))
+    except (SmokeFailure, subprocess.TimeoutExpired, OSError, ValueError):
+        print(runtime.diagnostics(), file=sys.stderr)
+        raise
+    finally:
+        runtime.cleanup()
+
+
+def test_permanent_daemon_tolerates_one_io_observation_and_exits_after_two(binary, root):
+    """D1 §B hysteresis: a check that cannot read the runtime directory once
+    is forgiven; two in a row end the generation with 75. The check period is
+    2 s here, so a 1 s revocation can hold at most one observation and a 6 s
+    one holds at least two."""
+    runtime = PrivateDaemonRuntime(binary, root, {"CBM_TEST_NAMES_INTACT_MS": "2000"})
+    try:
+        process = runtime.start_permanent()
+        runtime.wait_serving()
+        served_pid = runtime.serving_pid()
+        os.chmod(str(runtime.runtime_dir), 0)
+        try:
+            time.sleep(1.0)
+        finally:
+            os.chmod(str(runtime.runtime_dir), 0o700)
+        time.sleep(4.5)
+        check(process.poll() is None, "a single IO observation ended the generation")
+        check(runtime.serving_pid() == served_pid, "the daemon stopped serving after one IO")
+        check(
+            not runtime.events("daemon.runtime_dir.orphaned"),
+            "a single IO observation was reported as orphaned",
+        )
+        os.chmod(str(runtime.runtime_dir), 0)
+        try:
+            code = process.wait(timeout=8.0)
+        except subprocess.TimeoutExpired:
+            code = None
+        finally:
+            os.chmod(str(runtime.runtime_dir), 0o700)
+        check(code == EXIT_RUNTIME_DIR_ORPHANED, "two IO observations exited {}".format(code))
+        check(
+            runtime.logged("daemon.runtime_dir.orphaned", "detail", "io"),
+            "no daemon.runtime_dir.orphaned detail=io",
+        )
+    except (SmokeFailure, subprocess.TimeoutExpired, OSError):
+        print(runtime.diagnostics(), file=sys.stderr)
+        raise
+    finally:
+        runtime.cleanup()
+
+
+def test_second_daemon_exits_73_when_a_generation_already_serves(binary, root):
+    """D1 §E: with a client-launched (session-managed) generation serving, a
+    permanent daemon started by hand, as a supervisor unit does, retires in
+    well under the 12 s claim window with 73 and leaves the first serving."""
+    runtime = PrivateDaemonRuntime(binary, root)
+    clients = []
+    initialize_params = {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "cbm-runtime-dir-smoke", "version": "1"},
+    }
+    try:
+        start_ready_mcp_client(
+            binary,
+            runtime.env,
+            root / "session-client.err",
+            clients,
+            initialize_params,
+            9101,
+            "session-managed client",
+        )
+        wait_until(
+            lambda: runtime.serving_pid() is not None,
+            START_TIMEOUT,
+            "the session-managed daemon to serve",
+        )
+        served_pid = runtime.serving_pid()
+        check(
+            "session-managed" in runtime.run("daemon", "status").stdout,
+            "the client-launched daemon is not session-managed",
+        )
+        second = runtime.start_permanent()
+        try:
+            code = second.wait(timeout=5.0)
+        except subprocess.TimeoutExpired as exc:
+            raise SmokeFailure("the second daemon was still waiting 5 s after start") from exc
+        check(code == EXIT_ALREADY_SERVED, "the second daemon exited {}".format(code))
+        skipped = [
+            record
+            for record in runtime.events("daemon.start_skipped")
+            if record.get("reason") == "generation_already_served"
+        ]
+        check(
+            any(record.get("pid") == str(served_pid) for record in skipped),
+            "no daemon.start_skipped naming pid {}".format(served_pid),
+        )
+        check(runtime.serving_pid() == served_pid, "the first generation stopped serving")
+    except (SmokeFailure, subprocess.TimeoutExpired, OSError):
+        print(runtime.diagnostics(), file=sys.stderr)
+        raise
+    finally:
+        for client in clients:
+            client.cleanup()
+        try:
+            wait_until(
+                lambda: runtime.serving_pid() is None,
+                SHUTDOWN_TIMEOUT,
+                "the session-managed daemon to retire with its client",
+            )
+        finally:
+            runtime.cleanup()
+
+
+def main_runtime_dir_resilience(binary):
+    if os.name == "nt" or sys.platform.startswith(("cygwin", "msys")):
+        print("SKIP: runtime-directory resilience covers POSIX runtime files only")
+        return 0
+    binary = Path(binary).resolve()
+    check(binary.is_file() and os.access(binary, os.X_OK), "missing executable: " + str(binary))
+    # Keep socket paths short: sockaddr_un caps them at 104 bytes on macOS.
+    short_root = "/private/tmp" if sys.platform == "darwin" else "/tmp"
+    scenarios = (
+        test_permanent_daemon_refreshes_runtime_names_each_interval,
+        test_permanent_daemon_exits_within_2s_when_lifetime_lock_is_replaced,
+        test_permanent_daemon_tolerates_one_io_observation_and_exits_after_two,
+        test_second_daemon_exits_73_when_a_generation_already_serves,
+    )
+    for scenario in scenarios:
+        with tempfile.TemporaryDirectory(prefix="cbm-rtdir-", dir=short_root) as raw_root:
+            scenario(binary, Path(raw_root))
+        print("ok: " + scenario.__name__)
+    print("GREEN: runtime-directory resilience")
+    return 0
+
+
 if __name__ == "__main__":
     try:
+        if RUNTIME_DIR_FLAG in sys.argv[1:]:
+            positional = [argument for argument in sys.argv[1:] if argument != RUNTIME_DIR_FLAG]
+            default_binary = Path(__file__).resolve().parent.parent / "build/c/codebase-memory-mcp"
+            raise SystemExit(
+                main_runtime_dir_resilience(positional[0] if positional else default_binary)
+            )
         raise SystemExit(main())
     except (SmokeFailure, subprocess.TimeoutExpired, ValueError) as exc:
         print("FAIL: " + str(exc), file=sys.stderr)
