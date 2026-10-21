@@ -1022,17 +1022,25 @@ static bool fingerprint_identity_windows(HANDLE file, fingerprint_file_identity_
     return true;
 }
 
+/* CreateFileW on a UTF-8 path. cbm_path_to_wide() allocates with raw malloc,
+ * so its result is released raw -- here, once, for every caller that widens a
+ * path only to open it. INVALID_HANDLE_VALUE when the path cannot be widened. */
+static HANDLE windows_open_utf8(const char *path, DWORD access, DWORD share, DWORD disposition,
+                                DWORD flags) {
+    wchar_t *wide = cbm_path_to_wide(path);
+    if (!wide) {
+        return INVALID_HANDLE_VALUE;
+    }
+    HANDLE file = CreateFileW(wide, access, share, NULL, disposition, flags, NULL);
+    free(wide);
+    return file;
+}
+
 static bool fingerprint_cache_write_tmp(const char *tmp_path, const char *data, size_t length) {
     /* CREATE_NEW makes the name a claim only this call holds; a collision (a
      * concurrent store, a crash leftover on a wrapped sequence) fails without
      * touching the file because it may not be ours. */
-    wchar_t *wide = cbm_path_to_wide(tmp_path);
-    if (!wide) {
-        return false;
-    }
-    HANDLE file =
-        CreateFileW(wide, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-    free(wide);
+    HANDLE file = windows_open_utf8(tmp_path, GENERIC_WRITE, 0, CREATE_NEW, FILE_ATTRIBUTE_NORMAL);
     if (file == INVALID_HANDLE_VALUE) {
         return false;
     }
@@ -1139,14 +1147,9 @@ bool cbm_daemon_build_fingerprint_file(const char *path,
     if (!bounded_length(path, DAEMON_SERVICE_PATH_CAP, &path_length) || path_length == 0) {
         return false;
     }
-    wchar_t *wide = cbm_path_to_wide(path);
-    if (!wide) {
-        return false;
-    }
     HANDLE file =
-        CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    free(wide);
+        windows_open_utf8(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, OPEN_EXISTING,
+                          FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
     bool ok = file != INVALID_HANDLE_VALUE;
     /* open/close is this wrapper's whole job: the hash and the cache decision
      * live in native_file, keyed by the identity of the handle passed here. */

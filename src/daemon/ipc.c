@@ -9,6 +9,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/macos_acl.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "foundation/private_file_lock_internal.h"
 #include "foundation/sha256.h"
@@ -3086,7 +3087,7 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         ipc_listen_failed(runtime_dir, "socket_creation", errno, NULL);
         return NULL;
     }
-    cbm_daemon_ipc_listener_t *listener = calloc(1, sizeof(*listener));
+    cbm_daemon_ipc_listener_t *listener = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*listener));
     if (!listener) {
         ipc_listen_failed(runtime_dir, "listener_allocation", ENOMEM, NULL);
         (void)close(fd);
@@ -3110,7 +3111,7 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         }
         cbm_mutex_destroy(&listener->wake_mutex);
         (void)close(fd);
-        free(listener);
+        cbm_free(CBM_MEM_CLASS_OTHER, listener);
         return NULL;
     }
     listener->wake_read_fd = wake_fds[0];
@@ -3143,7 +3144,7 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         free(listener->socket_anchor_name);
         free(listener->socket_identity_name);
         free(listener->socket_pending_name);
-        free(listener);
+        cbm_free(CBM_MEM_CLASS_OTHER, listener);
         return NULL;
     }
 
@@ -3419,7 +3420,7 @@ void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener) {
     free(listener->socket_anchor_name);
     free(listener->socket_identity_name);
     free(listener->socket_pending_name);
-    free(listener);
+    cbm_free(CBM_MEM_CLASS_OTHER, listener);
 }
 
 bool cbm_daemon_ipc_listener_interrupt(cbm_daemon_ipc_listener_t *listener) {
