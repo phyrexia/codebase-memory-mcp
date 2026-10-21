@@ -308,6 +308,37 @@ bool cbm_daemon_ipc_listener_keepalive(const cbm_daemon_ipc_listener_t *listener
 bool cbm_daemon_ipc_participant_guard_keepalive(const cbm_daemon_ipc_participant_guard_t *guard,
                                                 cbm_daemon_ipc_keepalive_failure_t *failure_out);
 
+/* names_intact compares what each held descriptor is with what its name
+ * resolves to now (no-follow, retrying EINTR); it opens, locks and changes
+ * nothing it does not already hold. A discrepancy of inode is terminal: the
+ * name was removed or replaced under a live generation, which other processes
+ * can then no longer prove alive. IO means the runtime directory could not be
+ * inspected or no longer validates as the private directory this generation
+ * opened (mode, owner, or the path no longer naming it), which a caller may
+ * treat as transient. The listener checks its lifetime reservation, `.sock`
+ * and `.anc` (the inode it bound), the identity record (inode and the
+ * encoded socket identity, ctime included) and, when listen() gave it one,
+ * its participant guard. The guard check needs the endpoint for the
+ * directory. Windows reports INTACT for a live owner (see keepalive). */
+typedef enum {
+    CBM_DAEMON_IPC_NAMES_INTACT = 0,
+    CBM_DAEMON_IPC_NAMES_LIFETIME_REPLACED = 1,
+    CBM_DAEMON_IPC_NAMES_SOCKET_MISSING = 2,
+    CBM_DAEMON_IPC_NAMES_IDENTITY_MISSING = 3,
+    CBM_DAEMON_IPC_NAMES_PARTICIPANT_REPLACED = 4,
+    CBM_DAEMON_IPC_NAMES_COHORT_MARKER_REPLACED = 5,
+    CBM_DAEMON_IPC_NAMES_COHORT_RECORD_REPLACED = 6,
+    CBM_DAEMON_IPC_NAMES_IO = 7,
+} cbm_daemon_ipc_names_state_t;
+/* Stable lowercase name for logs: "intact", "lifetime_replaced",
+ * "socket_missing", "identity_missing", "participant_lock_replaced",
+ * "cohort_marker_replaced", "cohort_record_replaced", "io". */
+const char *cbm_daemon_ipc_names_state_name(cbm_daemon_ipc_names_state_t state);
+cbm_daemon_ipc_names_state_t cbm_daemon_ipc_listener_names_intact(
+    const cbm_daemon_ipc_listener_t *listener);
+cbm_daemon_ipc_names_state_t cbm_daemon_ipc_participant_guard_names_intact(
+    const cbm_daemon_ipc_participant_guard_t *guard, const cbm_daemon_ipc_endpoint_t *endpoint);
+
 /* Standalone CLI work joins the legacy-compatible current participant group
  * without becoming a daemon client. Acquisition retains startup-v2 only for
  * the seal/presence decision. Sealing also retains a participant claim:

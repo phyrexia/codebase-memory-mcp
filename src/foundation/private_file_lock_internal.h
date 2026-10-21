@@ -71,6 +71,20 @@ cbm_private_file_lock_status_t cbm_private_file_lock_payload_write(cbm_private_f
  * unlink one under its holder; there touch only validates the lock. */
 bool cbm_private_file_lock_touch(const cbm_private_file_lock_t *lock, int *errno_out);
 
+/* Whether base_name inside directory still names the inode this lock holds:
+ * HELD when it does, REPLACED when the name is gone or now names another
+ * file, IO when either side cannot be observed. Observation only: nothing is
+ * opened, locked or modified. Windows reports HELD for a live lock, which no
+ * cleaner can unlink there (see touch). */
+typedef enum {
+    CBM_PRIVATE_FILE_LOCK_NAME_HELD = 0,
+    CBM_PRIVATE_FILE_LOCK_NAME_REPLACED = 1,
+    CBM_PRIVATE_FILE_LOCK_NAME_IO = 2,
+} cbm_private_file_lock_name_state_t;
+cbm_private_file_lock_name_state_t cbm_private_file_lock_name_state(
+    const cbm_private_file_lock_t *lock, const cbm_private_lock_directory_t *directory,
+    const char *base_name);
+
 /* Forces the next successfully acquired native lock down the post-lock
  * validation cleanup path and injects pre-call release failures there. */
 bool cbm_private_lock_directory_fail_post_acquire_cleanup_for_test(

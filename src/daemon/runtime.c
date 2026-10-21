@@ -3032,6 +3032,23 @@ bool cbm_daemon_runtime_service_stop(cbm_daemon_runtime_service_t *service, uint
     return cbm_daemon_runtime_service_wait_exited(service, timeout_ms);
 }
 
+void cbm_daemon_runtime_service_begin_stop(cbm_daemon_runtime_service_t *service,
+                                           uint32_t timeout_ms, const char *reason) {
+    if (!service) {
+        return;
+    }
+    uint64_t deadline = runtime_deadline_after(timeout_ms);
+    cbm_mutex_lock(&service->mutex);
+    if (service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING) {
+        /* Same exit criterion as `daemon stop`: a permanent coordinator never
+         * turns client-terminal, so resource emptiness completes the stop. */
+        service->activation_shutdown_requested = true;
+    }
+    runtime_service_begin_stopping_locked(service, deadline, false, reason);
+    cbm_mutex_unlock(&service->mutex);
+    runtime_service_interrupt_connections(service);
+}
+
 bool cbm_daemon_runtime_service_free(cbm_daemon_runtime_service_t *service) {
     if (!service ||
         cbm_daemon_runtime_service_state(service) != CBM_DAEMON_RUNTIME_SERVICE_EXITED) {

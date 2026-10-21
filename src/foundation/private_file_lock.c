@@ -502,6 +502,34 @@ bool cbm_private_file_lock_touch(const cbm_private_file_lock_t *lock, int *errno
     return result == 0;
 }
 
+cbm_private_file_lock_name_state_t cbm_private_file_lock_name_state(
+    const cbm_private_file_lock_t *lock, const cbm_private_lock_directory_t *directory,
+    const char *base_name) {
+    if (!lock || lock->fd < 0 || lock->unlocked || !directory || directory->fd < 0 ||
+        !private_base_name_valid(base_name)) {
+        return CBM_PRIVATE_FILE_LOCK_NAME_IO;
+    }
+    struct stat held;
+    struct stat named;
+    int result;
+    do {
+        result = fstat(lock->fd, &held);
+    } while (result != 0 && errno == EINTR);
+    if (result != 0) {
+        return CBM_PRIVATE_FILE_LOCK_NAME_IO;
+    }
+    do {
+        result = fstatat(directory->fd, base_name, &named, AT_SYMLINK_NOFOLLOW);
+    } while (result != 0 && errno == EINTR);
+    if (result != 0) {
+        return errno == ENOENT ? CBM_PRIVATE_FILE_LOCK_NAME_REPLACED
+                               : CBM_PRIVATE_FILE_LOCK_NAME_IO;
+    }
+    return named.st_dev == held.st_dev && named.st_ino == held.st_ino
+               ? CBM_PRIVATE_FILE_LOCK_NAME_HELD
+               : CBM_PRIVATE_FILE_LOCK_NAME_REPLACED;
+}
+
 cbm_private_file_lock_status_t cbm_private_file_lock_release(cbm_private_file_lock_t **lock_io) {
     if (!lock_io || !*lock_io) {
         return CBM_PRIVATE_FILE_LOCK_IO;
@@ -1477,6 +1505,15 @@ bool cbm_private_file_lock_touch(const cbm_private_file_lock_t *lock, int *errno
         *errno_out = 0;
     }
     return lock && lock->handle != INVALID_HANDLE_VALUE && !lock->unlocked;
+}
+
+cbm_private_file_lock_name_state_t cbm_private_file_lock_name_state(
+    const cbm_private_file_lock_t *lock, const cbm_private_lock_directory_t *directory,
+    const char *base_name) {
+    (void)base_name;
+    return lock && directory && lock->handle != INVALID_HANDLE_VALUE && !lock->unlocked
+               ? CBM_PRIVATE_FILE_LOCK_NAME_HELD
+               : CBM_PRIVATE_FILE_LOCK_NAME_IO;
 }
 
 static bool private_win_release_unlock(cbm_private_file_lock_t *lock) {

@@ -455,6 +455,16 @@ bool cbm_daemon_runtime_service_job_reaped(cbm_daemon_runtime_service_t *service
  * final disconnect makes STOPPING terminal, drains/reaps within the configured
  * bound, and exits automatically. stop is itself bounded by timeout_ms. */
 bool cbm_daemon_runtime_service_stop(cbm_daemon_runtime_service_t *service, uint32_t timeout_ms);
+/* Begin the ordinary, non-emergency stop `daemon stop` uses, on the host's own
+ * initiative, and name why in daemon.runtime_stopping. Admission ends at
+ * once; every live connection is interrupted, so an in-flight application
+ * request is cancelled (cooperatively, through its session) rather than
+ * answered; workers and cancelled jobs then get up to timeout_ms to unwind,
+ * and resource emptiness completes the stop for a permanent generation too.
+ * Returns immediately; observe the end with state or wait_exited. A service
+ * that is already stopping keeps its earlier deadline. */
+void cbm_daemon_runtime_service_begin_stop(cbm_daemon_runtime_service_t *service,
+                                           uint32_t timeout_ms, const char *reason);
 /* Before wait_exited or a successful stop this returns false without teardown.
  * Otherwise it returns true only after every thread is joined, the owned
  * participant guard is released, and the service allocation is destroyed. A

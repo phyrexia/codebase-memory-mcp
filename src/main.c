@@ -3201,7 +3201,8 @@ int main(int argc, char **argv) {
         };
         int result = cbm_daemon_host_run(&host_config);
         cbm_daemon_ipc_endpoint_free(endpoint);
-        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+        /* 0 and the supervisor-facing statuses in host.h pass through. */
+        return result < 0 ? EXIT_FAILURE : result;
     }
 
 #ifdef CBM_ENABLE_TEST_SEAMS

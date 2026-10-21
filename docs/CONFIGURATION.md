@@ -642,17 +642,27 @@ leave live sockets alone. A refresh that fails is logged once as
 `daemon.runtime_dir.keepalive_failed name=<file> errno=<code>`, and the daemon
 keeps serving.
 
-If a cleaner unlinks and recreates `cbm-<key>.lifetime.lock` anyway, the daemon
-keeps its lock on the deleted file, so other CBM processes can no longer see
+If a name is removed or replaced anyway — a cleaner pass the refresh lost to,
+or a manual `rm` — the daemon notices within a second: it compares every file
+it holds with what the name resolves to now. It logs
+`daemon.runtime_dir.orphaned detail=<what>` (`lifetime_replaced`,
+`socket_missing`, `identity_missing`, `participant_lock_replaced`,
+`cohort_marker_replaced`, `cohort_record_replaced`, or `io` when two checks in
+a row could not inspect the directory), stops admitting sessions, cancels the
+requests in flight, removes only the names that are still its own and exits
+with status 75 (`EX_TEMPFAIL`), so a fresh generation takes over: the next
+session or command starts one, or the supervisor restarts it. Until then, a
+`cbm-<key>.lifetime.lock` that was unlinked and recreated leaves the daemon
+holding its lock on the deleted file, so other CBM processes can no longer see
 that it is alive. A CLI command or index worker that then finds the lock free
 still asks the daemon's socket before it removes anything: when a listener
 answers, every name stays in place, the process logs
 `daemon.ipc.stale_cleanup_preserved socket=anchor listener=answered lifetime_lock=unheld`,
 and it refuses to start, reporting that a pre-coordination or unverified CBM
-generation is active. Restart the daemon to give it a fresh lock (close its
-sessions, run `codebase-memory-mcp daemon stop`, and let the next session start
-it), and exclude the directory from the cleaner — on systemd hosts, an
-`x /tmp/cbm-daemon-*` line in `/etc/tmpfiles.d/`.
+generation is active; retry once the daemon has left. Excluding the directory
+from the cleaner remains the first line of defence and also protects older
+binaries — on systemd hosts, an `x /tmp/cbm-daemon-*` line in
+`/etc/tmpfiles.d/`, placed before any rule that ages `/tmp`.
 
 Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
 
