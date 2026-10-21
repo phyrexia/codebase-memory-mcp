@@ -25,9 +25,23 @@ performed and the two negative cases can use a short deterministic deadline:
     make -f Makefile.cbm cbm-with-ui TEST_SEAMS=1 BUILD_DIR=build/ui-open-test
     python3 tests/test_daemon_open_readiness.py build/ui-open-test/codebase-memory-mcp
 
+``--case NAME`` (repeatable) runs only the named cases, in their usual order:
+delayed-open, foreign-port, active-open, off-bare, off-port, off-open.
+``--keep-logs DIR`` copies every case's ``<cache>/logs`` (``cbm-daemon.log``
+and the conflict/activation records) into ``DIR/<cache>/logs`` before the work
+directory is removed, whether the run passed or not. The caches are, in case
+order: cache-delayed, cache-occupied, cache-active, cache-off-bare,
+cache-off-port, cache-off-open.
+
+The work directory lives under the system temp directory (``TMPDIR`` on
+Linux), and the daemon's private-directory check applies to its ancestry: no
+group- or world-writable ancestor other than a root-owned sticky one such as
+``/tmp``.
+
 Exit code: 0 == green, 1 == behavior regression, 2 == fixture/setup error.
 """
 
+import argparse
 import os
 import re
 import shutil
@@ -43,6 +57,19 @@ import time
 OPEN_MARKER_ENV = "CBM_TEST_DAEMON_OPEN_MARKER"
 READY_TIMEOUT_ENV = "CBM_TEST_DAEMON_UI_READY_TIMEOUT_MS"
 RUNTIME_PARENT_ENV = "CBM_TEST_DAEMON_RUNTIME_PARENT"
+
+# Every invocation of the binary hashes its whole executable image before it
+# does anything else (src/main.c main_build_identity -> the SHA-256 build
+# fingerprint, hundreds of MB in a UI build). On a loaded Linux runner that
+# alone outlasted the 2-3 s the status probes here used to allow, so every
+# `daemon status` was killed before it could answer and the first case never
+# saw the daemon it had just started. One-shot commands get this budget; the
+# waits that are bounded on purpose keep their own short values.
+CLI_TIMEOUT_S = 60
+# The longest UI readiness wait the test seam accepts
+# (MAIN_DAEMON_CTL_UI_READY_TIMEOUT_MS). Success paths must outlast one status
+# probe of the cost above plus the daemon's bind-retry backoff (1, 2, 4, 8 s).
+READY_TIMEOUT_MS = 30000
 
 
 def output_text(result):
@@ -66,14 +93,15 @@ def force_kill(pid):
 def stop_daemon(binary, env, pid):
     stopped = False
     try:
-        subprocess.run([binary, "daemon", "stop"], capture_output=True, timeout=30, env=env)
+        subprocess.run([binary, "daemon", "stop"], capture_output=True, timeout=CLI_TIMEOUT_S,
+                       env=env)
     except (OSError, subprocess.TimeoutExpired):
         pass
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + CLI_TIMEOUT_S
     while time.monotonic() < deadline:
         try:
             status = subprocess.run([binary, "daemon", "status"], capture_output=True,
-                                    timeout=2, env=env)
+                                    timeout=CLI_TIMEOUT_S, env=env)
             if status.returncode != 0 and "not running" in output_text(status):
                 stopped = True
                 break
@@ -179,21 +207,33 @@ def launch_start(binary, work, cache, marker, port, timeout_ms):
     return process, env
 
 
-def collect(process, timeout=30):
+def collect(process, timeout=CLI_TIMEOUT_S):
     stdout, stderr = process.communicate(timeout=timeout)
     result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
     return result, output_text(result)
 
 
-def wait_daemon_active(binary, env, process, timeout=10):
+def wait_daemon_active(binary, env, process, cache, timeout=2 * CLI_TIMEOUT_S):
     deadline = time.monotonic() + timeout
     last_probe = "status probe was not attempted"
+    # The daemon opens <cache>/logs/cbm-daemon.log early in its startup. Until
+    # it exists a status probe can only report "not running", and at a full
+    # executable hash per probe that wasted probe is what pushes the release
+    # of the blocked port past the daemon's next bind retry.
+    daemon_log = os.path.join(cache, "logs", "cbm-daemon.log")
+    while not os.path.exists(daemon_log):
+        if process.poll() is not None:
+            return False
+        if time.monotonic() >= deadline:
+            print("diagnostic: the daemon never opened %s" % daemon_log)
+            return False
+        time.sleep(0.05)
     while time.monotonic() < deadline:
         if process.poll() is not None:
             return False
         try:
             status = subprocess.run([binary, "daemon", "status"], capture_output=True,
-                                    timeout=2, env=env)
+                                    timeout=CLI_TIMEOUT_S, env=env)
             last_probe = "status rc=%d: %s" % (status.returncode, output_text(status)[:600])
         except subprocess.TimeoutExpired as timeout_error:
             # The starter may still own the short bootstrap handoff. A timed
@@ -213,10 +253,10 @@ def assert_delayed_success(binary, work):
     cache = os.path.join(work, "cache-delayed")
     marker = os.path.join(work, "browser-delayed.txt")
     blocker, port = occupied_loopback_port()
-    process, env = launch_start(binary, work, cache, marker, port, 10000)
+    process, env = launch_start(binary, work, cache, marker, port, READY_TIMEOUT_MS)
     daemon_pid = 0
     try:
-        if not wait_daemon_active(binary, env, process):
+        if not wait_daemon_active(binary, env, process, cache):
             result, text = collect(process)
             daemon_pid = pid_from(text)
             print("RED: daemon control service never became active during --open:\n%s"
@@ -237,7 +277,7 @@ def assert_delayed_success(binary, work):
         # Releasing the port lets the background retry publish the real CBM UI.
         blocker.close()
         blocker = None
-        result, text = collect(process, timeout=25)
+        result, text = collect(process)
         daemon_pid = pid_from(text)
         expected_url = "http://127.0.0.1:%d" % port
         marker_text = ""
@@ -268,7 +308,7 @@ def assert_bounded_foreign_port_failure(binary, work):
     process, env = launch_start(binary, work, cache, marker, port, 900)
     daemon_pid = 0
     try:
-        result, text = collect(process, timeout=10)
+        result, text = collect(process)
         daemon_pid = pid_from(text)
         url = "http://127.0.0.1:%d" % port
         if (result.returncode == 0 or os.path.exists(marker) or url in text or
@@ -278,7 +318,7 @@ def assert_bounded_foreign_port_failure(binary, work):
             return False
         request_count = blocker.request_count
         status = subprocess.run([binary, "daemon", "status"], capture_output=True,
-                                timeout=3, env=env)
+                                timeout=CLI_TIMEOUT_S, env=env)
         status_text = output_text(status)
         if (status.returncode != 0 or "daemon: active" not in status_text or
                 blocker.request_count != request_count):
@@ -303,11 +343,11 @@ def assert_active_daemon_open(binary, work):
     probe, port = occupied_loopback_port()
     probe.close()
     os.makedirs(cache, exist_ok=True)
-    env = fixture_environment(work, cache, marker, 10000)
+    env = fixture_environment(work, cache, marker, READY_TIMEOUT_MS)
     daemon_pid = 0
     try:
         first = subprocess.run([binary, "daemon", "start", "--port=%d" % port],
-                               capture_output=True, timeout=30, env=env)
+                               capture_output=True, timeout=CLI_TIMEOUT_S, env=env)
         first_text = output_text(first)
         daemon_pid = pid_from(first_text)
         if first.returncode != 0 or "daemon: started" not in first_text:
@@ -315,7 +355,7 @@ def assert_active_daemon_open(binary, work):
             return False
 
         second = subprocess.run([binary, "daemon", "start", "--open"], capture_output=True,
-                                timeout=20, env=env)
+                                timeout=CLI_TIMEOUT_S, env=env)
         second_text = output_text(second)
         expected_url = "http://127.0.0.1:%d" % port
         marker_text = ""
@@ -337,7 +377,7 @@ class FixtureError(Exception):
     """The fixture could not be prepared: exit code 2, not a behavior RED."""
 
 
-def run_cli(binary, env, args, timeout=30):
+def run_cli(binary, env, args, timeout=CLI_TIMEOUT_S):
     return subprocess.run([binary] + list(args), capture_output=True, timeout=timeout, env=env)
 
 
@@ -376,7 +416,7 @@ def disabled_ui_environment(binary, work, label, port):
     cache = os.path.join(work, "cache-" + label)
     marker = os.path.join(work, "browser-%s.txt" % label)
     os.makedirs(cache, exist_ok=True)
-    env = fixture_environment(work, cache, marker, 10000)
+    env = fixture_environment(work, cache, marker, READY_TIMEOUT_MS)
     # The port goes first: on a fresh cache a UI build auto-enables, so that
     # write alone persists ui_enabled=true. The operator's switch comes last,
     # through the supported surface (#1558), not a hand-written config.json.
@@ -419,7 +459,7 @@ def assert_bare_start_keeps_disabled_ui(binary, work):
         if loopback_port_answers_within(port, 3.0):
             print("RED: a UI listener bound port %d although ui_enabled is false" % port)
             return False
-        status = run_cli(binary, env, ["daemon", "status"], timeout=10)
+        status = run_cli(binary, env, ["daemon", "status"])
         status_text = output_text(status)
         if (status.returncode != 0 or "ui: disabled" not in status_text or
                 "config set ui_enabled true" not in status_text):
@@ -432,57 +472,109 @@ def assert_bare_start_keeps_disabled_ui(binary, work):
         stop_daemon(binary, env, daemon_pid)
 
 
-def assert_explicit_ui_request_enables_disabled_ui(binary, work):
+def assert_explicit_request_enables_disabled_ui(binary, work, label, use_open):
     persisted_port = free_loopback_port()
-    requested_port = free_loopback_port()
-    while requested_port == persisted_port:
+    if use_open:
+        flags, expected_port = ["--open"], persisted_port
+    else:
         requested_port = free_loopback_port()
-    cases = (
-        ("off-port", ["--port=%d" % requested_port], requested_port),
-        ("off-open", ["--open"], persisted_port),
-    )
-    for label, flags, expected_port in cases:
-        env, marker = disabled_ui_environment(binary, work, label, persisted_port)
-        daemon_pid = 0
+        while requested_port == persisted_port:
+            requested_port = free_loopback_port()
+        flags, expected_port = ["--port=%d" % requested_port], requested_port
+    env, marker = disabled_ui_environment(binary, work, label, persisted_port)
+    daemon_pid = 0
+    try:
+        start = run_cli(binary, env, ["daemon", "start"] + flags)
+        text = output_text(start)
+        daemon_pid = pid_from(text)
+        command = "daemon start " + " ".join(flags)
+        enabled = persisted_ui_setting(binary, env, "ui_enabled")
+        port_now = persisted_ui_setting(binary, env, "ui_port")
+        if start.returncode != 0 or enabled != "true" or port_now != str(expected_port):
+            print("RED: `%s` asks for the UI, so it must turn it on over "
+                  "ui_enabled=false (got rc=%d ui_enabled=%s ui_port=%s, expected "
+                  "true/%d):\n%s" % (command, start.returncode, enabled, port_now,
+                                      expected_port, text[:700]))
+            return False
+        if not loopback_port_answers_within(expected_port, READY_TIMEOUT_MS / 1000.0):
+            print("RED: `%s` turned the UI on but nothing listens on port %d:\n%s"
+                  % (command, expected_port, text[:700]))
+            return False
+        if use_open:
+            expected_url = "http://127.0.0.1:%d" % expected_port
+            marker_text = ""
+            if os.path.exists(marker):
+                with open(marker, "r", encoding="utf-8") as handle:
+                    marker_text = handle.read()
+            if expected_url not in text or marker_text != expected_url:
+                print("RED: `%s` over a disabled UI did not open the verified "
+                      "endpoint:\n%s\nmarker=%r" % (command, text[:700], marker_text))
+                return False
+        print("PASS: `%s` still turns on a UI the operator had switched off" % command)
+        return True
+    finally:
+        stop_daemon(binary, env, daemon_pid)
+
+
+def assert_port_request_enables_disabled_ui(binary, work):
+    return assert_explicit_request_enables_disabled_ui(binary, work, "off-port", use_open=False)
+
+
+def assert_open_request_enables_disabled_ui(binary, work):
+    return assert_explicit_request_enables_disabled_ui(binary, work, "off-open", use_open=True)
+
+
+# Run order and the names --case accepts.
+CASES = (
+    ("delayed-open", assert_delayed_success),
+    ("foreign-port", assert_bounded_foreign_port_failure),
+    ("active-open", assert_active_daemon_open),
+    ("off-bare", assert_bare_start_keeps_disabled_ui),
+    ("off-port", assert_port_request_enables_disabled_ui),
+    ("off-open", assert_open_request_enables_disabled_ui),
+)
+
+
+def run_cases(binary, work, cases):
+    for name, case in cases:
+        print("== case %s" % name)
         try:
-            start = run_cli(binary, env, ["daemon", "start"] + flags)
-            text = output_text(start)
-            daemon_pid = pid_from(text)
-            command = "daemon start " + " ".join(flags)
-            enabled = persisted_ui_setting(binary, env, "ui_enabled")
-            port_now = persisted_ui_setting(binary, env, "ui_port")
-            if (start.returncode != 0 or enabled != "true" or
-                    port_now != str(expected_port)):
-                print("RED: `%s` asks for the UI, so it must turn it on over "
-                      "ui_enabled=false (got rc=%d ui_enabled=%s ui_port=%s, expected "
-                      "true/%d):\n%s" % (command, start.returncode, enabled, port_now,
-                                          expected_port, text[:700]))
-                return False
-            if not loopback_port_answers_within(expected_port, 10.0):
-                print("RED: `%s` turned the UI on but nothing listens on port %d:\n%s"
-                      % (command, expected_port, text[:700]))
-                return False
-            if "--open" in flags:
-                expected_url = "http://127.0.0.1:%d" % expected_port
-                marker_text = ""
-                if os.path.exists(marker):
-                    with open(marker, "r", encoding="utf-8") as handle:
-                        marker_text = handle.read()
-                if expected_url not in text or marker_text != expected_url:
-                    print("RED: `%s` over a disabled UI did not open the verified "
-                          "endpoint:\n%s\nmarker=%r" % (command, text[:700], marker_text))
-                    return False
-            print("PASS: `%s` still turns on a UI the operator had switched off" % command)
-        finally:
-            stop_daemon(binary, env, daemon_pid)
-    return True
+            if not case(binary, work):
+                return 1
+        except FixtureError as error:
+            print("SETUP FAIL (%s): %s" % (name, error))
+            return 2
+        except subprocess.TimeoutExpired as error:
+            print("RED (%s): `%s` did not finish within %s s"
+                  % (name, " ".join(str(arg) for arg in error.cmd[1:]), error.timeout))
+            return 1
+    print("\nGREEN: %s" % ", ".join(name for name, _ in cases))
+    return 0
+
+
+def keep_daemon_logs(work, destination):
+    """Copy each case's <cache>/logs out of the work directory before it goes."""
+    os.makedirs(destination, exist_ok=True)
+    kept = 0
+    for entry in sorted(os.listdir(work)):
+        logs = os.path.join(work, entry, "logs")
+        if entry.startswith("cache-") and os.path.isdir(logs):
+            shutil.copytree(logs, os.path.join(destination, entry, "logs"), dirs_exist_ok=True)
+            kept += 1
+    print("daemon logs of %d case(s) kept in %s" % (kept, destination))
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("usage: python3 test_daemon_open_readiness.py <ui-binary>")
-        return 2
-    binary = os.path.abspath(sys.argv[1])
+    parser = argparse.ArgumentParser(
+        description="Product guard for the UI side of `daemon start` (needs a UI build "
+                    "with TEST_SEAMS=1).")
+    parser.add_argument("binary", help="path to the UI build of codebase-memory-mcp")
+    parser.add_argument("--case", action="append", choices=[name for name, _ in CASES],
+                        help="run only this case; repeatable; default: every case, in order")
+    parser.add_argument("--keep-logs", metavar="DIR",
+                        help="copy each case's daemon logs into DIR/<cache>/logs")
+    args = parser.parse_args()
+    binary = os.path.abspath(args.binary)
     if not os.path.isfile(binary):
         print("SETUP FAIL: binary not found: %s" % binary)
         return 2
@@ -491,29 +583,18 @@ def main():
             if OPEN_MARKER_ENV.encode("ascii") not in handle.read():
                 print("SETUP FAIL: Windows fixture must be built with TEST_SEAMS=1")
                 return 2
+    selected = [case for case in CASES if not args.case or case[0] in args.case]
 
     # macOS sockaddr_un paths are capped at 104 bytes. Anchor the isolated
     # runtime directly under /private/tmp rather than the much longer per-user
     # Darwin temporary root so the product endpoint itself remains valid.
     short_temp_root = "/private/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
     with tempfile.TemporaryDirectory(prefix="cbm_uiopen_", dir=short_temp_root) as work:
-        if not assert_delayed_success(binary, work):
-            return 1
-        if not assert_bounded_foreign_port_failure(binary, work):
-            return 1
-        if not assert_active_daemon_open(binary, work):
-            return 1
         try:
-            if not assert_bare_start_keeps_disabled_ui(binary, work):
-                return 1
-            if not assert_explicit_ui_request_enables_disabled_ui(binary, work):
-                return 1
-        except FixtureError as error:
-            print("SETUP FAIL: %s" % error)
-            return 2
-    print("\nGREEN: daemon --open is bound to verified UI endpoint readiness, and only an "
-          "explicit UI request overrides ui_enabled=false.")
-    return 0
+            return run_cases(binary, work, selected)
+        finally:
+            if args.keep_logs:
+                keep_daemon_logs(work, os.path.abspath(args.keep_logs))
 
 
 if __name__ == "__main__":
