@@ -26,6 +26,7 @@ enum {
     CBM_DAEMON_IPC_SEND_TIMEOUT_MS = 5000,
     CBM_DAEMON_IPC_PATH_CAP = 4096,
     CBM_DAEMON_IPC_RETRY_INTERVAL_MS = 10,
+    CBM_DAEMON_IPC_SEAL_RETRY_INTERVAL_MS = 100,
     CBM_DAEMON_IPC_COORDINATION_CLEANUP_MS = 500,
     CBM_DAEMON_IPC_WINDOWS_RENDEZVOUS_RETRY_MS = 250,
 };
@@ -590,6 +591,9 @@ struct cbm_daemon_ipc_local_transition {
     pid_t owner_pid;
     bool sealed;
     bool work_begun;
+    /* The last seal attempt refused only because the generation's own socket
+     * still answered behind a lifetime lock someone else had replaced. */
+    bool seal_preserved_live_listener;
 };
 
 struct cbm_daemon_ipc_participant_guard {
@@ -2727,7 +2731,16 @@ static int posix_socket_name_listener_probe(const char *address) {
     return connect_error == ECONNREFUSED || connect_error == ENOENT ? 0 : -1;
 }
 
-static int posix_stale_generation_cleanup_locked(const cbm_daemon_ipc_endpoint_t *endpoint) {
+/* *live_listener_out (optional) reports whether a 0 came only from a listener
+ * that still answered behind an unheld lifetime lock. announce_live_listener
+ * false keeps a caller that re-asks the same question from logging the same
+ * preservation again. */
+static int posix_stale_generation_cleanup_locked(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                                 bool announce_live_listener,
+                                                 bool *live_listener_out) {
+    if (live_listener_out) {
+        *live_listener_out = false;
+    }
     /* Holding the startup lock excludes compliant starters. Reserving the
      * endpoint lifetime as well closes the check/unlink race against a caller
      * that already owns a transferred reservation. */
@@ -2806,8 +2819,13 @@ static int posix_stale_generation_cleanup_locked(const cbm_daemon_ipc_endpoint_t
     }
     if (listener_state != 0) {
         const char *listener = listener_state == 1 ? "answered" : "undetermined";
-        cbm_log_warn("daemon.ipc.stale_cleanup_preserved", "socket", probed_socket, "listener",
-                     listener, "lifetime_lock", "unheld");
+        if (listener_state != 1 || announce_live_listener) {
+            cbm_log_warn("daemon.ipc.stale_cleanup_preserved", "socket", probed_socket, "listener",
+                         listener, "lifetime_lock", "unheld");
+        }
+        if (live_listener_out) {
+            *live_listener_out = listener_state == 1;
+        }
         result = listener_state == 1 ? 0 : -1;
         goto cleanup_done;
     }
@@ -2952,7 +2970,7 @@ cleanup_done:
 int cbm_daemon_ipc_stale_generation_cleanup(const cbm_daemon_ipc_endpoint_t *endpoint,
                                             const cbm_daemon_ipc_startup_lock_t *startup_lock) {
     return posix_startup_lock_matches_endpoint(endpoint, startup_lock)
-               ? posix_stale_generation_cleanup_locked(endpoint)
+               ? posix_stale_generation_cleanup_locked(endpoint, true, NULL)
                : -1;
 }
 
@@ -3897,6 +3915,11 @@ int cbm_daemon_ipc_local_transition_try_acquire(
 }
 
 int cbm_daemon_ipc_local_transition_seal_legacy(cbm_daemon_ipc_local_transition_t *transition) {
+    /* A retry of the same refusal announces nothing new. */
+    bool already_announced = transition && transition->seal_preserved_live_listener;
+    if (transition) {
+        transition->seal_preserved_live_listener = false;
+    }
     if (!transition || !transition->endpoint ||
         !posix_named_lock_is_retained(
             transition->endpoint, transition->endpoint->startup_v2_lock_name, false,
@@ -3912,13 +3935,24 @@ int cbm_daemon_ipc_local_transition_seal_legacy(cbm_daemon_ipc_local_transition_
         return 1;
     }
     int lifetime = cbm_daemon_ipc_lifetime_reservation_probe(transition->endpoint);
-    int result = lifetime == 1   ? 1
-                 : lifetime == 0 ? posix_stale_generation_cleanup_locked(transition->endpoint)
-                                 : -1;
+    bool live_listener = false;
+    int result = -1;
+    if (lifetime == 1) {
+        result = 1;
+    } else if (lifetime == 0) {
+        result = posix_stale_generation_cleanup_locked(transition->endpoint, !already_announced,
+                                                       &live_listener);
+    }
     if (result == 1) {
         transition->sealed = true;
     }
+    transition->seal_preserved_live_listener = result == 0 && live_listener;
     return result;
+}
+
+bool cbm_daemon_ipc_local_transition_seal_preserved_live_listener(
+    const cbm_daemon_ipc_local_transition_t *transition) {
+    return transition && transition->seal_preserved_live_listener;
 }
 
 int cbm_daemon_ipc_local_transition_lifetime_probe(
@@ -7190,6 +7224,14 @@ int cbm_daemon_ipc_local_transition_seal_legacy(cbm_daemon_ipc_local_transition_
     return 1;
 }
 
+bool cbm_daemon_ipc_local_transition_seal_preserved_live_listener(
+    const cbm_daemon_ipc_local_transition_t *transition) {
+    /* Windows sealing never collects socket names, so it never preserves a
+     * listener: every 0 here is another transition or a legacy generation. */
+    (void)transition;
+    return false;
+}
+
 int cbm_daemon_ipc_local_transition_lifetime_probe(
     const cbm_daemon_ipc_endpoint_t *endpoint,
     const cbm_daemon_ipc_local_transition_t *transition) {
@@ -7250,6 +7292,33 @@ bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t *
 cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoint_t *endpoint,
                                                     uint32_t timeout_ms) {
     return cbm_daemon_ipc_connect_ex(endpoint, timeout_ms, NULL);
+}
+
+int cbm_daemon_ipc_local_transition_seal_legacy_wait(cbm_daemon_ipc_local_transition_t *transition,
+                                                     uint32_t timeout_ms) {
+    if (timeout_ms == CBM_DAEMON_IPC_WAIT_FOREVER) {
+        return -1;
+    }
+    uint64_t deadline_ms = ipc_deadline_after(timeout_ms);
+    for (;;) {
+        int result = cbm_daemon_ipc_local_transition_seal_legacy(transition);
+        if (result != 0 ||
+            !cbm_daemon_ipc_local_transition_seal_preserved_live_listener(transition)) {
+            return result;
+        }
+        /* The answering daemon lost its lifetime lock; once it exits it
+         * removes its names and the next attempt seals. Until then it is
+         * still a live generation, so the seal keeps failing closed. */
+        uint64_t now_ms = ipc_now_ms();
+        if (now_ms >= deadline_ms) {
+            return result;
+        }
+        uint64_t pause_ms = deadline_ms - now_ms;
+        if (pause_ms > CBM_DAEMON_IPC_SEAL_RETRY_INTERVAL_MS) {
+            pause_ms = CBM_DAEMON_IPC_SEAL_RETRY_INTERVAL_MS;
+        }
+        cbm_usleep(pause_ms * 1000U);
+    }
 }
 
 bool cbm_daemon_ipc_send_frame(cbm_daemon_ipc_connection_t *connection,

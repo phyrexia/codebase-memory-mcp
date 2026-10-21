@@ -637,12 +637,15 @@ cleaner unlinks and recreates `cbm-<key>.lifetime.lock`, the daemon keeps its
 lock on the deleted file, so other CBM processes can no longer see that it is
 alive. A CLI command or index worker that then finds the lock free still asks
 the daemon's socket before it removes anything: when a listener answers, every
-name stays in place, the process logs
-`daemon.ipc.stale_cleanup_preserved socket=anchor listener=answered lifetime_lock=unheld`,
-and it refuses to start, reporting that a pre-coordination or unverified CBM
-generation is active. Restart the daemon to give it a fresh lock (close its
-sessions, run `codebase-memory-mcp daemon stop`, and let the next session start
-it). If instead the socket names are gone while the daemon still holds its
+name stays in place and the process logs
+`daemon.ipc.stale_cleanup_preserved socket=anchor listener=answered lifetime_lock=unheld`
+once. It asks again every 100 ms for up to 2 s, so a daemon that is already
+exiting does not fail the command; if the listener still answers after that, the
+command refuses to start with *"a live CBM daemon lost its lifetime lock (an
+external cleaner replaced it); it is restarting — retry in a few seconds"*. If
+that persists, restart the daemon to give it a fresh lock (close its sessions,
+run `codebase-memory-mcp daemon stop`, and let the next session start it). If
+instead the socket names are gone while the daemon still holds its
 cohort marker, `daemon stop` cannot reach it: a session waits out its startup
 budget and then reports *"CBM daemon holds the cohort marker but publishes no
 endpoint (orphaned runtime dir)"* — stop that process

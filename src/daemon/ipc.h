@@ -303,6 +303,22 @@ bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t
 int cbm_daemon_ipc_local_transition_try_acquire(const cbm_daemon_ipc_endpoint_t *endpoint,
                                                 cbm_daemon_ipc_local_transition_t **transition_out);
 int cbm_daemon_ipc_local_transition_seal_legacy(cbm_daemon_ipc_local_transition_t *transition);
+/* Whether the most recent seal attempt returned 0 only because POSIX stale
+ * cleanup found the lifetime lock unheld yet the generation's own socket still
+ * answering: a live daemon whose lifetime lock an external cleaner replaced.
+ * That daemon keeps serving until it exits, so the refusal stands; the reason
+ * only lets callers say so. A repeat of that refusal on the same transition
+ * does not log the preservation again. Always false on Windows and for NULL. */
+bool cbm_daemon_ipc_local_transition_seal_preserved_live_listener(
+    const cbm_daemon_ipc_local_transition_t *transition);
+/* seal_legacy, repeated every 100 ms for at most timeout_ms (finite) while it
+ * returns 0 for the live-listener reason above, so a daemon that is already
+ * exiting does not fail the command. Any other result returns at once; at the
+ * bound the last 0 is returned and the seal still fails closed. The transition
+ * keeps startup-v2 throughout, so starters queue behind it for at most
+ * timeout_ms. */
+int cbm_daemon_ipc_local_transition_seal_legacy_wait(cbm_daemon_ipc_local_transition_t *transition,
+                                                     uint32_t timeout_ms);
 /* Observe daemon lifetime only through a successfully sealed, matching,
  * retained transition. Returns 1 while a daemon lifetime is active, 0 when
  * its absence is authoritative under the transition, and -1 when the guard,

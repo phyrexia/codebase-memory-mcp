@@ -52,6 +52,10 @@ enum {
      * the OS finishes reclaiming a dead holder's lock. This only bounds a peer
      * that never finishes, so a command cannot hang indefinitely. */
     MAIN_STARTUP_CONTENTION_CEILING_MS = 120000,
+    /* How long a one-shot CLI or index worker keeps re-sealing while a live
+     * daemon that lost its lifetime lock still answers: enough for one that
+     * notices and exits without draining a long request. */
+    MAIN_SEAL_RETRY_MS = 2000,
     MAIN_MCP_STARTUP_TIMEOUT_MS = 30000,
     MAIN_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000,
     MAIN_HOOK_CONNECT_TIMEOUT_MS = 250,
@@ -2947,7 +2951,19 @@ int main(int argc, char **argv) {
             }
             goto local_cli_cleanup;
         }
-        int seal_status = cbm_daemon_ipc_local_transition_seal_legacy(local_transition);
+        int seal_status =
+            cbm_daemon_ipc_local_transition_seal_legacy_wait(local_transition, MAIN_SEAL_RETRY_MS);
+        if (seal_status == 0 &&
+            cbm_daemon_ipc_local_transition_seal_preserved_live_listener(local_transition)) {
+            /* Not a pre-coordination generation: a daemon of this runtime dir
+             * still answers after something outside CBM replaced its lifetime
+             * lock. The cleanup already logged stale_cleanup_preserved, so no
+             * uncoordinated-daemon conflict record either. */
+            (void)fprintf(stderr, "codebase-memory-mcp: CBM CLI could not start because a "
+                                  "live CBM daemon lost its lifetime lock (an external cleaner "
+                                  "replaced it); it is restarting — retry in a few seconds\n");
+            goto local_cli_cleanup;
+        }
         if (seal_status != 1) {
             if (seal_status == 0) {
                 (void)cbm_version_cohort_log_uncoordinated_daemon(&local_identity);
@@ -3088,7 +3104,15 @@ int main(int argc, char **argv) {
                                                         : "could not be verified safely");
             goto worker_cleanup;
         }
-        int worker_seal_status = cbm_daemon_ipc_local_transition_seal_legacy(worker_transition);
+        int worker_seal_status =
+            cbm_daemon_ipc_local_transition_seal_legacy_wait(worker_transition, MAIN_SEAL_RETRY_MS);
+        if (worker_seal_status == 0 &&
+            cbm_daemon_ipc_local_transition_seal_preserved_live_listener(worker_transition)) {
+            (void)fprintf(stderr, "CBM index worker could not start: a live CBM daemon lost its "
+                                  "lifetime lock (an external cleaner replaced it); it is "
+                                  "restarting — retry in a few seconds\n");
+            goto worker_cleanup;
+        }
         if (worker_seal_status != 1) {
             if (worker_seal_status == 0) {
                 (void)cbm_version_cohort_log_uncoordinated_daemon(&identity);
