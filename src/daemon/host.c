@@ -28,12 +28,14 @@
 #include "ui/http_server.h"
 #include "watcher/watcher.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum {
     /* Descriptor budget for the configured connection cap. Measured on a live
@@ -64,6 +66,10 @@ enum {
     HOST_HTTP_RETRY_INITIAL_MS = 1000,
     HOST_HTTP_RETRY_MAX_MS = 30000,
     HOST_WATCH_INTERVAL_MS = 5000,
+    /* Age-based cleaners reap runtime files after about 3 days (a common
+     * systemd-tmpfiles /tmp policy; macOS tmp_cleaner's daily sweep). An
+     * hourly refresh keeps every held name far inside either threshold. */
+    HOST_KEEPALIVE_INTERVAL_S = 3600,
     HOST_CONFLICT_LOG_CAP = 1024 * 1024,
     HOST_OPERATION_LOG_CAP = 5 * 1024 * 1024,
     HOST_PATH_CAP = 4096,
@@ -1088,8 +1094,117 @@ static bool host_background_start(host_state_t *host) {
     return true;
 }
 
+/* ── Runtime-directory upkeep ──
+ *
+ * The names this generation holds in the runtime directory, each kept by its
+ * owner: the listener (inside the runtime service) holds the lifetime
+ * reservation and the identity record; the host itself holds the participant
+ * guard, the cohort lease and the daemon claim. See ipc.h for why age-based
+ * cleaners would otherwise reap them under a daemon that runs for days. */
+typedef struct {
+    const cbm_daemon_ipc_participant_guard_t *participant_guard;
+    const cbm_version_cohort_daemon_claim_t *daemon_claim;
+    const cbm_version_cohort_lease_t *cohort_lease;
+    uint64_t keepalive_interval_ms;
+    uint64_t keepalive_last_wall_ms;
+    bool keepalive_done;
+    bool keepalive_failure_logged;
+} host_runtime_dir_t;
+
+/* Wall-clock milliseconds since the epoch, 0 if unavailable. The keepalive is
+ * paced by the wall clock rather than cbm_now_ms(): cleaners age files by wall
+ * time, and the monotonic clock stops while the machine sleeps, so the first
+ * tick after a long suspend has to see the whole gap. */
+static uint64_t host_wall_clock_ms(void) {
+#ifdef _WIN32
+    time_t now = time(NULL);
+    return now > 0 ? (uint64_t)now * CBM_MSEC_PER_SEC : 0;
+#else
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec < 0) {
+        return 0;
+    }
+    return (uint64_t)now.tv_sec * CBM_MSEC_PER_SEC + (uint64_t)now.tv_nsec / CBM_NSEC_PER_MSEC;
+#endif
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Test builds may shorten a host cadence. Only a whole number of milliseconds
+ * in [HOST_WAIT_TICK_MS, ceiling_ms] is honoured; anything else keeps the
+ * production value. */
+static uint64_t host_cadence_seam_ms(const char *name, uint64_t production_ms,
+                                     uint64_t ceiling_ms) {
+    char text[32];
+    const char *configured = cbm_safe_getenv(name, text, sizeof(text), NULL);
+    if (configured) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(configured, &end, 10);
+        if (errno == 0 && end && end != configured && *end == '\0' &&
+            parsed >= HOST_WAIT_TICK_MS && parsed <= ceiling_ms) {
+            return (uint64_t)parsed;
+        }
+    }
+    return production_ms;
+}
+#endif
+
+static uint64_t host_keepalive_interval_ms(void) {
+    uint64_t interval = (uint64_t)HOST_KEEPALIVE_INTERVAL_S * CBM_MSEC_PER_SEC;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    interval = host_cadence_seam_ms("CBM_TEST_KEEPALIVE_MS", interval, interval);
+#endif
+    return interval;
+}
+
+/* Evaluated every tick: refresh on the first one, once the interval has passed
+ * on the wall clock, and whenever that clock went backwards. A failure is
+ * logged once and never stops the daemon; the next complete refresh re-arms
+ * the log, so a new episode shows up without a persistent one repeating
+ * hourly. */
+static void host_runtime_dir_keepalive_at(host_runtime_dir_t *dir,
+                                          cbm_daemon_runtime_service_t *service,
+                                          uint64_t now_wall_ms) {
+    bool due = !dir->keepalive_done || now_wall_ms < dir->keepalive_last_wall_ms ||
+               now_wall_ms - dir->keepalive_last_wall_ms >= dir->keepalive_interval_ms;
+    if (!due) {
+        return;
+    }
+    dir->keepalive_done = true;
+    dir->keepalive_last_wall_ms = now_wall_ms;
+
+    cbm_daemon_ipc_keepalive_failure_t first;
+    cbm_daemon_ipc_keepalive_failure_t failure;
+    bool refreshed =
+        cbm_daemon_ipc_listener_keepalive(cbm_daemon_runtime_service_listener(service), &first);
+    if (!cbm_daemon_ipc_participant_guard_keepalive(dir->participant_guard, &failure)) {
+        if (refreshed) {
+            first = failure;
+        }
+        refreshed = false;
+    }
+    if (!cbm_version_cohort_daemon_keepalive(dir->daemon_claim, dir->cohort_lease, &failure)) {
+        if (refreshed) {
+            first = failure;
+        }
+        refreshed = false;
+    }
+    if (refreshed) {
+        dir->keepalive_failure_logged = false;
+        return;
+    }
+    if (dir->keepalive_failure_logged) {
+        return;
+    }
+    dir->keepalive_failure_logged = true;
+    const char *errno_name = first.errno_value != 0 ? cbm_errno_name(first.errno_value) : NULL;
+    cbm_log_warn("daemon.runtime_dir.keepalive_failed", "name", first.name, "errno",
+                 errno_name ? errno_name : "none");
+}
+
 static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
-                                   atomic_int *stop_requested, host_state_t *host, bool permanent) {
+                                   atomic_int *stop_requested, host_state_t *host, bool permanent,
+                                   host_runtime_dir_t *runtime_dir) {
     uint64_t initial_deadline = cbm_now_ms() + HOST_INITIAL_CLIENT_TIMEOUT_MS;
     uint64_t stopping_deadline = 0;
     for (;;) {
@@ -1123,6 +1238,7 @@ static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
                          stop ? "stop_requested" : "initial_window_expired");
             return cbm_daemon_runtime_service_stop(service, HOST_RUNTIME_SHUTDOWN_MS);
         }
+        host_runtime_dir_keepalive_at(runtime_dir, service, host_wall_clock_ms());
         host_http_reconcile_at(host, cbm_now_ms(), false);
         host_metrics_flush_at(host, cbm_now_ms());
         /* Retire an ephemeral generation that lingered for cold-storm cohort
@@ -1443,7 +1559,14 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
                   * it — the same values `daemon status` reports. */
                  "max_clients", max_clients_text, "max_clients_source",
                  cbm_daemon_max_clients_source_name(knobs.max_clients_source));
-    if (!host_wait_for_lifetime(service, config->stop_requested, &host, config->permanent)) {
+    host_runtime_dir_t runtime_dir = {
+        .participant_guard = participant_guard,
+        .daemon_claim = daemon_claim,
+        .cohort_lease = cohort_lease,
+        .keepalive_interval_ms = host_keepalive_interval_ms(),
+    };
+    if (!host_wait_for_lifetime(service, config->stop_requested, &host, config->permanent,
+                                &runtime_dir)) {
         host_force_terminate("runtime");
     }
 

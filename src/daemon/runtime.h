@@ -408,6 +408,14 @@ size_t cbm_daemon_runtime_service_active_connections(cbm_daemon_runtime_service_
  * no-op unless a last-committed-client linger is armed. */
 void cbm_daemon_runtime_service_reconcile_lifetime(cbm_daemon_runtime_service_t *service);
 
+/* The service's listener, lent to its host for runtime-directory upkeep (the
+ * cbm_daemon_ipc_listener_* upkeep calls, read-only towards the listener). It
+ * is set before start returns, never replaced, and closed only by
+ * cbm_daemon_runtime_service_free, so the host that will free the service may
+ * use it until then. NULL for a NULL service. */
+const cbm_daemon_ipc_listener_t *cbm_daemon_runtime_service_listener(
+    const cbm_daemon_runtime_service_t *service);
+
 /* ── Connection-admission telemetry ──────────────────────────────
  *
  * Together these answer the one question the live count cannot: is the

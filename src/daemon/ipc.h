@@ -278,6 +278,36 @@ int cbm_daemon_ipc_participant_guard_try_join(const cbm_daemon_ipc_endpoint_t *e
                                               cbm_daemon_ipc_participant_guard_t **guard_out);
 bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t **guard_io);
 
+/* ── Runtime-directory upkeep for a long-lived daemon generation ──
+ *
+ * Age-based temporary-file cleaners (systemd-tmpfiles, macOS tmp_cleaner)
+ * delete files whose access, modification and change times are all old.
+ * Neither honours the lifetime lock's fcntl record lock, and tmp_cleaner
+ * honours no lock at all, so a daemon that runs for days would lose the names
+ * its locks hang on while it keeps serving.
+ *
+ * keepalive refreshes the times of what its owner holds: each lock through its
+ * retained descriptor, and the identity record through a no-follow descriptor
+ * proven to be the inode this listener published. It never creates, unlinks
+ * or relinks anything, never refreshes a name that is no longer the owner's
+ * (the names check reports that), and never touches `.sock` or `.anc`, whose
+ * ctime is part of the socket identity the record vouches for. A listener
+ * refreshes its lifetime reservation, its identity record and, when listen()
+ * gave it one, its participant guard; in the daemon role the host holds the
+ * guard and refreshes it itself. A failure does not stop the rest from being
+ * refreshed; failure_out names the first file that could not be. Windows
+ * publishes named pipes and holds every lock file without FILE_SHARE_DELETE,
+ * so nothing there can be cleaned away and keepalive only validates. */
+enum { CBM_DAEMON_IPC_KEEPALIVE_NAME_CAP = 96 };
+typedef struct {
+    char name[CBM_DAEMON_IPC_KEEPALIVE_NAME_CAP]; /* runtime-directory base name */
+    int errno_value;
+} cbm_daemon_ipc_keepalive_failure_t;
+bool cbm_daemon_ipc_listener_keepalive(const cbm_daemon_ipc_listener_t *listener,
+                                       cbm_daemon_ipc_keepalive_failure_t *failure_out);
+bool cbm_daemon_ipc_participant_guard_keepalive(const cbm_daemon_ipc_participant_guard_t *guard,
+                                                cbm_daemon_ipc_keepalive_failure_t *failure_out);
+
 /* Standalone CLI work joins the legacy-compatible current participant group
  * without becoming a daemon client. Acquisition retains startup-v2 only for
  * the seal/presence decision. Sealing also retains a participant claim:

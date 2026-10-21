@@ -857,6 +857,30 @@ cbm_private_file_lock_status_t cbm_version_cohort_daemon_claim_release(
     return result;
 }
 
+bool cbm_version_cohort_daemon_keepalive(const cbm_version_cohort_daemon_claim_t *claim,
+                                         const cbm_version_cohort_lease_t *lease,
+                                         cbm_daemon_ipc_keepalive_failure_t *failure_out) {
+    if (failure_out) {
+        memset(failure_out, 0, sizeof(*failure_out));
+    }
+    const cbm_private_file_lock_t *held[] = {claim ? claim->marker : NULL,
+                                             lease ? lease->lifetime : NULL};
+    const char *names[] = {VERSION_COHORT_DAEMON_FILE, VERSION_COHORT_LIFETIME_FILE};
+    bool refreshed = true;
+    for (size_t index = 0; index < sizeof(held) / sizeof(held[0]); index++) {
+        int error = 0;
+        if (cbm_private_file_lock_touch(held[index], &error)) {
+            continue;
+        }
+        if (refreshed && failure_out) {
+            (void)snprintf(failure_out->name, sizeof(failure_out->name), "%s", names[index]);
+            failure_out->errno_value = error;
+        }
+        refreshed = false;
+    }
+    return refreshed;
+}
+
 cbm_version_cohort_daemon_presence_t cbm_version_cohort_daemon_claim_presence(
     cbm_version_cohort_manager_t *manager) {
     if (!manager || !version_cohort_manager_register(manager)) {

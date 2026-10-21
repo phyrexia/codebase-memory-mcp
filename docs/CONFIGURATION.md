@@ -630,14 +630,23 @@ process that should share one daemon must see the same value — set it in the
 environment of your MCP client and your shell alike, or a CLI invocation without
 it will coordinate through the default location instead.
 
-**Keep temporary-file cleaners out of the rendezvous directory.** It holds the
-running daemon's socket names (`cbm-<key>.sock`, `.anc`, `.sock.identity`) and
-its lock files, and on a daemon that has been up for days they look old. If a
-cleaner unlinks and recreates `cbm-<key>.lifetime.lock`, the daemon keeps its
-lock on the deleted file, so other CBM processes can no longer see that it is
-alive. A CLI command or index worker that then finds the lock free still asks
-the daemon's socket before it removes anything: when a listener answers, every
-name stays in place, the process logs
+**Temporary-file cleaners and the rendezvous directory.** It holds the running
+daemon's socket names (`cbm-<key>.sock`, `.anc`, `.sock.identity`) and its lock
+files. Age-based cleaners do not see the daemon's locks — macOS `tmp_cleaner`
+honours none, and `systemd-tmpfiles` ignores the `fcntl` record lock on
+`cbm-<key>.lifetime.lock` — so a running daemon refreshes the timestamps of
+every file it holds once an hour, by wall-clock time (the first check after a
+long sleep refreshes at once). It never touches the socket names: their change
+time is part of the identity `.sock.identity` vouches for, and both cleaners
+leave live sockets alone. A refresh that fails is logged once as
+`daemon.runtime_dir.keepalive_failed name=<file> errno=<code>`, and the daemon
+keeps serving.
+
+If a cleaner unlinks and recreates `cbm-<key>.lifetime.lock` anyway, the daemon
+keeps its lock on the deleted file, so other CBM processes can no longer see
+that it is alive. A CLI command or index worker that then finds the lock free
+still asks the daemon's socket before it removes anything: when a listener
+answers, every name stays in place, the process logs
 `daemon.ipc.stale_cleanup_preserved socket=anchor listener=answered lifetime_lock=unheld`,
 and it refuses to start, reporting that a pre-coordination or unverified CBM
 generation is active. Restart the daemon to give it a fresh lock (close its

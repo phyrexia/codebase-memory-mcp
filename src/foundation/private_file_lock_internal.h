@@ -61,6 +61,16 @@ cbm_private_file_lock_status_t cbm_private_file_lock_payload_write(cbm_private_f
                                                                    const void *buffer,
                                                                    size_t length);
 
+/* Upkeep for a lock held for days. Age-based temporary-file cleaners judge a
+ * file by its timestamps, and macOS tmp_cleaner ignores locks entirely, so a
+ * long-held lock can lose its name. touch refreshes the held file's access
+ * and modification times (and with them its change time) through the
+ * retained handle: it never reopens, truncates, writes or relinks, so a
+ * payload is untouched. On failure *errno_out (when non-NULL) names the
+ * cause. Windows holds lock files without FILE_SHARE_DELETE, so no cleaner can
+ * unlink one under its holder; there touch only validates the lock. */
+bool cbm_private_file_lock_touch(const cbm_private_file_lock_t *lock, int *errno_out);
+
 /* Forces the next successfully acquired native lock down the post-lock
  * validation cleanup path and injects pre-call release failures there. */
 bool cbm_private_lock_directory_fail_post_acquire_cleanup_for_test(

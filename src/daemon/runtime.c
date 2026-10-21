@@ -2855,6 +2855,14 @@ void cbm_daemon_runtime_service_reconcile_lifetime(cbm_daemon_runtime_service_t 
     }
 }
 
+const cbm_daemon_ipc_listener_t *cbm_daemon_runtime_service_listener(
+    const cbm_daemon_runtime_service_t *service) {
+    /* Written once before the accept thread starts and before start returns;
+     * cleared only by free. No lock: the listener's identity fields that
+     * upkeep reads are immutable for its lifetime. */
+    return service ? service->listener : NULL;
+}
+
 size_t cbm_daemon_runtime_service_max_clients(cbm_daemon_runtime_service_t *service) {
     if (!service) {
         return 0;

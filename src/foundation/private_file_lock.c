@@ -482,6 +482,26 @@ cbm_private_file_lock_status_t cbm_private_file_lock_payload_write(cbm_private_f
     return valid ? CBM_PRIVATE_FILE_LOCK_OK : CBM_PRIVATE_FILE_LOCK_IO;
 }
 
+bool cbm_private_file_lock_touch(const cbm_private_file_lock_t *lock, int *errno_out) {
+    if (errno_out) {
+        *errno_out = 0;
+    }
+    if (!lock || lock->fd < 0 || lock->unlocked || lock->owner_pid != getpid()) {
+        if (errno_out) {
+            *errno_out = EBADF;
+        }
+        return false;
+    }
+    int result;
+    do {
+        result = futimens(lock->fd, NULL);
+    } while (result != 0 && errno == EINTR);
+    if (result != 0 && errno_out) {
+        *errno_out = errno;
+    }
+    return result == 0;
+}
+
 cbm_private_file_lock_status_t cbm_private_file_lock_release(cbm_private_file_lock_t **lock_io) {
     if (!lock_io || !*lock_io) {
         return CBM_PRIVATE_FILE_LOCK_IO;
@@ -1448,6 +1468,15 @@ cbm_private_file_lock_status_t cbm_private_file_lock_payload_write(cbm_private_f
     valid = valid && FlushFileBuffers(lock->handle) != 0;
     cbm_private_file_lock_fork_guard_leave();
     return valid ? CBM_PRIVATE_FILE_LOCK_OK : CBM_PRIVATE_FILE_LOCK_IO;
+}
+
+bool cbm_private_file_lock_touch(const cbm_private_file_lock_t *lock, int *errno_out) {
+    /* The handle was opened without FILE_SHARE_DELETE: the name cannot be
+     * unlinked while it is held, so there is nothing to keep alive. */
+    if (errno_out) {
+        *errno_out = 0;
+    }
+    return lock && lock->handle != INVALID_HANDLE_VALUE && !lock->unlocked;
 }
 
 static bool private_win_release_unlock(cbm_private_file_lock_t *lock) {
