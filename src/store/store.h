@@ -537,6 +537,11 @@ int cbm_store_persist_project_counts(cbm_store_t *s, const char *project);
  * not once per list_projects call. */
 size_t cbm_store_projects_count_column_probes_for_test(void);
 void cbm_store_projects_count_column_probes_reset_for_test(void);
+
+/* Test seam: how many times cbm_store_open_path_query() has been called. Lets
+ * a test prove a warm list_projects page reopens no project database. */
+size_t cbm_store_query_opens_for_test(void);
+void cbm_store_query_opens_reset_for_test(void);
 #endif
 
 /* ── Node CRUD ──────────────────────────────────────────────────── */

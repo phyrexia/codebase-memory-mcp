@@ -2778,7 +2778,7 @@ typedef enum {
 /* Collect sortable identity from the project registry. The registry opens the
  * .db file only when it changed since the cached read (size + mtime), so a warm
  * listing opens no SQLite file at all — the work this listing used to do for
- * all ~120 databases on every call. Counts and Git context stay for the page. */
+ * all ~120 databases on every call. Only the branch is resolved per page row. */
 static project_record_status_t read_project_record_identity(const char *dir_path, const char *name,
                                                             mcp_project_record_t *record) {
     memset(record, 0, sizeof(*record));
@@ -2821,40 +2821,24 @@ static project_record_status_t read_project_record_identity(const char *dir_path
     return PROJECT_RECORD_OK;
 }
 
-static bool populate_project_record(const char *dir_path, bool include_stats,
-                                    mcp_project_record_t *record) {
+static bool populate_project_record(bool include_stats, mcp_project_record_t *record) {
     if (record->populated) {
         return true;
     }
-    /* COUNT(*) only when the published row carries no totals to serve: it is a
-     * full index scan per project, which is exactly what this listing stopped
-     * doing on every call. */
-    if (include_stats && !record->counts_stored) {
-        char full_path[CBM_SZ_2K];
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, record->db_file);
-        cbm_store_t *pstore = cbm_store_open_path_query(full_path);
-        if (!pstore) {
-            return false;
-        }
-        record->nodes = cbm_store_count_nodes(pstore, record->name);
-        record->edges = cbm_store_count_edges(pstore, record->name);
-        cbm_store_close(pstore);
-    }
-    /* Listing stays lean: the branch (the one git fact that disambiguates
-     * same-repo projects) is resolved only for the details projection, where
-     * it is worth a git process per project. The 12-field git block — mostly
-     * null for non-git roots — stays in index_status. */
+    /* Node/edge totals are already on the record: the registry caches them with
+     * the generation it read (the stored values, or one COUNT(*) for a row that
+     * carries none), so the page never reopens a database. Only the branch —
+     * the one git fact that disambiguates same-repo projects — is per-page
+     * work, and it is read from HEAD rather than from git processes. The
+     * 12-field git block, mostly null for non-git roots, stays in index_status. */
     if (include_stats && record->root_path[0]) {
-        cbm_git_context_t gctx = {0};
-        (void)cbm_git_context_resolve(record->root_path, &gctx);
-        if (gctx.is_git && gctx.branch) {
-            record->branch = heap_strdup(gctx.branch);
+        char branch[CBM_SZ_4K];
+        if (cbm_git_head_branch(record->root_path, branch, sizeof(branch))) {
+            record->branch = heap_strdup(branch);
             if (!record->branch) {
-                cbm_git_context_free(&gctx);
                 return false;
             }
         }
-        cbm_git_context_free(&gctx);
     }
     record->populated = true;
     return true;
@@ -2985,7 +2969,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     int end = start + limit < record_count ? start + limit : record_count;
     if (!metadata_only) {
         for (int i = start; i < end; i++) {
-            if (!populate_project_record(dir_path, include_stats, &records[i])) {
+            if (!populate_project_record(include_stats, &records[i])) {
                 oom = true;
                 break;
             }

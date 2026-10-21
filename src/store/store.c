@@ -1080,7 +1080,28 @@ static bool build_immutable_uri(const char *path, char *out, size_t out_sz) {
     return true;
 }
 
+#if defined(CBM_CLI_ENABLE_TEST_API)
+/* Default (seq_cst) ordering, like the project registry's read counter: a
+ * stale zero read by the test thread would fail as flaky instead of red. */
+static atomic_size_t g_query_opens = 0;
+
+size_t cbm_store_query_opens_for_test(void) {
+    return atomic_load(&g_query_opens);
+}
+
+void cbm_store_query_opens_reset_for_test(void) {
+    atomic_store(&g_query_opens, 0);
+}
+
+static void query_open_tick(void) {
+    atomic_fetch_add(&g_query_opens, 1);
+}
+#else
+static void query_open_tick(void) {}
+#endif
+
 cbm_store_t *cbm_store_open_path_query(const char *db_path) {
+    query_open_tick();
     if (!db_path) {
         return NULL;
     }

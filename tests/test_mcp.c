@@ -5765,12 +5765,369 @@ TEST(tool_list_projects_registry_reuses_identity_until_generation_changes) {
     PASS();
 }
 
+/* D6: the details page serves node/edge totals from the project registry,
+ * which caches them with the generation it read — the stored values, or one
+ * COUNT(*) for a row that carries none. A warm `detail=stats` listing of a
+ * project without stored totals must therefore open no project database. */
+TEST(tool_list_projects_stats_reuses_registry_totals_without_reopening) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-d6-totals-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char db_path[512];
+    char missing_root[512];
+    snprintf(db_path, sizeof(db_path), "%s/totals-d6.db", cache);
+    /* Never created: the row's root has no git context to resolve. */
+    snprintf(missing_root, sizeof(missing_root), "%s/no-such-root", cache);
+    ASSERT_TRUE(
+        c5_make_pre_count_columns_db(cache, "totals-d6.db", "totals-d6", missing_root, 3, 2));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* The registry's read of this generation: the one open it is allowed. */
+    yyjson_doc *doc = c5_list_projects_json(srv, "{\"limit\":50,\"format\":\"json\"}");
+    bool warmed = c5_first_project(doc) != NULL;
+    yyjson_doc_free(doc);
+
+    cbm_store_query_opens_reset_for_test();
+    enum { D6_ROUNDS = 2 };
+    int64_t nodes[D6_ROUNDS] = {-1, -1};
+    int64_t edges[D6_ROUNDS] = {-1, -1};
+    bool computed[D6_ROUNDS] = {false, false};
+    for (int round = 0; round < D6_ROUNDS; round++) {
+        doc = c5_list_projects_json(srv, "{\"limit\":50,\"format\":\"json\",\"detail\":\"stats\"}");
+        yyjson_val *first = c5_first_project(doc);
+        if (first) {
+            const char *source = yyjson_get_str(yyjson_obj_get(first, "stats_source"));
+            nodes[round] = yyjson_get_int(yyjson_obj_get(first, "nodes"));
+            edges[round] = yyjson_get_int(yyjson_obj_get(first, "edges"));
+            computed[round] = source && strcmp(source, "computed") == 0;
+        }
+        yyjson_doc_free(doc);
+    }
+    size_t reopens = cbm_store_query_opens_for_test();
+
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_unlink(db_path);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(warmed);
+    ASSERT_EQ(reopens, 0);
+    for (int round = 0; round < D6_ROUNDS; round++) {
+        ASSERT_EQ(nodes[round], 3);
+        ASSERT_EQ(edges[round], 2);
+        ASSERT_TRUE(computed[round]);
+    }
+    PASS();
+}
+
+#ifndef _WIN32
+/* D6 fixture: a hand-made git directory — HEAD plus the empty objects/ and
+ * refs/heads/ of a real one, no commits — so a branch is knowable only by
+ * reading HEAD, and the fake git on PATH proves nobody asked git for it. */
+static bool d6_make_git_dir(const char *git_dir, const char *head) {
+    char path[CBM_SZ_2K];
+    snprintf(path, sizeof(path), "%s/objects", git_dir);
+    if (th_mkdir_p(path) != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/refs/heads", git_dir);
+    if (th_mkdir_p(path) != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/HEAD", git_dir);
+    return th_write_file(path, head) == 0;
+}
+
+/* A project DB in `cache` whose single row points at `root`. */
+static bool d6_make_project(const char *cache, const char *name, const char *root) {
+    char db_path[CBM_SZ_2K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, name);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    bool ok = store && cbm_store_upsert_project(store, name, root) == CBM_STORE_OK;
+    cbm_store_close(store);
+    return ok;
+}
+
+/* The listed row named `name` in a list_projects JSON page, or NULL. */
+static yyjson_val *d6_listed_project(yyjson_doc *doc, const char *name) {
+    yyjson_val *projects = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "projects") : NULL;
+    size_t index;
+    size_t max;
+    yyjson_val *row;
+    yyjson_arr_foreach(projects, index, max, row) {
+        const char *listed = yyjson_get_str(yyjson_obj_get(row, "name"));
+        if (listed && strcmp(listed, name) == 0) {
+            return row;
+        }
+    }
+    return NULL;
+}
+
+/* What the page says about `name`'s branch, as text that survives freeing the
+ * page: the branch, "(no branch)" or "(not listed)". */
+static void d6_listed_branch(yyjson_doc *doc, const char *name, char *out, size_t out_size) {
+    yyjson_val *row = d6_listed_project(doc, name);
+    const char *branch = row ? yyjson_get_str(yyjson_obj_get(row, "branch")) : NULL;
+    snprintf(out, out_size, "%s", !row ? "(not listed)" : branch ? branch : "(no branch)");
+}
+
+/* Occurrences of `needle` in `haystack`. */
+static int d6_count(const char *haystack, const char *needle) {
+    int count = 0;
+    size_t needle_len = strlen(needle);
+    for (const char *p = haystack ? strstr(haystack, needle) : NULL; p;
+         p = strstr(p + needle_len, needle)) {
+        count++;
+    }
+    return count;
+}
+#endif /* _WIN32 */
+
+/* D6: detail=stats names each listed project's branch by reading HEAD, never
+ * by spawning git — it used to cost seven git processes per row, 5-10 s for a
+ * page of 100. The rows cover the shapes a root takes: a branch with a slash,
+ * a detached HEAD, a linked worktree behind a relative `gitdir:` file, a
+ * submodule behind an absolute one, a root indexed from a subdirectory of its
+ * repository, and a root outside any repository. */
+TEST(tool_list_projects_stats_reads_branch_from_head_without_git) {
+#ifdef _WIN32
+    SKIP_PLATFORM("the fake git on PATH is a /bin/sh script");
+#else
+    char work[256];
+    snprintf(work, sizeof(work), "%s/cbm-d6-head-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(work));
+    char cache[CBM_SZ_512];
+    char repos[CBM_SZ_512];
+    snprintf(cache, sizeof(cache), "%s/cache", work);
+    snprintf(repos, sizeof(repos), "%s/repos", work);
+
+    char path[CBM_SZ_2K];
+    char text[CBM_SZ_2K];
+    bool fixtures = th_mkdir_p(cache) == 0;
+    snprintf(path, sizeof(path), "%s/branch/.git", repos);
+    fixtures = fixtures && d6_make_git_dir(path, "ref: refs/heads/feature/d6-x\n");
+    snprintf(path, sizeof(path), "%s/detached/.git", repos);
+    fixtures = fixtures && d6_make_git_dir(path, "0123456789abcdef0123456789abcdef01234567\n");
+    /* Linked worktree: <main>/.git/worktrees/wt holds its HEAD. */
+    snprintf(path, sizeof(path), "%s/main/.git", repos);
+    fixtures = fixtures && d6_make_git_dir(path, "ref: refs/heads/main\n");
+    snprintf(path, sizeof(path), "%s/main/.git/worktrees/wt", repos);
+    fixtures = fixtures && d6_make_git_dir(path, "ref: refs/heads/d6-worktree-branch\n");
+    snprintf(path, sizeof(path), "%s/main/.git/worktrees/wt/commondir", repos);
+    fixtures = fixtures && th_write_file(path, "../..\n") == 0;
+    snprintf(path, sizeof(path), "%s/linked-wt/.git", repos);
+    fixtures = fixtures && th_write_file(path, "gitdir: ../main/.git/worktrees/wt\n") == 0;
+    /* Submodule: <super>/.git/modules/sub, named by an absolute gitdir. */
+    snprintf(path, sizeof(path), "%s/super/.git", repos);
+    fixtures = fixtures && d6_make_git_dir(path, "ref: refs/heads/main\n");
+    snprintf(path, sizeof(path), "%s/super/.git/modules/sub", repos);
+    fixtures = fixtures && d6_make_git_dir(path, "ref: refs/heads/d6-sub-branch\n");
+    snprintf(path, sizeof(path), "%s/super/sub/.git", repos);
+    snprintf(text, sizeof(text), "gitdir: %s/super/.git/modules/sub\n", repos);
+    fixtures = fixtures && th_write_file(path, text) == 0;
+    /* Indexed from a subdirectory: the walk up finds <mono>/.git. */
+    snprintf(path, sizeof(path), "%s/mono/.git", repos);
+    fixtures = fixtures && d6_make_git_dir(path, "ref: refs/heads/mono-main\n");
+    snprintf(path, sizeof(path), "%s/mono/packages/app", repos);
+    fixtures = fixtures && th_mkdir_p(path) == 0;
+    snprintf(path, sizeof(path), "%s/plain", repos);
+    fixtures = fixtures && th_mkdir_p(path) == 0;
+
+    static const struct {
+        const char *project;
+        const char *root;     /* relative to repos */
+        const char *expected; /* what the page must say */
+    } rows[] = {
+        {"d6-branch", "branch", "feature/d6-x"},
+        {"d6-detached", "detached", "DETACHED"},
+        {"d6-worktree", "linked-wt", "d6-worktree-branch"},
+        {"d6-submodule", "super/sub", "d6-sub-branch"},
+        {"d6-subdir", "mono/packages/app", "mono-main"},
+        {"d6-plain", "plain", "(no branch)"},
+    };
+    enum { D6_ROWS = sizeof(rows) / sizeof(rows[0]) };
+    for (int i = 0; i < D6_ROWS && fixtures; i++) {
+        snprintf(path, sizeof(path), "%s/%s", repos, rows[i].root);
+        fixtures = d6_make_project(cache, rows[i].project, path);
+    }
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    th_fake_git_t fake = {0};
+    bool fake_ready = fixtures && th_fake_git_install(&fake, work, NULL, 128);
+    cbm_mcp_server_t *srv = fake_ready ? cbm_mcp_server_new(NULL) : NULL;
+    yyjson_doc *doc =
+        srv ? c5_list_projects_json(srv, "{\"limit\":50,\"format\":\"json\",\"detail\":\"stats\"}")
+            : NULL;
+    int git_calls = fake_ready ? th_fake_git_calls(&fake) : -1;
+    char got[D6_ROWS][CBM_SZ_64];
+    for (int i = 0; i < D6_ROWS; i++) {
+        d6_listed_branch(doc, rows[i].project, got[i], sizeof(got[i]));
+    }
+
+    yyjson_doc_free(doc);
+    cbm_mcp_server_free(srv);
+    th_fake_git_remove(&fake);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(work);
+
+    ASSERT_TRUE(fixtures);
+    ASSERT_TRUE(fake_ready);
+    ASSERT_EQ(git_calls, 0);
+    for (int i = 0; i < D6_ROWS; i++) {
+        ASSERT_STR_EQ(got[i], rows[i].expected);
+    }
+    PASS();
+#endif /* _WIN32 */
+}
+
+/* D6: HEAD and `gitdir:` files are input from whatever tree a project was
+ * indexed from. Oversized, control-laden, multi-line, traversing or unknown
+ * content (the reftable stub) must neither crash nor reach the listing: each
+ * such root costs at most one `git symbolic-ref` — the fallback for the forms
+ * not parsed in-process, whose failure here means "no branch" — and a
+ * `gitdir:` target is used as a git directory, never followed as a second
+ * gitlink. A well-formed neighbour on the same page keeps its branch without
+ * git. Under the sanitizer build any overflow fails the run outright. */
+TEST(tool_list_projects_stats_contains_hostile_head_content) {
+#ifdef _WIN32
+    SKIP_PLATFORM("the fake git on PATH is a /bin/sh script");
+#else
+    char work[256];
+    snprintf(work, sizeof(work), "%s/cbm-d6-hostile-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(work));
+    char cache[CBM_SZ_512];
+    char repos[CBM_SZ_512];
+    snprintf(cache, sizeof(cache), "%s/cache", work);
+    snprintf(repos, sizeof(repos), "%s/repos", work);
+
+    enum { D6_HUGE_HEAD = 64 * 1024, D6_HUGE_GITDIR = 8 * 1024 };
+    char *huge_head = malloc(D6_HUGE_HEAD + 64);
+    char *huge_gitlink = malloc(D6_HUGE_GITDIR + 64);
+    bool fixtures = huge_head && huge_gitlink && th_mkdir_p(cache) == 0;
+    if (fixtures) {
+        int n = snprintf(huge_head, 64, "ref: refs/heads/");
+        memset(huge_head + n, 'a', D6_HUGE_HEAD);
+        memcpy(huge_head + n + D6_HUGE_HEAD, "\n", 2);
+        n = snprintf(huge_gitlink, 64, "gitdir: ");
+        for (int i = 0; i < D6_HUGE_GITDIR; i += 2) {
+            memcpy(huge_gitlink + n + i, "x/", 2);
+        }
+        memcpy(huge_gitlink + n + D6_HUGE_GITDIR, "\n", 2);
+    }
+
+    char path[CBM_SZ_2K];
+    char text[CBM_SZ_2K];
+    static const struct {
+        const char *root;
+        const char *head;
+    } heads[] = {
+        {"control", "ref: refs/heads/evil\x1b[31mred\n"},
+        {"multiline", "ref: refs/heads/one\nref: refs/heads/two\n"},
+        {"reftable", "ref: refs/heads/.invalid\n"},
+        {"traversal", "ref: refs/heads/../../../etc/passwd\n"},
+        {"lockname", "ref: refs/heads/topic.lock\n"},
+        {"nonheads", "ref: refs/remotes/origin/main\n"},
+        {"neighbour", "ref: refs/heads/still-fine\n"},
+    };
+    enum { D6_HEADS = sizeof(heads) / sizeof(heads[0]) };
+    for (int i = 0; i < D6_HEADS && fixtures; i++) {
+        snprintf(path, sizeof(path), "%s/%s/.git", repos, heads[i].root);
+        fixtures = d6_make_git_dir(path, heads[i].head);
+    }
+    snprintf(path, sizeof(path), "%s/huge/.git", repos);
+    fixtures = fixtures && d6_make_git_dir(path, huge_head);
+    snprintf(path, sizeof(path), "%s/gitlink-huge/.git", repos);
+    fixtures = fixtures && th_write_file(path, huge_gitlink) == 0;
+    /* One level only: chain-mid has no HEAD, just a gitlink to the
+     * neighbour's git directory. Following it would report "still-fine". */
+    snprintf(path, sizeof(path), "%s/chain-mid/.git", repos);
+    snprintf(text, sizeof(text), "gitdir: %s/neighbour/.git\n", repos);
+    fixtures = fixtures && th_write_file(path, text) == 0;
+    snprintf(path, sizeof(path), "%s/gitlink-chain/.git", repos);
+    fixtures = fixtures && th_write_file(path, "gitdir: ../chain-mid\n") == 0;
+
+    static const char *const hostile[] = {"control",   "multiline",    "reftable",
+                                          "traversal", "lockname",     "nonheads",
+                                          "huge",      "gitlink-huge", "gitlink-chain"};
+    enum { D6_HOSTILE = sizeof(hostile) / sizeof(hostile[0]) };
+    char project[CBM_SZ_64];
+    for (int i = 0; i < D6_HOSTILE && fixtures; i++) {
+        snprintf(project, sizeof(project), "d6h-%s", hostile[i]);
+        snprintf(path, sizeof(path), "%s/%s", repos, hostile[i]);
+        fixtures = d6_make_project(cache, project, path);
+    }
+    snprintf(path, sizeof(path), "%s/neighbour", repos);
+    fixtures = fixtures && d6_make_project(cache, "d6h-neighbour", path);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    th_fake_git_t fake = {0};
+    bool fake_ready = fixtures && th_fake_git_install(&fake, work, NULL, 128);
+    cbm_mcp_server_t *srv = fake_ready ? cbm_mcp_server_new(NULL) : NULL;
+    yyjson_doc *doc =
+        srv ? c5_list_projects_json(srv, "{\"limit\":50,\"format\":\"json\",\"detail\":\"stats\"}")
+            : NULL;
+    int64_t total = doc ? yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(doc), "total")) : -1;
+    char *log = fake_ready ? th_fake_git_log(&fake) : NULL;
+
+    char got[D6_HOSTILE][CBM_SZ_64];
+    int spawned[D6_HOSTILE];
+    char needle[CBM_SZ_2K];
+    for (int i = 0; i < D6_HOSTILE; i++) {
+        snprintf(project, sizeof(project), "d6h-%s", hostile[i]);
+        d6_listed_branch(doc, project, got[i], sizeof(got[i]));
+        snprintf(needle, sizeof(needle), "-C %s/%s ", repos, hostile[i]);
+        spawned[i] = d6_count(log, needle);
+    }
+    char neighbour[CBM_SZ_64];
+    d6_listed_branch(doc, "d6h-neighbour", neighbour, sizeof(neighbour));
+    snprintf(needle, sizeof(needle), "-C %s/neighbour ", repos);
+    int neighbour_spawned = d6_count(log, needle);
+    /* Whatever git ran must be the single fallback query. */
+    int lines = d6_count(log, "\n");
+    int fallback_lines = d6_count(log, " symbolic-ref --quiet --short HEAD\n");
+
+    free(log);
+    yyjson_doc_free(doc);
+    cbm_mcp_server_free(srv);
+    th_fake_git_remove(&fake);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(work);
+    free(huge_head);
+    free(huge_gitlink);
+
+    ASSERT_TRUE(fixtures);
+    ASSERT_TRUE(fake_ready);
+    ASSERT_EQ(total, D6_HOSTILE + 1);
+    ASSERT_STR_EQ(neighbour, "still-fine");
+    ASSERT_EQ(neighbour_spawned, 0);
+    ASSERT_EQ(fallback_lines, lines);
+    for (int i = 0; i < D6_HOSTILE; i++) {
+        ASSERT_STR_EQ(got[i], "(no branch)");
+        ASSERT_LTE(spawned[i], 1);
+    }
+    PASS();
+#endif /* _WIN32 */
+}
+
 /* C5 cost criterion: listing ~120 projects must average under 100 ms. The
  * assertion is on the warm mean — what a session pays once the daemon has read
  * each generation — and the numbers are printed so a qf-infra run records
- * them. The details projection keeps one git process per listed project (the
- * ADR gates it behind include_details, and C10 tells callers not to ask for
- * it at session start), so it is reported, not asserted. */
+ * them. The details projection also reads each listed project's branch from
+ * HEAD (the ADR gates it behind include_details, and C10 tells callers not to
+ * ask for it at session start); it is reported, not asserted — the D6 tests
+ * pin its cost by counting git processes and database opens instead. */
 TEST(tool_list_projects_mean_latency_with_120_projects) {
     enum { C5_BENCH_PROJECTS = 120, C5_BENCH_ROUNDS = 5 };
     char cache[256];
@@ -21888,6 +22245,9 @@ SUITE(mcp) {
     RUN_TEST(tool_list_projects_preserves_root_beyond_one_kib);
     RUN_TEST(tool_list_projects_legacy_counts_fall_back_and_store_on_publish);
     RUN_TEST(tool_list_projects_registry_reuses_identity_until_generation_changes);
+    RUN_TEST(tool_list_projects_stats_reuses_registry_totals_without_reopening);
+    RUN_TEST(tool_list_projects_stats_reads_branch_from_head_without_git);
+    RUN_TEST(tool_list_projects_stats_contains_hostile_head_content);
     RUN_TEST(tool_list_projects_mean_latency_with_120_projects);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
