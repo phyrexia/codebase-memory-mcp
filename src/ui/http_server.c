@@ -29,6 +29,7 @@
 #endif
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "foundation/secure_random.h"
 #include "foundation/sha256.h"
@@ -947,8 +948,8 @@ static void handle_indexed_roots(cbm_http_conn_t *c) {
 
 /* ── Request metrics endpoint ─────────────────────────────────── */
 
-/* printf-append into a heap buffer, growing as needed. Returns false (and
- * frees nothing) on allocation failure; the caller bails out. */
+/* printf-append into a memory-core buffer (class other), growing as needed.
+ * Returns false (and frees nothing) on allocation failure; the caller bails out. */
 static bool metrics_appendf(char **buf, size_t *cap, size_t *len, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -965,7 +966,7 @@ static bool metrics_appendf(char **buf, size_t *cap, size_t *len, const char *fm
         while (*len + (size_t)needed + 1 > next) {
             next *= 2;
         }
-        char *grown = realloc(*buf, next);
+        char *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, *buf, next);
         if (!grown) {
             va_end(args_copy);
             return false;
@@ -1027,7 +1028,7 @@ static void handle_metrics(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     sqlite3_bind_text(stmt, 1, cutoff, -1, SQLITE_TRANSIENT);
 
     size_t cap = 65536, len = 0;
-    char *buf = malloc(cap);
+    char *buf = cbm_alloc(CBM_MEM_CLASS_OTHER, cap);
     bool ok = buf && metrics_appendf(&buf, &cap, &len, "{\"buckets\":[");
     int count = 0;
     while (ok && sqlite3_step(stmt) == SQLITE_ROW) {
@@ -1049,12 +1050,12 @@ static void handle_metrics(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     if (!ok || !metrics_appendf(&buf, &cap, &len, "]}")) {
-        free(buf);
+        cbm_free(CBM_MEM_CLASS_OTHER, buf);
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"out of memory\"}");
         return;
     }
     cbm_http_reply_buf(c, 200, g_cors_json, buf, len);
-    free(buf);
+    cbm_free(CBM_MEM_CLASS_OTHER, buf);
 }
 
 /* ── ADR endpoints ────────────────────────────────────────────── */
