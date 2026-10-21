@@ -10417,10 +10417,12 @@ static bool add_failure_summaries_from_rows(yyjson_mut_doc *doc, yyjson_mut_val 
         }
     }
 
-    cbm_file_error_t *failures =
-        failure_count > 0 ? calloc((size_t)failure_count, sizeof(*failures)) : NULL;
-    if (failure_count > 0 && !failures) {
-        return false;
+    cbm_file_error_t *failures = NULL;
+    if (failure_count > 0) {
+        failures = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)failure_count * sizeof(*failures));
+        if (!failures) {
+            return false;
+        }
     }
 
     int n = 0;
@@ -10430,7 +10432,7 @@ static bool add_failure_summaries_from_rows(yyjson_mut_doc *doc, yyjson_mut_val 
             continue;
         }
         if (!failures || n >= failure_count) {
-            free(failures);
+            cbm_free(CBM_MEM_CLASS_OTHER, failures);
             return false;
         }
         failures[n].path = (char *)rows[i].rel_path;
@@ -10442,7 +10444,7 @@ static bool add_failure_summaries_from_rows(yyjson_mut_doc *doc, yyjson_mut_val 
     add_skipped_summary(doc, root, failures, failure_count, logfile);
     add_parse_partial_summary(doc, root, failures, failure_count);
     add_parse_unusable_summary(doc, root, failures, failure_count);
-    free(failures);
+    cbm_free(CBM_MEM_CLASS_OTHER, failures);
     return true;
 }
 
@@ -11315,7 +11317,8 @@ static bool same_path(const char *a, const char *b) {
  * databases the fleet review found. When the override disagrees with the name
  * derived from repo_path AND another project already owns that root_path, the
  * result names the owner instead of staying silent. Query-only scan of the
- * cache directory; NULL when no other project owns the root. */
+ * cache directory; NULL when no other project owns the root. The name comes
+ * from the memory core: release it with cbm_free(CBM_MEM_CLASS_OTHER, ...). */
 static char *project_alias_for_root(const char *root_path, const char *current_project) {
     if (!root_path || !root_path[0] || !current_project || !current_project[0]) {
         return NULL;
@@ -11369,8 +11372,8 @@ static char *project_alias_for_root(const char *root_path, const char *current_p
         /* Deterministic answer when several projects duplicate the root: the
          * smallest name, not whatever order readdir happened to return. */
         if (owns_root && (!alias || strcmp(project_name, alias) < 0)) {
-            free(alias);
-            alias = heap_strdup(project_name);
+            cbm_free(CBM_MEM_CLASS_OTHER, alias);
+            alias = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, project_name);
         }
     }
     cbm_closedir(d);
@@ -11437,9 +11440,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * indistinguishable from a real index to the caller. */
     if (cbm_mcp_ignore_worktrees_enabled(srv) && !cbm_mcp_get_bool_arg(args, "index_worktree") &&
         cbm_git_is_linked_worktree(repo_path)) {
-        free(mode_str);
-        free(name_override);
-        free(repo_path);
+        index_args_free(repo_path, mode_str, name_override);
         return cbm_mcp_text_result(
             "repo_path is a linked git worktree and ignore_worktrees is enabled. Pass "
             "index_worktree=true to index it anyway, or run: codebase-memory-mcp config set "
@@ -11625,7 +11626,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             cbm_log_info("index.project_alias", "project", project_name, "alias_of", alias_of,
                          "root", repo_path);
             yyjson_mut_obj_add_strcpy(doc, root, "alias_of", alias_of);
-            free(alias_of);
+            cbm_free(CBM_MEM_CLASS_OTHER, alias_of);
         }
     }
 
