@@ -709,7 +709,9 @@ typedef struct {
 /* Metadata describing how completely one index run recorded the best-effort
  * coverage signal. `recording_status` is "complete", "truncated", or
  * "unavailable"; it is deliberately separate from hash_records_complete.
- * Strings returned by cbm_store_coverage_meta_get are heap-owned. */
+ * Strings returned by cbm_store_coverage_meta_get are owned by the meta and
+ * come from the memory core (class store): release them only with
+ * cbm_store_coverage_meta_clear(). */
 typedef struct {
     const char *project;
     const char *generation;

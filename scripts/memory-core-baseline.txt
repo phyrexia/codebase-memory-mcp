@@ -52,7 +52,7 @@ src/git/git_context.c	18
 src/main.c	32
 src/mcp/compact_out.c	39
 src/mcp/index_supervisor.c	8
-src/mcp/mcp.c	784
+src/mcp/mcp.c	781
 src/pipeline/artifact.c	38
 src/pipeline/fqn.c	23
 src/pipeline/lsp_resolve.h	4
@@ -82,7 +82,7 @@ src/pipeline/pipeline_delta.c	19
 src/pipeline/pipeline_incremental.c	144
 src/pipeline/registry.c	17
 src/pipeline/worker_pool.c	2
-src/store/store.c	358
+src/store/store.c	353
 src/ui/config.c	12
 src/ui/http_server.c	31
 src/ui/httpd.c	21

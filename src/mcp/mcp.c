@@ -2747,10 +2747,13 @@ static void project_record_clear(mcp_project_record_t *record) {
     if (!record) {
         return;
     }
-    free(record->name);
-    free(record->root_path);
+    /* name, root_path and indexed_at are taken over from the project
+     * registry, which allocates through the memory core (class store);
+     * db_file and branch are this file's raw heap_strdup() copies. */
+    cbm_free(CBM_MEM_CLASS_STORE, record->name);
+    cbm_free(CBM_MEM_CLASS_STORE, record->root_path);
     free(record->db_file);
-    free(record->indexed_at);
+    cbm_free(CBM_MEM_CLASS_STORE, record->indexed_at);
     free(record->branch);
     memset(record, 0, sizeof(*record));
 }

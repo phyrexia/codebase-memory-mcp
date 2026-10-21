@@ -79,6 +79,7 @@ enum {
 #include "foundation/compat.h"
 #include "foundation/log.h"
 #include "foundation/compat_regex.h"
+#include "foundation/mem_core.h"
 #include "foundation/str_util.h"
 
 #define XXH_INLINE_ALL
@@ -4464,16 +4465,23 @@ int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char
     return coverage_query_rows(s, project, scope, sql, out, count);
 }
 
+/* The strings of a meta read by cbm_store_coverage_meta_get() come from the
+ * memory core, class store, and are released only by
+ * cbm_store_coverage_meta_clear(). */
+static char *meta_strdup(const char *s) {
+    return cbm_mem_strdup(CBM_MEM_CLASS_STORE, s);
+}
+
 void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta) {
     if (!meta) {
         return;
     }
-    free((char *)meta->project);
-    free((char *)meta->generation);
-    free((char *)meta->index_mode);
-    free((char *)meta->recorded_at);
-    free((char *)meta->recording_status);
-    free((char *)meta->indexed_checkout_sha);
+    cbm_free(CBM_MEM_CLASS_STORE, (char *)meta->project);
+    cbm_free(CBM_MEM_CLASS_STORE, (char *)meta->generation);
+    cbm_free(CBM_MEM_CLASS_STORE, (char *)meta->index_mode);
+    cbm_free(CBM_MEM_CLASS_STORE, (char *)meta->recorded_at);
+    cbm_free(CBM_MEM_CLASS_STORE, (char *)meta->recording_status);
+    cbm_free(CBM_MEM_CLASS_STORE, (char *)meta->indexed_checkout_sha);
     memset(meta, 0, sizeof(*meta));
 }
 
@@ -4507,18 +4515,18 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
     bind_text(stmt, SKIP_ONE, project);
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
-        out->project = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-        out->generation = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
-        out->index_mode = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_2));
-        out->recorded_at = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_3));
-        out->recording_status = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_4));
+        out->project = meta_strdup((const char *)sqlite3_column_text(stmt, 0));
+        out->generation = meta_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+        out->index_mode = meta_strdup((const char *)sqlite3_column_text(stmt, ST_COL_2));
+        out->recorded_at = meta_strdup((const char *)sqlite3_column_text(stmt, ST_COL_3));
+        out->recording_status = meta_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_4));
         out->ignored_files_stored = sqlite3_column_int(stmt, CBM_SZ_5);
         out->ignored_files_total = sqlite3_column_int(stmt, 6);
         out->coverage_version = sqlite3_column_int(stmt, 7);
         out->hash_records_complete = sqlite3_column_int(stmt, 8) != 0;
         if (has_checkout_column) {
             const char *sha = (const char *)sqlite3_column_text(stmt, 9);
-            out->indexed_checkout_sha = sha && sha[0] ? heap_strdup(sha) : NULL;
+            out->indexed_checkout_sha = sha && sha[0] ? meta_strdup(sha) : NULL;
         }
         sqlite3_finalize(stmt);
         if (!out->project || !out->generation || !out->index_mode || !out->recorded_at ||
