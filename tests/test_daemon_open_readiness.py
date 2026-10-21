@@ -17,7 +17,15 @@ This guard uses a real UI build and isolated daemon generations:
   operator's switch survives it: the setting stays ``false``, no listener binds
   and ``daemon status`` names the switch that turns the UI back on;
 * ``daemon start --port=N`` and ``daemon start --open`` over the same switch
-  prove that asking for the UI explicitly still turns it on.
+  prove that asking for the UI explicitly still turns it on;
+* the same three commands against a daemon that is already running with the
+  UI off prove a bare start reports ``ui: disabled`` like a fresh one,
+  ``--port`` says nothing about a browser, and ``--open`` fails naming
+  ``config set ui_enabled true``;
+* a refused UI handshake under ``--port=N`` proves the error names the port
+  rather than a browser nobody asked for;
+* malformed ``--port`` values (trailing text, values that wrap a C ``int``,
+  out of range) prove they are refused before anything starts.
 
 Build the fixture with test seams so browser launching is recorded rather than
 performed and the two negative cases can use a short deterministic deadline:
@@ -26,12 +34,13 @@ performed and the two negative cases can use a short deterministic deadline:
     python3 tests/test_daemon_open_readiness.py build/ui-open-test/codebase-memory-mcp
 
 ``--case NAME`` (repeatable) runs only the named cases, in their usual order:
-delayed-open, foreign-port, active-open, off-bare, off-port, off-open.
+delayed-open, foreign-port, active-open, off-bare, off-port, off-open,
+active-off, refused-port, bad-port.
 ``--keep-logs DIR`` copies every case's ``<cache>/logs`` (``cbm-daemon.log``
 and the conflict/activation records) into ``DIR/<cache>/logs`` before the work
 directory is removed, whether the run passed or not. The caches are, in case
 order: cache-delayed, cache-occupied, cache-active, cache-off-bare,
-cache-off-port, cache-off-open.
+cache-off-port, cache-off-open, cache-active-off, cache-refused, cache-bad-port.
 
 The work directory lives under the system temp directory (``TMPDIR`` on
 Linux), and the daemon's private-directory check applies to its ancestry: no
@@ -524,6 +533,108 @@ def assert_open_request_enables_disabled_ui(binary, work):
     return assert_explicit_request_enables_disabled_ui(binary, work, "off-open", use_open=True)
 
 
+def assert_active_daemon_keeps_disabled_ui(binary, work):
+    port = free_loopback_port()
+    other_port = free_loopback_port()
+    while other_port == port:
+        other_port = free_loopback_port()
+    env, marker = disabled_ui_environment(binary, work, "active-off", port)
+    daemon_pid = 0
+    try:
+        first = run_cli(binary, env, ["daemon", "start"])
+        first_text = output_text(first)
+        daemon_pid = pid_from(first_text)
+        if first.returncode != 0 or "daemon: started" not in first_text:
+            print("RED: the bare start that brings the daemon up failed:\n%s" % first_text[:700])
+            return False
+        bare = run_cli(binary, env, ["daemon", "start"])
+        bare_text = output_text(bare)
+        if (bare.returncode != 0 or "daemon: already active" not in bare_text or
+                "ui: disabled" not in bare_text or
+                "config set ui_enabled true" not in bare_text or "error:" in bare_text):
+            print("RED: a bare `daemon start` against an active daemon whose UI is off must "
+                  "report `ui: disabled` like a fresh start, not an error:\n%s" % bare_text[:700])
+            return False
+        moved = run_cli(binary, env, ["daemon", "start", "--port=%d" % other_port])
+        moved_text = output_text(moved)
+        if (moved.returncode != 0 or "ui: disabled" not in moved_text or
+                "browser" in moved_text):
+            print("RED: `daemon start --port=N` against an active daemon whose UI is off must "
+                  "report it disabled, not a browser it was never asked to open:\n%s"
+                  % moved_text[:700])
+            return False
+        opened = run_cli(binary, env, ["daemon", "start", "--open"])
+        opened_text = output_text(opened)
+        if (opened.returncode == 0 or os.path.exists(marker) or
+                "config set ui_enabled true" not in opened_text):
+            print("RED: `daemon start --open` against an active daemon whose UI is off must "
+                  "fail and name `config set ui_enabled true`:\n%s" % opened_text[:700])
+            return False
+        enabled = persisted_ui_setting(binary, env, "ui_enabled")
+        port_now = persisted_ui_setting(binary, env, "ui_port")
+        if enabled != "false" or port_now != str(port):
+            print("RED: starts against an active daemon rewrote the persisted UI setting to "
+                  "ui_enabled=%s ui_port=%s (expected false/%d)" % (enabled, port_now, port))
+            return False
+        print("PASS: an active daemon with its UI off is reported, not argued with")
+        return True
+    finally:
+        stop_daemon(binary, env, daemon_pid)
+
+
+def assert_refused_port_names_the_port(binary, work):
+    port = free_loopback_port()
+    cache = os.path.join(work, "cache-refused")
+    marker = os.path.join(work, "browser-refused.txt")
+    os.makedirs(cache, exist_ok=True)
+    env = fixture_environment(work, cache, marker, READY_TIMEOUT_MS)
+    # Test seam (TEST_SEAMS=1): the daemon comes up, the UI handshake is refused.
+    env["CBM_TEST_DAEMON_UI_CONFIG_REFUSED"] = "1"
+    try:
+        start = run_cli(binary, env, ["daemon", "start", "--port=%d" % port])
+        text = output_text(start)
+        if (start.returncode == 0 or "did not accept the UI configuration" not in text or
+                "browser" in text or ("--port=%d" % port) not in text):
+            print("RED: a refused `daemon start --port=N` must fail naming the port it could "
+                  "not configure, not a browser it was never asked to open:\n%s" % text[:700])
+            return False
+        print("PASS: a refused --port names the port, not a browser")
+        return True
+    finally:
+        stop_daemon(binary, env, 0)
+
+
+def assert_malformed_port_is_refused(binary, work):
+    port = free_loopback_port()
+    cache = os.path.join(work, "cache-bad-port")
+    marker = os.path.join(work, "browser-bad-port.txt")
+    os.makedirs(cache, exist_ok=True)
+    env = fixture_environment(work, cache, marker, READY_TIMEOUT_MS)
+    # atoi() read "<port>x" as <port> and wrapped 2**32 + <port> into <port>;
+    # the rest are the plain range limits.
+    values = ("%dx" % port, str((1 << 32) + port), "-1", "0", "65536", "")
+    daemon_pid = 0
+    try:
+        for value in values:
+            result = run_cli(binary, env, ["daemon", "start", "--port=" + value])
+            text = output_text(result)
+            daemon_pid = daemon_pid or pid_from(text)
+            if (result.returncode == 0 or
+                    "--port requires a value between 1 and 65535" not in text):
+                print("RED: `daemon start --port=%s` must be refused before anything "
+                      "starts:\n%s" % (value, text[:700]))
+                return False
+        status = run_cli(binary, env, ["daemon", "status"])
+        if "not running" not in output_text(status):
+            print("RED: a refused --port value still left a daemon running:\n%s"
+                  % output_text(status)[:700])
+            return False
+        print("PASS: malformed --port values are refused before anything starts")
+        return True
+    finally:
+        stop_daemon(binary, env, daemon_pid)
+
+
 # Run order and the names --case accepts.
 CASES = (
     ("delayed-open", assert_delayed_success),
@@ -532,6 +643,9 @@ CASES = (
     ("off-bare", assert_bare_start_keeps_disabled_ui),
     ("off-port", assert_port_request_enables_disabled_ui),
     ("off-open", assert_open_request_enables_disabled_ui),
+    ("active-off", assert_active_daemon_keeps_disabled_ui),
+    ("refused-port", assert_refused_port_names_the_port),
+    ("bad-port", assert_malformed_port_is_refused),
 )
 
 
