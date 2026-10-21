@@ -276,6 +276,12 @@ typedef struct {
      * wedged (2026-08-29 zombie incident) — callers must report this PID
      * rather than fold the failure into plain absence. */
     uint64_t muted_endpoint_holder_pid;
+    /* True only when the transport connect itself failed because the POSIX
+     * stable socket name was still absent at its deadline
+     * (cbm_daemon_ipc_connect_ex). Paired with a held generation, that is the
+     * orphaned runtime dir an external /tmp cleaner leaves: callers name it in
+     * their final diagnostic and never treat it as a license to spawn. */
+    bool endpoint_name_absent;
     cbm_daemon_conflict_t conflict;
     char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
 } cbm_daemon_runtime_connect_result_t;

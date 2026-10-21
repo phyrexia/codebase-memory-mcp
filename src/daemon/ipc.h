@@ -205,6 +205,16 @@ int cbm_daemon_ipc_legacy_generation_probe(const cbm_daemon_ipc_endpoint_t *endp
 
 cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoint_t *endpoint,
                                                     uint32_t timeout_ms);
+/* connect() that also reports, when it returns NULL, whether the last attempt
+ * found the POSIX stable socket name absent (ENOENT) when the deadline ran
+ * out: a generation that holds its ownership locks yet publishes no endpoint,
+ * the shape an external /tmp cleaner leaves behind. A socket that exists but
+ * refuses, a connect that succeeds, and every other failure report false.
+ * Windows always reports false: its rendezvous is not a socket name. The flag
+ * is diagnostic only; nothing may treat it as proof of absence. */
+cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect_ex(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                                       uint32_t timeout_ms,
+                                                       bool *name_absent_out);
 void cbm_daemon_ipc_connection_close(cbm_daemon_ipc_connection_t *connection);
 
 /* Bounded wait for the peer to consume everything already sent, by reading

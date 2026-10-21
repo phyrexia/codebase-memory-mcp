@@ -3288,7 +3288,8 @@ cbm_daemon_runtime_client_t *cbm_daemon_runtime_client_connect(
         !cbm_daemon_runtime_hello_request_encode(request, identity)) {
         return NULL;
     }
-    cbm_daemon_ipc_connection_t *connection = cbm_daemon_ipc_connect(endpoint, timeout_ms);
+    cbm_daemon_ipc_connection_t *connection =
+        cbm_daemon_ipc_connect_ex(endpoint, timeout_ms, &result_out->endpoint_name_absent);
     if (!connection || !cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST,
                                                   CBM_DAEMON_RUNTIME_OP_HELLO, request,
                                                   (uint32_t)sizeof(request))) {

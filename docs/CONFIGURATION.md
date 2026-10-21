@@ -642,8 +642,13 @@ name stays in place, the process logs
 and it refuses to start, reporting that a pre-coordination or unverified CBM
 generation is active. Restart the daemon to give it a fresh lock (close its
 sessions, run `codebase-memory-mcp daemon stop`, and let the next session start
-it), and exclude the directory from the cleaner — on systemd hosts, an
-`x /tmp/cbm-daemon-*` line in `/etc/tmpfiles.d/`.
+it). If instead the socket names are gone while the daemon still holds its
+cohort marker, `daemon stop` cannot reach it: a session waits out its startup
+budget and then reports *"CBM daemon holds the cohort marker but publishes no
+endpoint (orphaned runtime dir)"* — stop that process
+(`pgrep -f -- --cbm-daemon-internal` lists it) and retry. Either way, exclude
+the directory from the cleaner — on systemd hosts, an `x /tmp/cbm-daemon-*`
+line in `/etc/tmpfiles.d/`.
 
 Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
 

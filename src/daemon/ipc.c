@@ -3582,8 +3582,12 @@ int cbm_daemon_ipc_endpoint_probe(const cbm_daemon_ipc_endpoint_t *endpoint, uin
     return -1;
 }
 
-cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoint_t *endpoint,
-                                                    uint32_t timeout_ms) {
+cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect_ex(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                                       uint32_t timeout_ms,
+                                                       bool *name_absent_out) {
+    if (name_absent_out) {
+        *name_absent_out = false;
+    }
     if (!endpoint_runtime_still_valid(endpoint)) {
         return NULL;
     }
@@ -3594,6 +3598,9 @@ cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoin
             int path_error = errno;
             if (path_error == ENOENT && ipc_retry_pause(deadline_ms)) {
                 continue;
+            }
+            if (name_absent_out) {
+                *name_absent_out = path_error == ENOENT;
             }
             return NULL;
         }
@@ -3621,6 +3628,9 @@ cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoin
                 ipc_retry_pause(deadline_ms)) {
                 continue;
             }
+            if (name_absent_out) {
+                *name_absent_out = connect_error == ENOENT;
+            }
             return NULL;
         }
         if (result != 0) {
@@ -3637,6 +3647,9 @@ cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoin
                 if ((socket_error == ENOENT || socket_error == ECONNREFUSED) &&
                     ipc_retry_pause(deadline_ms)) {
                     continue;
+                }
+                if (name_absent_out) {
+                    *name_absent_out = socket_error == ENOENT;
                 }
                 return NULL;
             }
@@ -6696,8 +6709,13 @@ int cbm_daemon_ipc_endpoint_probe(const cbm_daemon_ipc_endpoint_t *endpoint, uin
     return -1;
 }
 
-cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoint_t *endpoint,
-                                                    uint32_t timeout_ms) {
+cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect_ex(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                                       uint32_t timeout_ms,
+                                                       bool *name_absent_out) {
+    /* The named-pipe rendezvous has no socket name a /tmp cleaner can take. */
+    if (name_absent_out) {
+        *name_absent_out = false;
+    }
     if (!endpoint) {
         return NULL;
     }
@@ -7228,6 +7246,11 @@ bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t *
 }
 
 #endif /* _WIN32 */
+
+cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                                    uint32_t timeout_ms) {
+    return cbm_daemon_ipc_connect_ex(endpoint, timeout_ms, NULL);
+}
 
 bool cbm_daemon_ipc_send_frame(cbm_daemon_ipc_connection_t *connection,
                                cbm_daemon_frame_type_t type, uint16_t flags, const void *payload,
