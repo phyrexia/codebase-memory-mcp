@@ -3929,10 +3929,8 @@ bool cbm_daemon_ipc_participant_guard_keepalive(const cbm_daemon_ipc_participant
     if (valid && posix_held_fd_touch(guard->legacy_fd, &error)) {
         return true;
     }
-    posix_keepalive_failure_note(failure_out,
-                                 valid ? guard->legacy_process_entry->lock_name
-                                       : "participant_guard",
-                                 error);
+    const char *name = valid ? guard->legacy_process_entry->lock_name : "participant_guard";
+    posix_keepalive_failure_note(failure_out, name, error);
     return false;
 }
 
@@ -3999,8 +3997,8 @@ static cbm_daemon_ipc_names_state_t posix_held_name_state(int dir_fd, const char
     if (posix_fstatat_no_eintr(dir_fd, name, &named) != 0) {
         return errno == ENOENT ? replaced : CBM_DAEMON_IPC_NAMES_IO;
     }
-    return named.st_dev == held.st_dev && named.st_ino == held.st_ino ? CBM_DAEMON_IPC_NAMES_INTACT
-                                                                      : replaced;
+    bool same_file = named.st_dev == held.st_dev && named.st_ino == held.st_ino;
+    return same_file ? CBM_DAEMON_IPC_NAMES_INTACT : replaced;
 }
 
 static cbm_daemon_ipc_names_state_t posix_participant_guard_name_state(
@@ -4020,10 +4018,9 @@ static cbm_daemon_ipc_names_state_t posix_listener_socket_name_state(
     if (posix_fstatat_no_eintr(listener->dir_fd, name, &status) != 0) {
         return errno == ENOENT ? CBM_DAEMON_IPC_NAMES_SOCKET_MISSING : CBM_DAEMON_IPC_NAMES_IO;
     }
-    return S_ISSOCK(status.st_mode) && status.st_dev == listener->socket_identity.device &&
-                   status.st_ino == listener->socket_identity.inode
-               ? CBM_DAEMON_IPC_NAMES_INTACT
-               : CBM_DAEMON_IPC_NAMES_SOCKET_MISSING;
+    bool bound = S_ISSOCK(status.st_mode) && status.st_dev == listener->socket_identity.device &&
+                 status.st_ino == listener->socket_identity.inode;
+    return bound ? CBM_DAEMON_IPC_NAMES_INTACT : CBM_DAEMON_IPC_NAMES_SOCKET_MISSING;
 }
 
 /* The identity record: still the inode this listener published, and still
@@ -4077,9 +4074,9 @@ cbm_daemon_ipc_names_state_t cbm_daemon_ipc_listener_names_intact(
     if (!endpoint_runtime_still_valid(&view)) {
         return CBM_DAEMON_IPC_NAMES_IO;
     }
-    cbm_daemon_ipc_names_state_t state =
-        posix_held_name_state(listener->dir_fd, reservation->process_entry->lock_name,
-                              reservation->fd, CBM_DAEMON_IPC_NAMES_LIFETIME_REPLACED);
+    const char *lifetime_name = reservation->process_entry->lock_name;
+    cbm_daemon_ipc_names_state_t state = posix_held_name_state(
+        listener->dir_fd, lifetime_name, reservation->fd, CBM_DAEMON_IPC_NAMES_LIFETIME_REPLACED);
     if (state == CBM_DAEMON_IPC_NAMES_INTACT) {
         state = posix_listener_socket_name_state(listener, listener->socket_name);
     }

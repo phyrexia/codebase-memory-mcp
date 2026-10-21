@@ -1285,8 +1285,7 @@ typedef enum {
 
 static host_lifetime_end_t host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
                                                   atomic_int *stop_requested, host_state_t *host,
-                                                  bool permanent,
-                                                  host_runtime_dir_t *runtime_dir) {
+                                                  bool permanent, host_runtime_dir_t *runtime_dir) {
     uint64_t initial_deadline = cbm_now_ms() + HOST_INITIAL_CLIENT_TIMEOUT_MS;
     uint64_t stopping_deadline = 0;
     bool orphaned = false;
