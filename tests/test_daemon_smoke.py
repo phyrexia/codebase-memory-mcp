@@ -2406,6 +2406,11 @@ EXIT_ALREADY_SERVED = 73
 EXIT_RUNTIME_DIR_ORPHANED = 75
 AGED_SECONDS = 10 * 24 * 3600
 FRESH_SECONDS = 2.0
+RUNTIME_DIR_INITIALIZE_PARAMS = {
+    "protocolVersion": "2024-11-05",
+    "capabilities": {},
+    "clientInfo": {"name": "cbm-runtime-dir-smoke", "version": "1"},
+}
 
 
 class PrivateDaemonRuntime:
@@ -2637,6 +2642,127 @@ def test_permanent_daemon_exits_within_2s_when_lifetime_lock_is_replaced(binary,
         runtime.cleanup()
 
 
+def test_orphaned_daemon_cuts_an_inflight_request_and_still_exits_75(binary, root):
+    """D1 §B with work in flight: an index_repository held by the hang seam
+    when the lifetime lock is replaced. The orphan stop is the ordinary
+    non-emergency stop, which cancels rather than answers: the client sees the
+    request end (its frontend loses the daemon transport and exits, or gets an
+    error) without hanging, the supervised worker tree is contained, the
+    daemon still exits 75, and a fresh session afterwards is served."""
+    repo = root / "repo"
+    repo.mkdir(mode=0o700)
+    (repo / "hang_me.py").write_text("def smoke():\n    return 1\n", encoding="utf-8")
+    descendant_pid_path = root / "worker-descendant.pid"
+    runtime = PrivateDaemonRuntime(
+        binary,
+        root,
+        {
+            "CBM_TEST_HANG_ON": "hang_me",
+            "CBM_TEST_WORKER_DESCENDANT_PID_FILE": str(descendant_pid_path),
+        },
+    )
+    clients = []
+    request_id = 9203
+    try:
+        process = runtime.start_permanent()
+        runtime.wait_serving()
+        client = start_ready_mcp_client(
+            binary,
+            runtime.env,
+            root / "inflight-client.err",
+            clients,
+            RUNTIME_DIR_INITIALIZE_PARAMS,
+            9201,
+            "in-flight client",
+        )
+        client.send(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "index_repository",
+                    "arguments": {"repo_path": str(repo), "mode": "fast"},
+                },
+            }
+        )
+        wait_until(
+            lambda: read_private_pid_fields(descendant_pid_path, 1) is not None,
+            OPERATION_TIMEOUT,
+            "the index worker to start",
+        )
+        descendant_pid = read_private_pid_fields(descendant_pid_path, 1)[0]
+        check(
+            not client.has_response(request_id),
+            "the index request finished instead of reaching the hang injector",
+        )
+        check(process.poll() is None, "the daemon exited before its lock was replaced")
+
+        replace_like_a_cleaner(runtime.name(".lifetime.lock"))
+        wait_until(
+            lambda: client.has_response(request_id) or client.process.poll() is not None,
+            10.0,
+            "the in-flight request to be cut instead of hanging",
+        )
+        if client.has_response(request_id):
+            check(
+                "error" in client.wait_response(request_id, timeout=1),
+                "the orphan stop answered the cancelled request with a result",
+            )
+        try:
+            # Above the 10 s drain bound, so a slow but orderly exit still
+            # shows its status instead of a timeout.
+            code = process.wait(timeout=25.0)
+        except subprocess.TimeoutExpired as exc:
+            raise SmokeFailure(
+                "the orphaned daemon kept running with a request in flight"
+            ) from exc
+        check(code == EXIT_RUNTIME_DIR_ORPHANED, "orphaned daemon exited {}".format(code))
+        check(
+            runtime.logged("daemon.runtime_dir.orphaned", "detail", "lifetime_replaced"),
+            "no daemon.runtime_dir.orphaned detail=lifetime_replaced",
+        )
+        check(
+            runtime.logged("daemon.lifetime_end", "reason", "runtime_dir_orphaned"),
+            "no daemon.lifetime_end reason=runtime_dir_orphaned",
+        )
+        wait_until(
+            lambda: process_gone_or_zombie(descendant_pid),
+            20,
+            "the cancelled index worker tree to be contained",
+        )
+        for suffix in (".sock", ".anc", ".sock.identity"):
+            check(
+                not os.path.lexists(str(runtime.name(suffix))),
+                "the orphaned daemon left its " + suffix + " behind",
+            )
+        # A fresh session launches a new generation on the same runtime dir
+        # (the recreated lifetime lock is free) and is served.
+        start_ready_mcp_client(
+            binary,
+            runtime.env,
+            root / "fresh-client.err",
+            clients,
+            RUNTIME_DIR_INITIALIZE_PARAMS,
+            9301,
+            "session after the orphan exit",
+        )
+    except (SmokeFailure, subprocess.TimeoutExpired, OSError, ValueError):
+        print(runtime.diagnostics(), file=sys.stderr)
+        raise
+    finally:
+        for client in clients:
+            client.cleanup()
+        try:
+            wait_until(
+                lambda: runtime.serving_pid() is None,
+                SHUTDOWN_TIMEOUT,
+                "the post-orphan generation to retire with its client",
+            )
+        finally:
+            runtime.cleanup()
+
+
 def test_permanent_daemon_tolerates_one_io_observation_and_exits_after_two(binary, root):
     """D1 §B hysteresis: a check that cannot read the runtime directory once
     is forgiven; two in a row end the generation with 75. The check period is
@@ -2684,18 +2810,13 @@ def test_second_daemon_exits_73_when_a_generation_already_serves(binary, root):
     well under the 12 s claim window with 73 and leaves the first serving."""
     runtime = PrivateDaemonRuntime(binary, root)
     clients = []
-    initialize_params = {
-        "protocolVersion": "2024-11-05",
-        "capabilities": {},
-        "clientInfo": {"name": "cbm-runtime-dir-smoke", "version": "1"},
-    }
     try:
         start_ready_mcp_client(
             binary,
             runtime.env,
             root / "session-client.err",
             clients,
-            initialize_params,
+            RUNTIME_DIR_INITIALIZE_PARAMS,
             9101,
             "session-managed client",
         )
@@ -2720,9 +2841,16 @@ def test_second_daemon_exits_73_when_a_generation_already_serves(binary, root):
             for record in runtime.events("daemon.start_skipped")
             if record.get("reason") == "generation_already_served"
         ]
+        # serving_permanent describes the generation that serves (here the
+        # client-launched one), not the daemon that is leaving.
         check(
-            any(record.get("pid") == str(served_pid) for record in skipped),
-            "no daemon.start_skipped naming pid {}".format(served_pid),
+            any(
+                record.get("pid") == str(served_pid) and record.get("serving_permanent") == "0"
+                for record in skipped
+            ),
+            "no daemon.start_skipped naming pid {} serving_permanent=0: {!r}".format(
+                served_pid, skipped
+            ),
         )
         check(runtime.serving_pid() == served_pid, "the first generation stopped serving")
     except (SmokeFailure, subprocess.TimeoutExpired, OSError):
@@ -2752,6 +2880,7 @@ def main_runtime_dir_resilience(binary):
     scenarios = (
         test_permanent_daemon_refreshes_runtime_names_each_interval,
         test_permanent_daemon_exits_within_2s_when_lifetime_lock_is_replaced,
+        test_orphaned_daemon_cuts_an_inflight_request_and_still_exits_75,
         test_permanent_daemon_tolerates_one_io_observation_and_exits_after_two,
         test_second_daemon_exits_73_when_a_generation_already_serves,
     )
