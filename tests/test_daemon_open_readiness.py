@@ -25,7 +25,11 @@ This guard uses a real UI build and isolated daemon generations:
 * a refused UI handshake under ``--port=N`` proves the error names the port
   rather than a browser nobody asked for;
 * malformed ``--port`` values (trailing text, values that wrap a C ``int``,
-  out of range) prove they are refused before anything starts.
+  out of range) prove they are refused before anything starts;
+* a ``config.json`` that exists but cannot be opened (it resolves through a
+  regular file: ENOTDIR) proves only a missing file auto-enables the UI: the
+  setting reads ``false``, a bare start reports ``ui: disabled`` and the
+  daemon logs ``ui.config.unreadable`` once, not on every poll.
 
 Build the fixture with test seams so browser launching is recorded rather than
 performed and the two negative cases can use a short deterministic deadline:
@@ -35,12 +39,13 @@ performed and the two negative cases can use a short deterministic deadline:
 
 ``--case NAME`` (repeatable) runs only the named cases, in their usual order:
 delayed-open, foreign-port, active-open, off-bare, off-port, off-open,
-active-off, refused-port, bad-port.
+active-off, refused-port, bad-port, unreadable-config.
 ``--keep-logs DIR`` copies every case's ``<cache>/logs`` (``cbm-daemon.log``
 and the conflict/activation records) into ``DIR/<cache>/logs`` before the work
 directory is removed, whether the run passed or not. The caches are, in case
 order: cache-delayed, cache-occupied, cache-active, cache-off-bare,
-cache-off-port, cache-off-open, cache-active-off, cache-refused, cache-bad-port.
+cache-off-port, cache-off-open, cache-active-off, cache-refused, cache-bad-port,
+cache-unreadable.
 
 The work directory lives under the system temp directory (``TMPDIR`` on
 Linux), and the daemon's private-directory check applies to its ancestry: no
@@ -635,6 +640,54 @@ def assert_malformed_port_is_refused(binary, work):
         stop_daemon(binary, env, daemon_pid)
 
 
+def assert_unreadable_config_keeps_ui_off(binary, work):
+    if os.name == "nt":
+        # A path through a regular file is ERROR_PATH_NOT_FOUND there, which
+        # counts as absent; symlinks also need a privilege.
+        print("SKIP: unreadable-config is POSIX-only")
+        return True
+    cache = os.path.join(work, "cache-unreadable")
+    marker = os.path.join(work, "browser-unreadable.txt")
+    os.makedirs(cache, exist_ok=True)
+    env = fixture_environment(work, cache, marker, READY_TIMEOUT_MS)
+    # config.json resolves through a regular file, so opening it fails with
+    # ENOTDIR even as root. Only a missing file may auto-enable the UI.
+    plain_file = os.path.join(work, "plain-file")
+    with open(plain_file, "w", encoding="utf-8") as handle:
+        handle.write("x")
+    os.symlink(os.path.join(plain_file, "config.json"), os.path.join(cache, "config.json"))
+    daemon_pid = 0
+    try:
+        enabled = persisted_ui_setting(binary, env, "ui_enabled")
+        if enabled != "false":
+            print("RED: an unreadable config.json read as ui_enabled=%s; only a missing "
+                  "file may auto-enable the UI" % enabled)
+            return False
+        start = run_cli(binary, env, ["daemon", "start"])
+        text = output_text(start)
+        daemon_pid = pid_from(text)
+        if start.returncode != 0 or "ui: disabled" not in text or "warming" in text:
+            print("RED: a bare `daemon start` over an unreadable config.json must leave the "
+                  "UI off:\n%s" % text[:700])
+            return False
+        # Several of the daemon's once-a-second config polls.
+        time.sleep(3.0)
+        daemon_log = os.path.join(cache, "logs", "cbm-daemon.log")
+        log_text = ""
+        if os.path.exists(daemon_log):
+            with open(daemon_log, "r", encoding="utf-8", errors="replace") as handle:
+                log_text = handle.read()
+        logged = log_text.count("ui.config.unreadable")
+        if logged != 1:
+            print("RED: the daemon must log the unreadable config.json once, not on every "
+                  "poll (logged %d times)" % logged)
+            return False
+        print("PASS: an unreadable config.json keeps the UI off and is reported once")
+        return True
+    finally:
+        stop_daemon(binary, env, daemon_pid)
+
+
 # Run order and the names --case accepts.
 CASES = (
     ("delayed-open", assert_delayed_success),
@@ -646,6 +699,7 @@ CASES = (
     ("active-off", assert_active_daemon_keeps_disabled_ui),
     ("refused-port", assert_refused_port_names_the_port),
     ("bad-port", assert_malformed_port_is_refused),
+    ("unreadable-config", assert_unreadable_config_keeps_ui_off),
 )
 
 
