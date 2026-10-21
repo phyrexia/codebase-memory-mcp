@@ -2733,8 +2733,8 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     char hard_cap_text[32];
     (void)snprintf(capacity_text, sizeof(capacity_text), "%zu", service->worker_capacity);
     (void)snprintf(hard_cap_text, sizeof(hard_cap_text), "%d", RUNTIME_MAX_CLIENTS_HARD);
-    cbm_log_info("daemon.runtime.capacity", "max_clients", capacity_text, "hard_cap",
-                 hard_cap_text, "max_clients_source",
+    cbm_log_info("daemon.runtime.capacity", "max_clients", capacity_text, "hard_cap", hard_cap_text,
+                 "max_clients_source",
                  cbm_daemon_max_clients_source_name(service->max_clients_source));
     return service;
 }
@@ -3133,9 +3133,8 @@ static bool runtime_control_request_send(const cbm_daemon_ipc_endpoint_t *endpoi
                                          const cbm_daemon_build_identity_t *identity,
                                          cbm_daemon_runtime_operation_t operation,
                                          uint32_t timeout_ms, uint32_t response_size,
-                                         uint32_t full_response_size,
-                                         uint32_t *payload_length_out, uint8_t **payload_out,
-                                         uint64_t *muted_holder_pid_out) {
+                                         uint32_t full_response_size, uint32_t *payload_length_out,
+                                         uint8_t **payload_out, uint64_t *muted_holder_pid_out) {
     *payload_out = NULL;
     if (payload_length_out) {
         *payload_length_out = 0;
@@ -3159,8 +3158,8 @@ static bool runtime_control_request_send(const cbm_daemon_ipc_endpoint_t *endpoi
                                                 request, (uint32_t)sizeof(request));
     cbm_daemon_frame_t frame = {0};
     uint8_t *payload = NULL;
-    int received = sent ? cbm_daemon_ipc_receive_frame_bounded(
-                              connection, timeout_ms, full_response_size, &frame, &payload)
+    int received = sent ? cbm_daemon_ipc_receive_frame_bounded(connection, timeout_ms,
+                                                               full_response_size, &frame, &payload)
                         : 0;
     if (muted_holder_pid_out && sent &&
         (received != 1 || (frame.type == CBM_DAEMON_FRAME_RESPONSE && frame.flags != operation))) {
@@ -3255,20 +3254,18 @@ bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint
         status_out->memory_budget_bytes = runtime_control_read_u64(payload + 121U);
         status_out->index_workers =
             (uint32_t)(((uint32_t)payload[129] << 8) | (uint32_t)payload[130]);
-        status_out->budget_source =
-            payload[131] <= (uint8_t)CBM_DAEMON_BUDGET_SOURCE_ENV
-                ? (cbm_daemon_budget_source_t)payload[131]
-                : CBM_DAEMON_BUDGET_SOURCE_RAM_FRACTION;
+        status_out->budget_source = payload[131] <= (uint8_t)CBM_DAEMON_BUDGET_SOURCE_ENV
+                                        ? (cbm_daemon_budget_source_t)payload[131]
+                                        : CBM_DAEMON_BUDGET_SOURCE_RAM_FRACTION;
         status_out->has_budget_status = true;
     }
     if (payload_length >= CBM_DAEMON_STATUS_RESPONSE_FULL_SIZE) {
         status_out->connections_peak = runtime_control_read_u32(payload + 132U);
         status_out->capacity_rejected = runtime_control_read_u64(payload + 136U);
         status_out->max_clients = runtime_control_read_u32(payload + 144U);
-        status_out->max_clients_source =
-            payload[148] <= (uint8_t)CBM_DAEMON_MAX_CLIENTS_SOURCE_ENV
-                ? (cbm_daemon_max_clients_source_t)payload[148]
-                : CBM_DAEMON_MAX_CLIENTS_SOURCE_DEFAULT;
+        status_out->max_clients_source = payload[148] <= (uint8_t)CBM_DAEMON_MAX_CLIENTS_SOURCE_ENV
+                                             ? (cbm_daemon_max_clients_source_t)payload[148]
+                                             : CBM_DAEMON_MAX_CLIENTS_SOURCE_DEFAULT;
         status_out->has_capacity_status = true;
     }
     free(payload);
@@ -3285,8 +3282,8 @@ bool cbm_daemon_runtime_request_stop(const cbm_daemon_ipc_endpoint_t *endpoint,
     memset(result_out, 0, sizeof(*result_out));
     uint8_t *payload = NULL;
     if (!runtime_control_request_send(endpoint, identity, CBM_DAEMON_RUNTIME_OP_STOP, timeout_ms,
-                                      CBM_DAEMON_STOP_RESPONSE_SIZE,
-                                      CBM_DAEMON_STOP_RESPONSE_SIZE, NULL, &payload, NULL)) {
+                                      CBM_DAEMON_STOP_RESPONSE_SIZE, CBM_DAEMON_STOP_RESPONSE_SIZE,
+                                      NULL, &payload, NULL)) {
         return false;
     }
     result_out->accepted = (payload[1] & 0x01U) != 0U;

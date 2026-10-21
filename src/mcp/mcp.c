@@ -11617,10 +11617,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * from repo_path — passing the derived name is not an alias. */
     if (name_overridden) {
         char *derived_name = cbm_project_name_from_path(repo_path);
-        char *alias_of =
-            derived_name && strcmp(derived_name, project_name) != 0
-                ? project_alias_for_root(repo_path, project_name)
-                : NULL;
+        char *alias_of = derived_name && strcmp(derived_name, project_name) != 0
+                             ? project_alias_for_root(repo_path, project_name)
+                             : NULL;
         free(derived_name);
         if (alias_of) {
             cbm_log_info("index.project_alias", "project", project_name, "alias_of", alias_of,

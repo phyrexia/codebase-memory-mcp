@@ -1156,8 +1156,8 @@ static uint64_t host_cadence_seam_ms(const char *name, uint64_t production_ms,
         char *end = NULL;
         errno = 0;
         unsigned long long parsed = strtoull(configured, &end, 10);
-        if (errno == 0 && end && end != configured && *end == '\0' &&
-            parsed >= HOST_WAIT_TICK_MS && parsed <= ceiling_ms) {
+        if (errno == 0 && end && end != configured && *end == '\0' && parsed >= HOST_WAIT_TICK_MS &&
+            parsed <= ceiling_ms) {
             return (uint64_t)parsed;
         }
     }
@@ -1221,8 +1221,8 @@ static void host_runtime_dir_keepalive_at(host_runtime_dir_t *dir,
 static uint64_t host_names_check_ms(void) {
     uint64_t period = HOST_NAMES_CHECK_MS;
 #ifdef CBM_ENABLE_TEST_SEAMS
-    period = host_cadence_seam_ms("CBM_TEST_NAMES_INTACT_MS", period,
-                                  HOST_NAMES_CHECK_SEAM_CEILING_MS);
+    period =
+        host_cadence_seam_ms("CBM_TEST_NAMES_INTACT_MS", period, HOST_NAMES_CHECK_SEAM_CEILING_MS);
 #endif
     return period;
 }

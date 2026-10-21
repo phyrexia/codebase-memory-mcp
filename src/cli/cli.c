@@ -7971,9 +7971,9 @@ static bool config_key_is_session_root(const char *key) {
 /* The three daemon-start runtime knobs share one validating writer, so one
  * predicate decides which `config set` values are checked instead of stored. */
 static bool config_key_is_runtime_knob(const char *key) {
-    return key && (strcmp(key, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB) == 0 ||
-                   strcmp(key, CBM_CONFIG_INDEX_WORKERS) == 0 ||
-                   strcmp(key, CBM_CONFIG_MAX_CLIENTS) == 0);
+    return key &&
+           (strcmp(key, CBM_CONFIG_INDEX_MEMORY_BUDGET_MB) == 0 ||
+            strcmp(key, CBM_CONFIG_INDEX_WORKERS) == 0 || strcmp(key, CBM_CONFIG_MAX_CLIENTS) == 0);
 }
 
 static int config_index_policy_write(cbm_config_t *config, const char *key, const char *value) {
@@ -8018,9 +8018,10 @@ static int config_session_root_write(cbm_config_t *config, const char *key, cons
  * session_root that is the validated mode — never the raw bytes a hand edit
  * left in _config.db, which the reader rejects back to the default. */
 static void config_session_root_read(cbm_config_t *cfg, char *out, size_t out_sz) {
-    snprintf(out, out_sz, "%s", cbm_config_session_root(cfg, NULL) == CBM_SESSION_ROOT_CWD
-                                    ? CBM_CONFIG_SESSION_ROOT_CWD
-                                    : CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL);
+    snprintf(out, out_sz, "%s",
+             cbm_config_session_root(cfg, NULL) == CBM_SESSION_ROOT_CWD
+                 ? CBM_CONFIG_SESSION_ROOT_CWD
+                 : CBM_CONFIG_SESSION_ROOT_GIT_TOPLEVEL);
 }
 
 /* B1/C8: validated write for the three runtime knobs. Two of their upper

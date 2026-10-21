@@ -297,8 +297,8 @@ size_t cbm_mem_clamp_to_available(size_t budget, size_t available) {
  * index_memory_budget_mb config — are deliberate choices; a budget derived
  * from RAM is not. */
 static bool mem_budget_source_is_explicit(const char *source) {
-    return source != NULL && (strcmp(source, "CBM_MEM_BUDGET_MB") == 0 ||
-                              strcmp(source, "config") == 0);
+    return source != NULL &&
+           (strcmp(source, "CBM_MEM_BUDGET_MB") == 0 || strcmp(source, "config") == 0);
 }
 
 /* The parent already divided the aggregate budget (user override or

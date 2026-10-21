@@ -3922,8 +3922,7 @@ static bool posix_held_fd_touch(int fd, int *errno_out) {
  * inode this listener published. Absent or replaced is no refresh failure:
  * the names check reports it, and refreshing a name that is no longer ours
  * would keep somebody else's file alive. */
-static bool posix_identity_record_touch(const cbm_daemon_ipc_listener_t *listener,
-                                        int *errno_out) {
+static bool posix_identity_record_touch(const cbm_daemon_ipc_listener_t *listener, int *errno_out) {
     *errno_out = 0;
     int fd;
     do {

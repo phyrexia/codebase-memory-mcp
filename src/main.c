@@ -2552,8 +2552,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
             } else {
                 (void)snprintf(index_workers, sizeof(index_workers), "auto");
             }
-            printf("  memory_budget_bytes: %llu\n",
-                   (unsigned long long)status.memory_budget_bytes);
+            printf("  memory_budget_bytes: %llu\n", (unsigned long long)status.memory_budget_bytes);
             printf("  budget_source: %s\n", cbm_daemon_budget_source_name(status.budget_source));
             printf("  index_workers: %s\n", index_workers);
         } else {

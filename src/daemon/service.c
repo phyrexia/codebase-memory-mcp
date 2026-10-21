@@ -375,7 +375,7 @@ static const char FINGERPRINT_CACHE_MAGIC[] = "cbm-fp-cache 1 ";
 
 /* Resolved once per process (tristate) so the SQLite lookup cannot run on
  * every fingerprint call. */
-static atomic_int g_fingerprint_cache_state; /* 0 unknown, >0 enabled, <0 disabled */
+static atomic_int g_fingerprint_cache_state;   /* 0 unknown, >0 enabled, <0 disabled */
 static atomic_size_t g_fingerprint_hash_count; /* completed file hash computations */
 /* Per-process sequence feeding fingerprint_cache_writer_id. */
 static atomic_uint_fast64_t g_fingerprint_cache_writer_sequence;
@@ -466,8 +466,7 @@ static bool fingerprint_cache_parse(const char *data, size_t length,
     const char *end = data + length;
     uint64_t fields[4];
     for (size_t i = 0; i < 4; i++) {
-        if (!fingerprint_cache_field(&cursor, end, &fields[i]) || cursor == end ||
-            *cursor != ' ') {
+        if (!fingerprint_cache_field(&cursor, end, &fields[i]) || cursor == end || *cursor != ' ') {
             return false;
         }
         cursor++;
@@ -536,10 +535,10 @@ static void fingerprint_cache_store(const fingerprint_file_identity_t *identity,
         return;
     }
     char line[FINGERPRINT_CACHE_CAP];
-    int length = snprintf(line, sizeof(line),
-                          "%s%" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %s\n",
-                          FINGERPRINT_CACHE_MAGIC, identity->device, identity->inode,
-                          identity->size, identity->mtime_ns, fingerprint);
+    int length =
+        snprintf(line, sizeof(line), "%s%" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %s\n",
+                 FINGERPRINT_CACHE_MAGIC, identity->device, identity->inode, identity->size,
+                 identity->mtime_ns, fingerprint);
     if (length <= 0 || (size_t)length >= sizeof(line)) {
         return;
     }

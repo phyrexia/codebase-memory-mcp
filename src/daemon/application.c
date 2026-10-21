@@ -2806,10 +2806,9 @@ static cbm_daemon_runtime_application_status_t application_request_dispatch(
          * augment requests (11 crashes on 2026-08-13). */
         const char *hook_metric_name = metrics_hook_name(&outcome);
         const char *hook_project = cbm_mcp_server_session_project(session->mcp);
-        cbm_daemon_application_metrics_record(application, "hook", hook_metric_name,
-                                              hook_project ? hook_project : "",
-                                              (cbm_now_ms() - hook_t0_ms) * 1000,
-                                              outcome.status == CBM_HOOK_AUGMENT_ERROR);
+        cbm_daemon_application_metrics_record(
+            application, "hook", hook_metric_name, hook_project ? hook_project : "",
+            (cbm_now_ms() - hook_t0_ms) * 1000, outcome.status == CBM_HOOK_AUGMENT_ERROR);
         free(input);
         if (response) {
             size_t response_length = strlen(response);

@@ -280,7 +280,7 @@ cbm_project_registry_status_t cbm_project_registry_lookup(const char *db_path,
         cbm_project_registry_status_t status = CBM_PROJECT_REGISTRY_ABSENT;
         if (entry->resolvable) {
             status = identity_clone(&entry->identity, out) ? CBM_PROJECT_REGISTRY_OK
-                                                          : CBM_PROJECT_REGISTRY_OOM;
+                                                           : CBM_PROJECT_REGISTRY_OOM;
         }
         registry_unlock();
         return status;
@@ -292,7 +292,8 @@ cbm_project_registry_status_t cbm_project_registry_lookup(const char *db_path,
     if (status != CBM_PROJECT_REGISTRY_OOM) {
         /* Unresolvable files are cached too: a ghost .db would otherwise be
          * reopened on every call. */
-        registry_store(db_path, info.size, info.mtime_ns, status == CBM_PROJECT_REGISTRY_OK, &fresh);
+        registry_store(db_path, info.size, info.mtime_ns, status == CBM_PROJECT_REGISTRY_OK,
+                       &fresh);
     }
     if (status == CBM_PROJECT_REGISTRY_OK) {
         *out = fresh;

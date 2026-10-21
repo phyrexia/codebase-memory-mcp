@@ -1801,9 +1801,9 @@ char *cbm_hook_augment_process_for(cbm_mcp_server_t *srv, const char *input_json
  * Metric names are checked against this catalog so a payload that invents an
  * event name cannot mint a metrics slot. */
 static const char *const ha_event_names[] = {
-    "PreToolUse",    "PostToolUse",     "AfterTool",      "SessionStart",
+    "PreToolUse",    "PostToolUse",      "AfterTool",      "SessionStart",
     "SubagentStart", "UserPromptSubmit", "PostCompaction", "TaskStart",
-    "TaskResume",    "PreCompact",      "pre_llm_call",
+    "TaskResume",    "PreCompact",       "pre_llm_call",
 };
 
 bool cbm_hook_augment_event_is_known(const char *event) {
