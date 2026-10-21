@@ -213,8 +213,7 @@ cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoin
  * Windows always reports false: its rendezvous is not a socket name. The flag
  * is diagnostic only; nothing may treat it as proof of absence. */
 cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect_ex(const cbm_daemon_ipc_endpoint_t *endpoint,
-                                                       uint32_t timeout_ms,
-                                                       bool *name_absent_out);
+                                                       uint32_t timeout_ms, bool *name_absent_out);
 void cbm_daemon_ipc_connection_close(cbm_daemon_ipc_connection_t *connection);
 
 /* Bounded wait for the peer to consume everything already sent, by reading

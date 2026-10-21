@@ -3601,8 +3601,7 @@ int cbm_daemon_ipc_endpoint_probe(const cbm_daemon_ipc_endpoint_t *endpoint, uin
 }
 
 cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect_ex(const cbm_daemon_ipc_endpoint_t *endpoint,
-                                                       uint32_t timeout_ms,
-                                                       bool *name_absent_out) {
+                                                       uint32_t timeout_ms, bool *name_absent_out) {
     if (name_absent_out) {
         *name_absent_out = false;
     }
@@ -6744,8 +6743,7 @@ int cbm_daemon_ipc_endpoint_probe(const cbm_daemon_ipc_endpoint_t *endpoint, uin
 }
 
 cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect_ex(const cbm_daemon_ipc_endpoint_t *endpoint,
-                                                       uint32_t timeout_ms,
-                                                       bool *name_absent_out) {
+                                                       uint32_t timeout_ms, bool *name_absent_out) {
     /* The named-pipe rendezvous has no socket name a /tmp cleaner can take. */
     if (name_absent_out) {
         *name_absent_out = false;
