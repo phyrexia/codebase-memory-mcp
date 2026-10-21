@@ -1,4 +1,5 @@
-r"""Product guard for ``daemon start --open`` UI readiness.
+r"""Product guard for the UI side of ``daemon start``: ``--open`` readiness and
+the persisted ``ui_enabled`` switch.
 
 The control socket becomes available before the HTTP listener does.  ``--open``
 is the one synchronous user request in that flow: it must wait for the *CBM HTTP
@@ -11,7 +12,12 @@ This guard uses a real UI build and isolated daemon generations:
 * a foreign service returning the exact formerly accepted HTML markers proves
   public page text is not treated as daemon identity;
 * a second ``daemon start --open`` proves the already-active daemon path obtains
-  the same generation-bound proof over a fresh authenticated IPC client.
+  the same generation-bound proof over a fresh authenticated IPC client;
+* a bare ``daemon start`` over ``config set ui_enabled false`` proves the
+  operator's switch survives it: the setting stays ``false``, no listener binds
+  and ``daemon status`` names the switch that turns the UI back on;
+* ``daemon start --port=N`` and ``daemon start --open`` over the same switch
+  prove that asking for the UI explicitly still turns it on.
 
 Build the fixture with test seams so browser launching is recorded rather than
 performed and the two negative cases can use a short deterministic deadline:
@@ -327,6 +333,151 @@ def assert_active_daemon_open(binary, work):
         stop_daemon(binary, env, daemon_pid)
 
 
+class FixtureError(Exception):
+    """The fixture could not be prepared: exit code 2, not a behavior RED."""
+
+
+def run_cli(binary, env, args, timeout=30):
+    return subprocess.run([binary] + list(args), capture_output=True, timeout=timeout, env=env)
+
+
+def free_loopback_port():
+    probe, port = occupied_loopback_port()
+    probe.close()
+    return port
+
+
+def loopback_port_answers_within(port, seconds):
+    deadline = time.monotonic() + seconds
+    while True:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.settimeout(0.5)
+        try:
+            probe.connect(("127.0.0.1", port))
+            return True
+        except OSError:
+            pass
+        finally:
+            probe.close()
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def persisted_ui_setting(binary, env, key):
+    result = run_cli(binary, env, ["config", "get", key])
+    if result.returncode != 0:
+        raise FixtureError("`config get %s` failed:\n%s" % (key, output_text(result)[:400]))
+    return (result.stdout or b"").decode("utf-8", "replace").strip()
+
+
+def disabled_ui_environment(binary, work, label, port):
+    """An isolated generation whose operator switched the UI off on `port`."""
+    cache = os.path.join(work, "cache-" + label)
+    marker = os.path.join(work, "browser-%s.txt" % label)
+    os.makedirs(cache, exist_ok=True)
+    env = fixture_environment(work, cache, marker, 10000)
+    # The port goes first: on a fresh cache a UI build auto-enables, so that
+    # write alone persists ui_enabled=true. The operator's switch comes last,
+    # through the supported surface (#1558), not a hand-written config.json.
+    for key, value in (("ui_port", str(port)), ("ui_enabled", "false")):
+        result = run_cli(binary, env, ["config", "set", key, value])
+        if result.returncode != 0:
+            raise FixtureError("`config set %s %s` failed:\n%s"
+                               % (key, value, output_text(result)[:400]))
+    if (persisted_ui_setting(binary, env, "ui_enabled") != "false" or
+            persisted_ui_setting(binary, env, "ui_port") != str(port)):
+        raise FixtureError("the disabled UI setting did not persist before the daemon started")
+    return env, marker
+
+
+def assert_bare_start_keeps_disabled_ui(binary, work):
+    port = free_loopback_port()
+    env, _ = disabled_ui_environment(binary, work, "off-bare", port)
+    daemon_pid = 0
+    try:
+        start = run_cli(binary, env, ["daemon", "start"])
+        text = output_text(start)
+        daemon_pid = pid_from(text)
+        if start.returncode != 0 or "daemon: started" not in text:
+            print("RED: a bare daemon start over a disabled UI did not start the daemon:\n%s"
+                  % text[:700])
+            return False
+        enabled = persisted_ui_setting(binary, env, "ui_enabled")
+        persisted_port = persisted_ui_setting(binary, env, "ui_port")
+        if enabled != "false" or persisted_port != str(port):
+            print("RED: a bare `daemon start` rewrote the persisted UI setting to "
+                  "ui_enabled=%s ui_port=%s (expected false/%d); `config set ui_enabled false` "
+                  "must survive it:\n%s" % (enabled, persisted_port, port, text[:700]))
+            return False
+        if "ui: disabled" not in text or "warming" in text or "did not accept" in text:
+            print("RED: a bare `daemon start` must report the UI as disabled instead of "
+                  "configuring it:\n%s" % text[:700])
+            return False
+        # The daemon re-reads config.json about once a second; three seconds of
+        # silence on the port spans several of those polls.
+        if loopback_port_answers_within(port, 3.0):
+            print("RED: a UI listener bound port %d although ui_enabled is false" % port)
+            return False
+        status = run_cli(binary, env, ["daemon", "status"], timeout=10)
+        status_text = output_text(status)
+        if (status.returncode != 0 or "ui: disabled" not in status_text or
+                "config set ui_enabled true" not in status_text):
+            print("RED: daemon status must report the UI as disabled and name the switch "
+                  "that turns it back on:\n%s" % status_text[:700])
+            return False
+        print("PASS: a bare daemon start leaves a UI the operator switched off, off")
+        return True
+    finally:
+        stop_daemon(binary, env, daemon_pid)
+
+
+def assert_explicit_ui_request_enables_disabled_ui(binary, work):
+    persisted_port = free_loopback_port()
+    requested_port = free_loopback_port()
+    while requested_port == persisted_port:
+        requested_port = free_loopback_port()
+    cases = (
+        ("off-port", ["--port=%d" % requested_port], requested_port),
+        ("off-open", ["--open"], persisted_port),
+    )
+    for label, flags, expected_port in cases:
+        env, marker = disabled_ui_environment(binary, work, label, persisted_port)
+        daemon_pid = 0
+        try:
+            start = run_cli(binary, env, ["daemon", "start"] + flags)
+            text = output_text(start)
+            daemon_pid = pid_from(text)
+            command = "daemon start " + " ".join(flags)
+            enabled = persisted_ui_setting(binary, env, "ui_enabled")
+            port_now = persisted_ui_setting(binary, env, "ui_port")
+            if (start.returncode != 0 or enabled != "true" or
+                    port_now != str(expected_port)):
+                print("RED: `%s` asks for the UI, so it must turn it on over "
+                      "ui_enabled=false (got rc=%d ui_enabled=%s ui_port=%s, expected "
+                      "true/%d):\n%s" % (command, start.returncode, enabled, port_now,
+                                          expected_port, text[:700]))
+                return False
+            if not loopback_port_answers_within(expected_port, 10.0):
+                print("RED: `%s` turned the UI on but nothing listens on port %d:\n%s"
+                      % (command, expected_port, text[:700]))
+                return False
+            if "--open" in flags:
+                expected_url = "http://127.0.0.1:%d" % expected_port
+                marker_text = ""
+                if os.path.exists(marker):
+                    with open(marker, "r", encoding="utf-8") as handle:
+                        marker_text = handle.read()
+                if expected_url not in text or marker_text != expected_url:
+                    print("RED: `%s` over a disabled UI did not open the verified "
+                          "endpoint:\n%s\nmarker=%r" % (command, text[:700], marker_text))
+                    return False
+            print("PASS: `%s` still turns on a UI the operator had switched off" % command)
+        finally:
+            stop_daemon(binary, env, daemon_pid)
+    return True
+
+
 def main():
     if len(sys.argv) != 2:
         print("usage: python3 test_daemon_open_readiness.py <ui-binary>")
@@ -352,7 +503,16 @@ def main():
             return 1
         if not assert_active_daemon_open(binary, work):
             return 1
-    print("\nGREEN: daemon --open is bound to verified UI endpoint readiness.")
+        try:
+            if not assert_bare_start_keeps_disabled_ui(binary, work):
+                return 1
+            if not assert_explicit_ui_request_enables_disabled_ui(binary, work):
+                return 1
+        except FixtureError as error:
+            print("SETUP FAIL: %s" % error)
+            return 2
+    print("\nGREEN: daemon --open is bound to verified UI endpoint readiness, and only an "
+          "explicit UI request overrides ui_enabled=false.")
     return 0
 
 
