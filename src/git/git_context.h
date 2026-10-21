@@ -2,6 +2,7 @@
 #define CBM_GIT_CONTEXT_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 typedef struct {
     bool is_git;
@@ -30,6 +31,32 @@ typedef struct {
  * Callers run this on every session start, so it stays fork-free; the richer
  * cbm_git_context_resolve() shells out to git and is not usable on that path. */
 bool cbm_git_is_linked_worktree(const char *path);
+
+/* Branch of the git work tree containing `path`: the value
+ * cbm_git_context_resolve() reports as `branch`, read from the repository's
+ * files instead of from seven git processes. list_projects detail=stats asks
+ * this once per listed project.
+ *
+ * Discovery follows git's: from the canonical `path` upward, the first `.git`
+ * wins — a directory is the git directory, a "gitdir: <path>" file (linked
+ * worktree, submodule) is followed exactly one level. A directory that is
+ * itself a git directory (bare repository, path inside .git) has no work tree
+ * and reports no branch. HEAD and the gitlink are untrusted input: read with a
+ * 4 KiB bound, never followed through a symlink, and accepted only as
+ *   "ref: refs/heads/<name>", with <name> a valid ref name -> <name>
+ *   a 40- or 64-hex object id                              -> "DETACHED"
+ * Any other on-disk form — the reftable stub "ref: refs/heads/.invalid", a
+ * symlinked HEAD, a symref outside refs/heads, a malformed or oversized file —
+ * costs ONE `git symbolic-ref --quiet --short HEAD`, read as resolve() reads
+ * it: a printed name is the branch, "not a symbolic ref" is "DETACHED", any
+ * other failure is no branch.
+ *
+ * Returns true with the NUL-terminated name in `out`, never truncated; false
+ * with `out` empty when there is no branch to report or it does not fit. Not
+ * mirrored from git, on purpose: GIT_DIR/GIT_CEILING_DIRECTORIES, the
+ * filesystem-boundary stop, the safe.directory ownership refusal, and the
+ * `--short` "heads/<name>" spelling git uses when a tag shares the name. */
+bool cbm_git_head_branch(const char *path, char *out, size_t out_size);
 
 int cbm_git_context_resolve(const char *path, cbm_git_context_t *out);
 void cbm_git_context_free(cbm_git_context_t *ctx);

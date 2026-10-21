@@ -678,7 +678,7 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 | Tool | Description |
 |------|-------------|
 | `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. |
-| `list_projects` | List all indexed projects. Node/edge counts, `branch`, and git detail are resolved only with `include_details` (alias `detail: "stats"`); `stats_source` reports whether the counts are `stored` (stamped when the generation was published) or `computed` (COUNT(*) at read time). `metadata_only: true` returns just name/root_path. |
+| `list_projects` | List all indexed projects. Node/edge counts, `branch`, and git detail are resolved only with `include_details` (alias `detail: "stats"`); `stats_source` reports whether the counts are `stored` (stamped when the generation was published) or `computed` (one COUNT(*) when the server first reads that generation, then cached). `branch` is read from the repository's `HEAD` without spawning git (one `git symbolic-ref` only for forms such as a reftable repository), so a stats page costs no git processes and reopens no database. `metadata_only: true` returns just name/root_path. |
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |
 | `check_index_coverage` | Check whether exact paths or a scope are indexed and fresh. A clean result means no recorded gap, not proof of completeness. |

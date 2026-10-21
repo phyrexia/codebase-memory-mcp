@@ -2,19 +2,29 @@
 
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
+#include "foundation/platform.h"
 #include "foundation/str_util.h"
 
 #include <ctype.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 enum {
     GIT_CMD_MAX = 1024,
     GIT_OUTPUT_MAX = 4096,
+    GIT_EXIT_UNKNOWN = -1, /* git could not be run, or did not exit normally */
 };
+
+/* The branch reported for a detached HEAD — by cbm_git_context_resolve() when
+ * `symbolic-ref` fails, and by cbm_git_head_branch() for an object-id HEAD. */
+#define GIT_DETACHED_BRANCH "DETACHED"
 
 /* Bounded worktree-status stream constants.
  * STATUS_FIELD_MAX is the largest single NUL-delimited record field we
@@ -54,11 +64,31 @@ static bool git_validate_repo_path(const char *repo_path) {
     return cbm_validate_shell_path_arg(repo_path);
 }
 
-static int git_capture(const char *repo_path, const char *git_args, char **out) {
-    if (!out) {
+/* Exit status of a cbm_pclose() result: POSIX pclose() reports a wait status,
+ * the Windows wrapper the child's exit code. -1 when the child did not exit
+ * normally or its status is unknown. */
+static int git_exit_status(int pclose_rc) {
+#ifdef _WIN32
+    return pclose_rc < 0 ? GIT_EXIT_UNKNOWN : pclose_rc;
+#else
+    if (pclose_rc < 0 || !WIFEXITED(pclose_rc)) {
+        return GIT_EXIT_UNKNOWN;
+    }
+    return WEXITSTATUS(pclose_rc);
+#endif
+}
+
+/* First output line of `git -C <repo_path> <git_args>`. Returns 0 with a heap
+ * copy in *out only when git exited 0 and printed a non-empty line; *exit_status
+ * receives git's exit status, GIT_EXIT_UNKNOWN when git could not be run or
+ * did not exit normally. */
+static int git_capture_status(const char *repo_path, const char *git_args, char **out,
+                              int *exit_status) {
+    if (!out || !exit_status) {
         return CBM_NOT_FOUND;
     }
     *out = NULL;
+    *exit_status = GIT_EXIT_UNKNOWN;
     if (!repo_path || !git_args || !git_validate_repo_path(repo_path)) {
         return CBM_NOT_FOUND;
     }
@@ -82,19 +112,23 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
     }
 
     char buf[GIT_OUTPUT_MAX];
-    if (!fgets(buf, sizeof(buf), fp)) {
-        cbm_pclose(fp);
+    bool got_line = fgets(buf, sizeof(buf), fp) != NULL;
+    *exit_status = git_exit_status(cbm_pclose(fp));
+    if (!got_line) {
         return CBM_NOT_FOUND;
     }
     trim_newlines(buf);
-
-    int rc = cbm_pclose(fp);
-    if (rc != 0 || buf[0] == '\0') {
+    if (*exit_status != 0 || buf[0] == '\0') {
         return CBM_NOT_FOUND;
     }
 
     *out = git_strdup(buf);
     return *out ? 0 : CBM_NOT_FOUND;
+}
+
+static int git_capture(const char *repo_path, const char *git_args, char **out) {
+    int exit_status = 0;
+    return git_capture_status(repo_path, git_args, out, &exit_status);
 }
 
 static bool path_is_absolute(const char *path) {
@@ -169,6 +203,338 @@ bool cbm_git_is_linked_worktree(const char *path) {
     }
     struct stat st;
     return stat(commondir, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* ── Branch from HEAD, without a subprocess ───────────────────────── */
+
+enum {
+    /* A loose HEAD ("ref: refs/heads/<name>" or an object id) and a gitlink
+     * file ("gitdir: <path>") are one short line. Ref names and git-directory
+     * paths live under PATH_MAX, so a file this large is neither and is never
+     * parsed. */
+    GIT_SMALL_FILE_MAX = CBM_SZ_4K,
+    /* A canonical directory plus the entry probed inside it. */
+    GIT_PROBE_PATH_MAX = CBM_SZ_4K + CBM_SZ_64,
+    GIT_OID_HEX_SHA1 = 40,
+    GIT_OID_HEX_SHA256 = 64,
+    /* Bound on the upward search for .git; real trees are far shallower. */
+    GIT_DISCOVERY_DEPTH_MAX = CBM_SZ_256,
+    /* `git symbolic-ref --quiet` exits 1, silently, when HEAD exists but is
+     * not a symbolic ref (detached). "Not a repository" and every other fatal
+     * error exit 128. */
+    GIT_SYMREF_NOT_SYMBOLIC = 1,
+    ASCII_FIRST_PRINTABLE = 0x20,
+    ASCII_DEL = 0x7f,
+};
+
+typedef enum {
+    HEAD_NO_BRANCH = 0, /* nothing to report: no work tree, or no room in out */
+    HEAD_FILE_FOUND,    /* head_path names the HEAD file to read */
+    HEAD_BRANCH_READ,   /* out holds the branch, or the detached marker */
+    HEAD_ASK_GIT,       /* an on-disk form not parsed here: ask git, once */
+} head_lookup_t;
+
+static const char GITLINK_PREFIX[] = "gitdir: ";
+static const char HEAD_SYMREF_PREFIX[] = "ref:";
+static const char HEADS_PREFIX[] = "refs/heads/";
+static const char REF_LOCK_SUFFIX[] = ".lock";
+/* Bytes git's check_refname_format() never accepts in a ref name. */
+static const char REF_FORBIDDEN_BYTES[] = " ~^:?*[\\";
+
+/* Copy text into out whole; false, with out emptied, when it does not fit. */
+static bool copy_whole(char *out, size_t out_size, const char *text) {
+    size_t len = strlen(text);
+    if (len >= out_size) {
+        out[0] = '\0';
+        return false;
+    }
+    memcpy(out, text, len + 1);
+    return true;
+}
+
+static bool path_is_separator(char c) {
+#ifdef _WIN32
+    return c == '/' || c == '\\';
+#else
+    return c == '/';
+#endif
+}
+
+/* Append "/<name>" to the path in buf, in place (no doubled separator after a
+ * root such as "/"). False, leaving buf unchanged, when it does not fit. */
+static bool path_append(char *buf, size_t buf_size, const char *name) {
+    size_t len = strlen(buf);
+    bool add_separator = len > 0 && !path_is_separator(buf[len - 1]);
+    size_t name_len = strlen(name);
+    if (len + (add_separator ? 1U : 0U) + name_len >= buf_size) {
+        return false;
+    }
+    if (add_separator) {
+        buf[len++] = '/';
+    }
+    memcpy(buf + len, name, name_len + 1);
+    return true;
+}
+
+/* path + "/<name>" into out; false when it does not fit. */
+static bool path_join(char *out, size_t out_size, const char *path, const char *name) {
+    int n = snprintf(out, out_size, "%s", path);
+    return n >= 0 && (size_t)n < out_size && path_append(out, out_size, name);
+}
+
+/* Drop the last component of a canonical absolute path, in place. False at
+ * the root ("/", or "C:\" on Windows), which has no parent. */
+static bool path_parent_in_place(char *dir) {
+    char *last = NULL;
+    for (char *p = dir; *p; p++) {
+        if (path_is_separator(*p) && p[1] != '\0') {
+            last = p;
+        }
+    }
+    if (!last) {
+        return false;
+    }
+    size_t keep = (size_t)(last - dir);
+    bool parent_is_root = keep == 0;
+#ifdef _WIN32
+    parent_is_root = parent_is_root || (keep == 2 && dir[1] == ':');
+#endif
+    /* A root keeps its separator: "/a" -> "/", "C:\a" -> "C:\". */
+    dir[parent_is_root ? keep + 1 : keep] = '\0';
+    return true;
+}
+
+static bool is_ascii_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+}
+
+static void trim_trailing_space(char *s) {
+    size_t n = strlen(s);
+    while (n > 0 && is_ascii_space(s[n - 1])) {
+        s[--n] = '\0';
+    }
+}
+
+/* Read a small regular file whole, NUL-terminated. False when the path is not
+ * a regular file (a symlink is not followed), cannot be read, holds a NUL
+ * byte, or does not fit buf — never a truncated prefix. */
+static bool read_small_regular_file(const char *path, char *buf, size_t buf_size) {
+    cbm_path_info_t info;
+    if (buf_size == 0 || cbm_path_info_utf8(path, &info) != CBM_PATH_INFO_OK || !info.is_regular ||
+        info.size < 0 || (uint64_t)info.size >= buf_size) {
+        return false;
+    }
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    /* Ask for a full buffer: filling it means the file grew past the bound. */
+    size_t n = fread(buf, sizeof(char), buf_size, f);
+    bool complete = !ferror(f) && n < buf_size;
+    fclose(f);
+    if (!complete || memchr(buf, '\0', n) != NULL) {
+        return false;
+    }
+    buf[n] = '\0';
+    return true;
+}
+
+/* Is dir itself a git directory — a bare repository, or the .git of the work
+ * tree the walk started inside? git's is_git_directory() test, short of
+ * validating HEAD's content: HEAD, objects/ and refs/ all present. */
+static bool dir_is_git_directory(const char *dir) {
+    char probe[GIT_PROBE_PATH_MAX];
+    return path_join(probe, sizeof(probe), dir, "HEAD") && cbm_file_exists(probe) &&
+           path_join(probe, sizeof(probe), dir, "objects") && cbm_is_dir(probe) &&
+           path_join(probe, sizeof(probe), dir, "refs") && cbm_is_dir(probe);
+}
+
+/* The git directory a gitlink file (linked worktree, submodule) names, read
+ * the way git's read_gitfile() reads it: "gitdir: <path>" with trailing
+ * newlines dropped, a relative path taken from the directory holding the
+ * file. The target must be a directory, and it is used as the git directory
+ * itself — never read as a further gitlink. */
+static bool gitlink_git_dir(const char *gitlink, const char *dir, char *out, size_t out_size) {
+    char content[GIT_SMALL_FILE_MAX];
+    if (!read_small_regular_file(gitlink, content, sizeof(content))) {
+        return false;
+    }
+    trim_newlines(content);
+    size_t prefix_len = strlen(GITLINK_PREFIX);
+    if (strncmp(content, GITLINK_PREFIX, prefix_len) != 0 || !content[prefix_len]) {
+        return false;
+    }
+    const char *target = content + prefix_len;
+    bool joined = path_is_absolute(target) ? copy_whole(out, out_size, target)
+                                           : path_join(out, out_size, dir, target);
+    return joined && cbm_is_dir(out);
+}
+
+/* HEAD file of the git directory that a present `.git` entry stands for. */
+static head_lookup_t dot_git_head_file(const char *dot_git, const char *dir,
+                                       const cbm_path_info_t *info, char *head_path,
+                                       size_t head_path_size) {
+    bool git_dir_found;
+    if (cbm_is_dir(dot_git)) { /* a directory, or a symlink to one */
+        int n = snprintf(head_path, head_path_size, "%s", dot_git);
+        git_dir_found = n > 0 && (size_t)n < head_path_size;
+    } else {
+        git_dir_found =
+            info->is_regular && gitlink_git_dir(dot_git, dir, head_path, head_path_size);
+    }
+    return git_dir_found && path_append(head_path, head_path_size, "HEAD") ? HEAD_FILE_FOUND
+                                                                           : HEAD_ASK_GIT;
+}
+
+/* The HEAD file of the work tree containing `path`, found the way git's
+ * discovery finds the repository: from the canonical directory upward, the
+ * first `.git` wins — a directory is the git directory, a regular file is a
+ * gitlink followed exactly one level. A directory that is itself a git
+ * directory (a bare repository, or a path inside .git) has no work tree, which
+ * is where `git rev-parse --show-toplevel` fails as well. */
+static head_lookup_t locate_head_file(const char *path, char *head_path, size_t head_path_size) {
+    char dir[CBM_SZ_4K];
+    if (!cbm_canonical_path(path, dir, sizeof(dir)) || !cbm_is_dir(dir)) {
+        return HEAD_NO_BRANCH; /* a missing root reports no branch, as before */
+    }
+    for (int depth = 0; depth < GIT_DISCOVERY_DEPTH_MAX; depth++) {
+        char dot_git[GIT_PROBE_PATH_MAX];
+        if (!path_join(dot_git, sizeof(dot_git), dir, ".git")) {
+            return HEAD_ASK_GIT;
+        }
+        cbm_path_info_t info;
+        int probed = cbm_path_info_utf8(dot_git, &info);
+        if (probed == CBM_PATH_INFO_OK) {
+            return dot_git_head_file(dot_git, dir, &info, head_path, head_path_size);
+        }
+        if (probed != CBM_PATH_INFO_ABSENT) {
+            return HEAD_ASK_GIT; /* .git is there but cannot be inspected */
+        }
+        if (dir_is_git_directory(dir) || !path_parent_in_place(dir)) {
+            return HEAD_NO_BRANCH;
+        }
+    }
+    return HEAD_ASK_GIT;
+}
+
+static bool text_is_printable(const char *s) {
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c < ASCII_FIRST_PRINTABLE || c == ASCII_DEL) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ref_component_is_valid(const char *component, size_t len) {
+    size_t lock_len = strlen(REF_LOCK_SUFFIX);
+    bool locked =
+        len >= lock_len && memcmp(component + len - lock_len, REF_LOCK_SUFFIX, lock_len) == 0;
+    return len > 0 && component[0] != '.' && !locked;
+}
+
+/* A branch name git's check_refname_format() accepts under refs/heads/: no
+ * control byte, DEL, space or ~^:?*[\, no ".." or "@{", no empty component,
+ * none starting with '.' or ending in ".lock", no trailing '.', and not "@"
+ * alone. The reftable stub "refs/heads/.invalid" fails on purpose: the real
+ * HEAD of such a repository is not in this file. */
+static bool branch_name_is_valid(const char *name) {
+    size_t len = strlen(name);
+    if (len == 0 || strcmp(name, "@") == 0 || name[len - 1] == '.') {
+        return false;
+    }
+    size_t start = 0;
+    for (size_t i = 0; i <= len; i++) {
+        if (i == len || name[i] == '/') {
+            if (!ref_component_is_valid(name + start, i - start)) {
+                return false;
+            }
+            start = i + 1;
+            continue;
+        }
+        unsigned char c = (unsigned char)name[i];
+        if (c < ASCII_FIRST_PRINTABLE || c == ASCII_DEL || strchr(REF_FORBIDDEN_BYTES, c) ||
+            (c == '.' && name[i + 1] == '.') || (c == '@' && name[i + 1] == '{')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_object_id(const char *s) {
+    size_t len = strlen(s);
+    if (len != GIT_OID_HEX_SHA1 && len != GIT_OID_HEX_SHA256) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The branch a loose HEAD names. Only the two forms the files backend writes
+ * are answered here — a symref into refs/heads/ and a detached object id;
+ * everything else is git's to interpret. */
+static head_lookup_t parse_head(char *content, char *out, size_t out_size) {
+    trim_trailing_space(content);
+    size_t symref_len = strlen(HEAD_SYMREF_PREFIX);
+    if (strncmp(content, HEAD_SYMREF_PREFIX, symref_len) == 0) {
+        const char *target = content + symref_len;
+        while (is_ascii_space(*target)) {
+            target++;
+        }
+        size_t heads_len = strlen(HEADS_PREFIX);
+        if (strncmp(target, HEADS_PREFIX, heads_len) != 0 ||
+            !branch_name_is_valid(target + heads_len)) {
+            return HEAD_ASK_GIT;
+        }
+        return copy_whole(out, out_size, target + heads_len) ? HEAD_BRANCH_READ : HEAD_NO_BRANCH;
+    }
+    if (is_object_id(content)) {
+        return copy_whole(out, out_size, GIT_DETACHED_BRANCH) ? HEAD_BRANCH_READ : HEAD_NO_BRANCH;
+    }
+    return HEAD_ASK_GIT;
+}
+
+/* One `git symbolic-ref` for the HEAD forms parse_head() leaves to git, read
+ * with the meaning cbm_git_context_resolve() gives its outcome: a printed name
+ * is the branch, "not a symbolic ref" is the detached marker, and any other
+ * failure (no repository, no git) reports no branch. */
+static bool head_branch_from_git(const char *path, char *out, size_t out_size) {
+    char *branch = NULL;
+    int exit_status = GIT_EXIT_UNKNOWN;
+    if (git_capture_status(path, "symbolic-ref --quiet --short HEAD", &branch, &exit_status) == 0) {
+        bool copied = text_is_printable(branch) && copy_whole(out, out_size, branch);
+        free(branch);
+        return copied;
+    }
+    return exit_status == GIT_SYMREF_NOT_SYMBOLIC && copy_whole(out, out_size, GIT_DETACHED_BRANCH);
+}
+
+bool cbm_git_head_branch(const char *path, char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    if (!path || !path[0]) {
+        return false;
+    }
+    char head_path[GIT_PROBE_PATH_MAX];
+    head_lookup_t state = locate_head_file(path, head_path, sizeof(head_path));
+    if (state == HEAD_FILE_FOUND) {
+        char content[GIT_SMALL_FILE_MAX];
+        state = read_small_regular_file(head_path, content, sizeof(content))
+                    ? parse_head(content, out, out_size)
+                    : HEAD_ASK_GIT;
+    }
+    if (state == HEAD_ASK_GIT) {
+        return head_branch_from_git(path, out, out_size);
+    }
+    return state == HEAD_BRANCH_READ;
 }
 
 static char *join_root_relative(const char *root, const char *rel) {
@@ -348,7 +714,7 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
     }
 
     if (git_capture(path, "symbolic-ref --quiet --short HEAD", &out->branch) != 0) {
-        out->branch = git_strdup("DETACHED");
+        out->branch = git_strdup(GIT_DETACHED_BRANCH);
         out->is_detached = true;
     }
 

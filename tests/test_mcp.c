@@ -6124,9 +6124,10 @@ TEST(tool_list_projects_stats_contains_hostile_head_content) {
 /* C5 cost criterion: listing ~120 projects must average under 100 ms. The
  * assertion is on the warm mean — what a session pays once the daemon has read
  * each generation — and the numbers are printed so a qf-infra run records
- * them. The details projection keeps one git process per listed project (the
- * ADR gates it behind include_details, and C10 tells callers not to ask for
- * it at session start), so it is reported, not asserted. */
+ * them. The details projection also reads each listed project's branch from
+ * HEAD (the ADR gates it behind include_details, and C10 tells callers not to
+ * ask for it at session start); it is reported, not asserted — the D6 tests
+ * pin its cost by counting git processes and database opens instead. */
 TEST(tool_list_projects_mean_latency_with_120_projects) {
     enum { C5_BENCH_PROJECTS = 120, C5_BENCH_ROUNDS = 5 };
     char cache[256];
