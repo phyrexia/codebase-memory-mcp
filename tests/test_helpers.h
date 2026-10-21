@@ -222,4 +222,141 @@ static inline void th_cleanup(const char *path) {
     }
 }
 
+#ifndef _WIN32
+/* ── Fake git on PATH (POSIX /bin/sh script) ──────────────────── */
+
+/* A `git` first on PATH that appends its argv as one line to `calls`, prints
+ * `stdout_line` (when non-NULL) and exits with `exit_code`. Code that shells
+ * out through cbm_popen("git ...") finds it through the shell's PATH lookup,
+ * so a test can count — and steer — every git process the code under test
+ * spawns. th_fake_git_remove() restores PATH (a no-op when install never got
+ * that far); the files live in the caller's temporary directory. */
+typedef struct {
+    char bin[1024];
+    char script[1024];
+    char calls[1024];
+    char *saved_path;
+    bool had_path;
+    bool path_replaced;
+} th_fake_git_t;
+
+/* (Re)write the script: what the next git invocations print and return. The
+ * printed line is single-quoted shell text, so it may not hold a quote. */
+static inline bool th_fake_git_configure(const th_fake_git_t *fake, const char *stdout_line,
+                                         int exit_code) {
+    if (stdout_line && strchr(stdout_line, '\'')) {
+        return false;
+    }
+    char body[4096];
+    int n =
+        stdout_line
+            ? snprintf(body, sizeof(body),
+                       "#!/bin/sh\nprintf '%%s\\n' \"$*\" >> '%s'\nprintf '%%s\\n' '%s'\n"
+                       "exit %d\n",
+                       fake->calls, stdout_line, exit_code)
+            : snprintf(body, sizeof(body), "#!/bin/sh\nprintf '%%s\\n' \"$*\" >> '%s'\nexit %d\n",
+                       fake->calls, exit_code);
+    if (n <= 0 || (size_t)n >= sizeof(body) || th_write_file(fake->script, body) != 0) {
+        return false;
+    }
+    return chmod(fake->script, 0700) == 0;
+}
+
+static inline bool th_fake_git_install(th_fake_git_t *fake, const char *dir,
+                                       const char *stdout_line, int exit_code) {
+    memset(fake, 0, sizeof(*fake));
+    int bin_n = snprintf(fake->bin, sizeof(fake->bin), "%s/fake-git-bin", dir);
+    int script_n = snprintf(fake->script, sizeof(fake->script), "%s/fake-git-bin/git", dir);
+    int calls_n = snprintf(fake->calls, sizeof(fake->calls), "%s/fake-git.calls", dir);
+    if (bin_n <= 0 || (size_t)bin_n >= sizeof(fake->bin) || script_n <= 0 ||
+        (size_t)script_n >= sizeof(fake->script) || calls_n <= 0 ||
+        (size_t)calls_n >= sizeof(fake->calls) || strchr(fake->calls, '\'') ||
+        th_mkdir_p(fake->bin) != 0 || !th_fake_git_configure(fake, stdout_line, exit_code)) {
+        return false;
+    }
+    const char *old_path = getenv("PATH");
+    fake->had_path = old_path != NULL;
+    fake->saved_path = old_path ? strdup(old_path) : NULL;
+    if (old_path && !fake->saved_path) {
+        return false;
+    }
+    size_t size = strlen(fake->bin) + 2U + (old_path ? strlen(old_path) : 0U);
+    char *path = malloc(size);
+    if (!path) {
+        return false;
+    }
+    if (old_path) {
+        (void)snprintf(path, size, "%s:%s", fake->bin, old_path);
+    } else {
+        (void)snprintf(path, size, "%s", fake->bin);
+    }
+    fake->path_replaced = cbm_setenv("PATH", path, 1) == 0;
+    free(path);
+    return fake->path_replaced;
+}
+
+/* Everything the fake recorded, one argv per line ("" when git never ran).
+ * The caller frees it; NULL only on allocation failure. */
+static inline char *th_fake_git_log(const th_fake_git_t *fake) {
+    size_t cap = 1024;
+    size_t len = 0;
+    char *log = malloc(cap);
+    if (!log) {
+        return NULL;
+    }
+    FILE *f = cbm_fopen(fake->calls, "rb");
+    int c;
+    while (f && (c = fgetc(f)) != EOF) {
+        if (len + 1 >= cap) {
+            char *grown = realloc(log, cap * 2);
+            if (!grown) {
+                free(log);
+                fclose(f);
+                return NULL;
+            }
+            log = grown;
+            cap *= 2;
+        }
+        log[len++] = (char)c;
+    }
+    log[len] = '\0';
+    if (f) {
+        fclose(f);
+    }
+    return log;
+}
+
+/* How many times git ran since install (or the last reset). -1 when the log
+ * could not be read. */
+static inline int th_fake_git_calls(const th_fake_git_t *fake) {
+    char *log = th_fake_git_log(fake);
+    if (!log) {
+        return -1;
+    }
+    int calls = 0;
+    for (const char *p = log; *p; p++) {
+        calls += *p == '\n';
+    }
+    free(log);
+    return calls;
+}
+
+static inline void th_fake_git_reset_calls(const th_fake_git_t *fake) {
+    (void)cbm_unlink(fake->calls);
+}
+
+static inline void th_fake_git_remove(th_fake_git_t *fake) {
+    if (fake->path_replaced) {
+        if (fake->had_path) {
+            (void)cbm_setenv("PATH", fake->saved_path, 1);
+        } else {
+            (void)cbm_unsetenv("PATH");
+        }
+    }
+    free(fake->saved_path);
+    fake->saved_path = NULL;
+    fake->path_replaced = false;
+}
+#endif /* _WIN32 */
+
 #endif /* TEST_HELPERS_H */
