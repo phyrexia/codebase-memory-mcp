@@ -13,8 +13,9 @@
  *   --tool-profile=analysis|scout  Expose a restricted agent tool surface
  *
  * Long-lived MCP and hook frontends are thin clients of one mandatory
- * per-account daemon. One-shot CLI tool calls run in an isolated local server
- * and never create or retain a daemon generation.
+ * per-account daemon, and so are one-shot CLI tool calls: they reuse the active
+ * generation, or start an ephemeral one for the command (`daemon start` keeps a
+ * permanent one warm). Only supervised index workers run tool calls in-process.
  */
 #ifdef _WIN32
 /* winsock2 must precede every project header that can transitively include
