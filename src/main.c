@@ -1292,6 +1292,20 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
     return CBM_NOT_FOUND;
 }
 
+/* One decimal port, 1..65535, with nothing after it. `daemon start --port=`
+ * used atoi(), which read "9750x" as 9750 and, on LP64, wrapped 4294977296
+ * into 10000 instead of refusing either. */
+static bool main_parse_port(const char *text, int *port_out) {
+    char *end = NULL;
+    errno = 0;
+    long port = strtol(text, &end, CBM_DECIMAL_BASE);
+    if (errno != 0 || end == text || !end || *end != '\0' || port <= 0 || port >= MAIN_MAX_PORT) {
+        return false;
+    }
+    *port_out = (int)port;
+    return true;
+}
+
 /* Parse --ui= and --port= into a per-field daemon mutation. */
 static uint8_t parse_ui_flags(int argc, char **argv, bool *ui_enabled, int *ui_port,
                               bool *explicit_enable) {
@@ -1304,16 +1318,9 @@ static uint8_t parse_ui_flags(int argc, char **argv, bool *ui_enabled, int *ui_p
             }
             update_mask |= CBM_DAEMON_APPLICATION_UI_CONFIG_ENABLED;
         }
-        if (strncmp(argv[i], "--port=", SLEN("--port=")) == 0) {
-            const char *value = argv[i] + MAIN_PORT_OFF;
-            char *end = NULL;
-            errno = 0;
-            long port = strtol(value, &end, CBM_DECIMAL_BASE);
-            if (errno == 0 && end != value && end && *end == '\0' && port > 0 &&
-                port < MAIN_MAX_PORT) {
-                *ui_port = (int)port;
-                update_mask |= CBM_DAEMON_APPLICATION_UI_CONFIG_PORT;
-            }
+        if (strncmp(argv[i], "--port=", SLEN("--port=")) == 0 &&
+            main_parse_port(argv[i] + MAIN_PORT_OFF, ui_port)) {
+            update_mask |= CBM_DAEMON_APPLICATION_UI_CONFIG_PORT;
         }
     }
     return update_mask;
@@ -2487,8 +2494,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
         } else if (strcmp(argv[index], "--open") == 0) {
             open_browser = true;
         } else if (strncmp(argv[index], "--port=", 7) == 0) {
-            requested_port = atoi(argv[index] + 7);
-            if (requested_port <= 0 || requested_port >= MAIN_MAX_PORT) {
+            if (!main_parse_port(argv[index] + MAIN_PORT_OFF, &requested_port)) {
                 (void)fprintf(stderr, "error: --port requires a value between 1 and 65535\n");
                 return EXIT_FAILURE;
             }
@@ -2624,9 +2630,23 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
         cbm_ui_config_t ui_config;
         cbm_ui_config_load(&ui_config);
         if (!ui_config.ui_enabled) {
-            (void)fprintf(stderr, "error: UI is disabled for the active daemon; browser was not "
-                                  "opened\n");
-            return open_browser ? EXIT_FAILURE : EXIT_SUCCESS;
+            /* A running generation follows the switch on its own; `daemon start`
+             * never flips it for one. Only --open needs the UI to succeed, so
+             * only --open fails, and every variant names the way back. */
+            if (open_browser) {
+                (void)fprintf(stderr, "error: the active daemon has its UI disabled; browser was "
+                                      "not opened. `codebase-memory-mcp config set ui_enabled "
+                                      "true` enables it within a second; then retry.\n");
+                return EXIT_FAILURE;
+            }
+            main_daemon_ctl_print_ui_disabled();
+            if (requested_port > 0) {
+                (void)fprintf(stderr,
+                              "warning: --port=%d has no effect on an active daemon; "
+                              "`codebase-memory-mcp config set ui_port %d` moves the UI\n",
+                              requested_port, requested_port);
+            }
+            return EXIT_SUCCESS;
         }
         if (requested_port > 0 && requested_port != ui_config.ui_port) {
             (void)fprintf(stderr,
@@ -2715,9 +2735,15 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
              * like a broken one, because a second of scheduling delay after an
              * abrupt shutdown is enough to miss this handshake. */
             if (ui_requested) {
-                (void)fprintf(stderr,
-                              "error: the daemon did not accept the UI configuration; browser was "
-                              "not opened\n");
+                if (open_browser) {
+                    (void)fprintf(stderr, "error: the daemon did not accept the UI "
+                                          "configuration; browser was not opened\n");
+                } else {
+                    (void)fprintf(stderr,
+                                  "error: the daemon did not accept the UI configuration for "
+                                  "--port=%d\n",
+                                  requested_port);
+                }
                 (void)cbm_daemon_runtime_client_close(start_result.client, MAIN_CLOSE_TIMEOUT_MS);
                 return EXIT_FAILURE;
             }

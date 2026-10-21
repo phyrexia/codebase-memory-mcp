@@ -9,6 +9,7 @@
 #include "foundation/compat_thread.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -25,7 +26,6 @@ typedef SOCKET cbm_sock_t;
 #define cbm_sock_close closesocket
 #else
 #include <arpa/inet.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -226,29 +226,37 @@ static int socket_last_error(void) {
 
 static bool socket_error_is_address_in_use(int error) {
 #ifdef _WIN32
+    /* Under SO_EXCLUSIVEADDRUSE a held port can also surface as WSAEACCES, but
+     * so does a real refusal (a reserved or excluded port); it stays
+     * bind_failed, which carries the same --port hint. */
     return error == WSAEADDRINUSE;
 #else
     return error == EADDRINUSE;
 #endif
 }
 
-/* Record why the listen attempt stopped at `stage`, then release its socket.
- * The error is read first because closing the socket may clobber it. Whichever
- * step reports EADDRINUSE, another socket holds the port: with SO_REUSEADDR two
- * sockets that are not yet listening can share one bind, and only listen() then
- * refuses. */
+/* Record why the listen attempt stopped, then release its socket. */
 static cbm_httpd_t *listen_failed(cbm_httpd_listen_failure_t *failure_out,
-                                  cbm_httpd_listen_reason_t stage, cbm_sock_t fd) {
-    int error = socket_last_error();
-    cbm_httpd_listen_reason_t reason =
-        socket_error_is_address_in_use(error) ? CBM_HTTPD_LISTEN_IN_USE : stage;
+                                  cbm_httpd_listen_reason_t reason, int os_error, cbm_sock_t fd) {
     if (fd != CBM_SOCK_BAD)
         cbm_sock_close(fd);
     if (failure_out) {
         failure_out->reason = reason;
-        failure_out->os_error = error;
+        failure_out->os_error = os_error;
     }
     return NULL;
+}
+
+/* A socket call failed at `stage`. Its error is read before the close, which
+ * may clobber it. Whichever step reports EADDRINUSE, another socket holds the
+ * port: with SO_REUSEADDR two sockets that are not yet listening can share one
+ * bind, and only listen() then refuses. */
+static cbm_httpd_t *listen_call_failed(cbm_httpd_listen_failure_t *failure_out,
+                                       cbm_httpd_listen_reason_t stage, cbm_sock_t fd) {
+    int error = socket_last_error();
+    return listen_failed(failure_out,
+                         socket_error_is_address_in_use(error) ? CBM_HTTPD_LISTEN_IN_USE : stage,
+                         error, fd);
 }
 
 const char *cbm_httpd_listen_reason_name(cbm_httpd_listen_reason_t reason) {
@@ -287,7 +295,7 @@ cbm_httpd_t *cbm_httpd_listen_ex(int port, cbm_httpd_listen_failure_t *failure_o
 
     cbm_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == CBM_SOCK_BAD)
-        return listen_failed(failure_out, CBM_HTTPD_LISTEN_SOCKET_FAILED, CBM_SOCK_BAD);
+        return listen_call_failed(failure_out, CBM_HTTPD_LISTEN_SOCKET_FAILED, CBM_SOCK_BAD);
 
     /* POSIX: SO_REUSEADDR only permits rebinding a TIME_WAIT port.
      * Windows: SO_REUSEADDR would let ANY local user hijack the port, so
@@ -307,19 +315,20 @@ cbm_httpd_t *cbm_httpd_listen_ex(int port, cbm_httpd_listen_failure_t *failure_o
     addr.sin_addr.s_addr = htonl(0x7F000001); /* 127.0.0.1 */
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0)
-        return listen_failed(failure_out, CBM_HTTPD_LISTEN_BIND_FAILED, fd);
+        return listen_call_failed(failure_out, CBM_HTTPD_LISTEN_BIND_FAILED, fd);
     if (listen(fd, 16) != 0 || !socket_set_nonblocking(fd))
-        return listen_failed(failure_out, CBM_HTTPD_LISTEN_SETUP_FAILED, fd);
+        return listen_call_failed(failure_out, CBM_HTTPD_LISTEN_SETUP_FAILED, fd);
 
     /* Resolve the actually-bound port (needed for port 0). */
     struct sockaddr_in bound;
     socklen_t blen = sizeof(bound);
     if (getsockname(fd, (struct sockaddr *)&bound, &blen) != 0)
-        return listen_failed(failure_out, CBM_HTTPD_LISTEN_SETUP_FAILED, fd);
+        return listen_call_failed(failure_out, CBM_HTTPD_LISTEN_SETUP_FAILED, fd);
 
+    /* Not a socket call: Winsock's last error would be stale here. */
     cbm_httpd_t *d = calloc(1, sizeof(*d));
     if (!d)
-        return listen_failed(failure_out, CBM_HTTPD_LISTEN_SETUP_FAILED, fd);
+        return listen_failed(failure_out, CBM_HTTPD_LISTEN_SETUP_FAILED, ENOMEM, fd);
     d->fd = fd;
     d->port = (int)ntohs(bound.sin_port);
     d->recv_deadline_ms = CBM_HTTP_RECV_DEADLINE_MS;

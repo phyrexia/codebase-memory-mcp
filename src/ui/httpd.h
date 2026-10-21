@@ -82,7 +82,8 @@ typedef enum {
 
 typedef struct {
     cbm_httpd_listen_reason_t reason;
-    /* errno on POSIX, WSAGetLastError() on Windows, read at the failing step; 0 on success. */
+    /* errno on POSIX, WSAGetLastError() on Windows, read at the failing socket call;
+     * ENOMEM when the listener's own allocation failed; 0 on success. */
     int os_error;
 } cbm_httpd_listen_failure_t;
 
