@@ -58,6 +58,9 @@ typedef struct {
     atomic_bool connect_after_reserved;
     atomic_bool connect_requires_unlocked;
     cbm_daemon_bootstrap_probe_status_t forced_probe;
+    /* Reported by every forced RESERVED probe: the connect behind it found
+     * no stable socket name for its whole timeout. */
+    bool forced_endpoint_name_absent;
     cbm_version_cohort_status_t forced_cohort;
     char diagnostic[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
 } bootstrap_fake_ops_t;
@@ -150,6 +153,7 @@ static cbm_daemon_bootstrap_probe_status_t bootstrap_fake_probe(
         return CBM_DAEMON_BOOTSTRAP_PROBE_TERMINAL;
     }
     if (fake->forced_probe == CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED) {
+        result_out->endpoint_name_absent = fake->forced_endpoint_name_absent;
         return fake->forced_probe;
     }
     if (fake->forced_probe == CBM_DAEMON_BOOTSTRAP_PROBE_CONFLICT) {
@@ -818,6 +822,69 @@ TEST(daemon_bootstrap_mute_endpoint_holder_is_reserved_and_never_unavailable) {
     PASS();
 }
 
+/* 2026-10-15/16: an external /tmp cleaner left a live daemon holding its
+ * cohort marker while its socket names were gone. Every client re-probed for
+ * its whole 30 s budget and then reported only "active or starting but could
+ * not accept this client", which reads like a capacity problem. When every
+ * probe of the attempt found the generation held and its stable socket name
+ * absent, the final message must name that orphaned shape and how to clear
+ * it; a single probe that saw anything else keeps the generic wording. */
+TEST(daemon_bootstrap_names_absent_endpoint_with_held_marker_in_final_message) {
+    bootstrap_endpoint_fixture_t fixture;
+    ASSERT_TRUE(bootstrap_endpoint_fixture_start(&fixture, "orphaned-names"));
+    cbm_daemon_build_identity_t identity = bootstrap_identity("2.4.0", BOOTSTRAP_BUILD_A);
+    cbm_daemon_bootstrap_config_t config = {
+        .role = CBM_DAEMON_PROCESS_MCP_CLIENT,
+        .endpoint = fixture.endpoint,
+        .identity = &identity,
+        .executable_path = "/tmp/cbm",
+        .connect_timeout_ms = 1,
+        .startup_timeout_ms = BOOTSTRAP_TEST_SHORT_TIMEOUT_MS,
+    };
+
+    bootstrap_fake_ops_t orphaned = {0};
+    orphaned.forced_probe = CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED;
+    orphaned.forced_endpoint_name_absent = true;
+    cbm_daemon_bootstrap_ops_t orphaned_ops = bootstrap_fake_callbacks(&orphaned);
+    cbm_daemon_bootstrap_result_t orphaned_result;
+    ASSERT_EQ(cbm_daemon_bootstrap_execute_with_ops(&config, &orphaned_ops, &orphaned_result),
+              CBM_DAEMON_BOOTSTRAP_FAILED);
+    ASSERT(atomic_load(&orphaned.probe_count) > 1);
+    ASSERT_EQ(atomic_load(&orphaned.lock_attempt_count), 0);
+    ASSERT_EQ(atomic_load(&orphaned.spawn_count), 0);
+    ASSERT_EQ(atomic_load(&orphaned.diagnostic_count), 1);
+    ASSERT_NOT_NULL(
+        strstr(orphaned_result.message, "holds the cohort marker but publishes no endpoint"));
+    ASSERT_NOT_NULL(strstr(orphaned_result.message, "pgrep -f -- --cbm-daemon-internal"));
+    ASSERT_NOT_NULL(strstr(orphaned.diagnostic, "publishes no endpoint"));
+
+    /* The first probe found the generation held without an absent name (it
+     * may simply have been starting); the later ones cannot rewrite that. */
+    bootstrap_fake_ops_t mixed = {0};
+    atomic_store(&mixed.reserved_probes_remaining, 1);
+    mixed.forced_probe = CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED;
+    mixed.forced_endpoint_name_absent = true;
+    cbm_daemon_bootstrap_ops_t mixed_ops = bootstrap_fake_callbacks(&mixed);
+    cbm_daemon_bootstrap_result_t mixed_result;
+    ASSERT_EQ(cbm_daemon_bootstrap_execute_with_ops(&config, &mixed_ops, &mixed_result),
+              CBM_DAEMON_BOOTSTRAP_FAILED);
+    ASSERT(atomic_load(&mixed.probe_count) > 1);
+    ASSERT_NULL(strstr(mixed_result.message, "publishes no endpoint"));
+    ASSERT_NOT_NULL(strstr(mixed_result.message, "is active or starting but could not accept"));
+
+    /* Held without ever reporting an absent name: today's wording. */
+    bootstrap_fake_ops_t held = {0};
+    held.forced_probe = CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED;
+    cbm_daemon_bootstrap_ops_t held_ops = bootstrap_fake_callbacks(&held);
+    cbm_daemon_bootstrap_result_t held_result;
+    ASSERT_EQ(cbm_daemon_bootstrap_execute_with_ops(&config, &held_ops, &held_result),
+              CBM_DAEMON_BOOTSTRAP_FAILED);
+    ASSERT_NULL(strstr(held_result.message, "publishes no endpoint"));
+    ASSERT_NOT_NULL(strstr(held_result.message, "is active or starting but could not accept"));
+    bootstrap_endpoint_fixture_finish(&fixture);
+    PASS();
+}
+
 TEST(daemon_bootstrap_concurrent_first_clients_spawn_one_daemon) {
     bootstrap_endpoint_fixture_t fixture;
     ASSERT_TRUE(bootstrap_endpoint_fixture_start(&fixture, "startup-race"));
@@ -1181,6 +1248,7 @@ SUITE(daemon_bootstrap) {
     RUN_TEST(daemon_bootstrap_releases_handoff_when_spawned_generation_is_reserved);
     RUN_TEST(daemon_bootstrap_rejected_connect_is_reserved_and_never_unavailable);
     RUN_TEST(daemon_bootstrap_mute_endpoint_holder_is_reserved_and_never_unavailable);
+    RUN_TEST(daemon_bootstrap_names_absent_endpoint_with_held_marker_in_final_message);
     RUN_TEST(daemon_bootstrap_concurrent_first_clients_spawn_one_daemon);
 #ifdef __APPLE__
     RUN_TEST(daemon_bootstrap_darwin_launch_failure_is_synchronous);
