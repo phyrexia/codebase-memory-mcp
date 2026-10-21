@@ -633,20 +633,35 @@ static cbm_daemon_bootstrap_status_t bootstrap_finish_probe(
     return CBM_DAEMON_BOOTSTRAP_FAILED;
 }
 
+/* What the probes of one bootstrap attempt saw, kept for its final timeout
+ * diagnostic. */
+typedef struct {
+    /* Sticky across probes: a later fast-path probe never attempts a connect
+     * and reports no holder, but a mute holder seen once must survive into
+     * the final timeout diagnostic. */
+    uint64_t muted_holder_pid;
+    /* Holds while every probe so far found the generation held and its
+     * stable socket name absent for the whole connect: a daemon whose names
+     * an external /tmp cleaner removed. One probe that saw anything else
+     * clears it for the rest of the attempt. */
+    bool held_without_endpoint;
+} bootstrap_probe_history_t;
+
 static cbm_daemon_bootstrap_probe_status_t bootstrap_probe(
     const cbm_daemon_bootstrap_config_t *config, const cbm_daemon_bootstrap_ops_t *ops,
     cbm_daemon_runtime_client_t **client_out, cbm_daemon_runtime_connect_result_t *connect_result,
-    uint64_t *muted_holder_pid_io) {
+    bootstrap_probe_history_t *history) {
     memset(connect_result, 0, sizeof(*connect_result));
     *client_out = NULL;
     cbm_daemon_bootstrap_probe_status_t status =
         ops->probe(ops->context, config->endpoint, config->identity, config->connect_timeout_ms,
                    client_out, connect_result);
-    /* Sticky across probes: a later fast-path probe never attempts a connect
-     * and reports no holder, but a mute holder seen once must survive into
-     * the final timeout diagnostic. */
-    if (muted_holder_pid_io && connect_result->muted_endpoint_holder_pid != 0) {
-        *muted_holder_pid_io = connect_result->muted_endpoint_holder_pid;
+    if (connect_result->muted_endpoint_holder_pid != 0) {
+        history->muted_holder_pid = connect_result->muted_endpoint_holder_pid;
+    }
+    if (status != CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED || !connect_result->endpoint_name_absent ||
+        connect_result->muted_endpoint_holder_pid != 0) {
+        history->held_without_endpoint = false;
     }
     return status;
 }
@@ -717,9 +732,12 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
 
     cbm_daemon_runtime_client_t *client = NULL;
     cbm_daemon_runtime_connect_result_t connect_result;
-    uint64_t muted_holder_pid = 0;
+    bootstrap_probe_history_t history = {
+        .muted_holder_pid = 0,
+        .held_without_endpoint = true,
+    };
     cbm_daemon_bootstrap_probe_status_t probe =
-        bootstrap_probe(config, ops, &client, &connect_result, &muted_holder_pid);
+        bootstrap_probe(config, ops, &client, &connect_result, &history);
     if (bootstrap_probe_is_finishable(probe)) {
         cbm_daemon_bootstrap_status_t status =
             bootstrap_finish_probe(probe, client, &connect_result, ops, result_out);
@@ -755,7 +773,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
              * replacements from being launched. */
             generation_observed = true;
             bootstrap_pause(deadline);
-            probe = bootstrap_probe(config, ops, &client, &connect_result, &muted_holder_pid);
+            probe = bootstrap_probe(config, ops, &client, &connect_result, &history);
             continue;
         }
 
@@ -767,7 +785,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
         }
         if (lock_status == 0) {
             bootstrap_pause(deadline);
-            probe = bootstrap_probe(config, ops, &client, &connect_result, &muted_holder_pid);
+            probe = bootstrap_probe(config, ops, &client, &connect_result, &history);
             continue;
         }
         if (lock_status != 1 || !startup_lock) {
@@ -776,7 +794,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
         }
 
         lock_acquired = true;
-        probe = bootstrap_probe(config, ops, &client, &connect_result, &muted_holder_pid);
+        probe = bootstrap_probe(config, ops, &client, &connect_result, &history);
         if (probe == CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED ||
             probe == CBM_DAEMON_BOOTSTRAP_PROBE_TERMINAL) {
             generation_observed = true;
@@ -819,7 +837,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
          * bootstrap against a daemon that is trying to cleanly stand down. */
         do {
             bootstrap_pause(deadline);
-            probe = bootstrap_probe(config, ops, &client, &connect_result, &muted_holder_pid);
+            probe = bootstrap_probe(config, ops, &client, &connect_result, &history);
             if (probe == CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED ||
                 probe == CBM_DAEMON_BOOTSTRAP_PROBE_TERMINAL) {
                 generation_observed = true;
@@ -858,7 +876,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
     result_out->status = CBM_DAEMON_BOOTSTRAP_FAILED;
     if (start_failed) {
         /* result_out->message already names the recorded cause. */
-    } else if (muted_holder_pid != 0) {
+    } else if (history.muted_holder_pid != 0) {
         /* The one diagnostic the 2026-08-29 zombie recovery had to assemble by
          * hand from process, pipe, and log correlation: name the pid that
          * holds the endpoint without answering, and say what to do with it. */
@@ -866,7 +884,15 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
                        "CBM daemon endpoint is held by pid %llu but that process answered no "
                        "rendezvous within %u ms; the daemon runtime is likely dead — stop that "
                        "process, then retry",
-                       (unsigned long long)muted_holder_pid, config->startup_timeout_ms);
+                       (unsigned long long)history.muted_holder_pid, config->startup_timeout_ms);
+    } else if (history.held_without_endpoint) {
+        /* qf-infra 2026-10-15/16: an external /tmp cleaner took the socket
+         * names of a daemon that kept its marker. Nothing here can repair
+         * that generation; only stopping it lets the next client start one. */
+        (void)snprintf(result_out->message, sizeof(result_out->message),
+                       "CBM daemon holds the cohort marker but publishes no endpoint (orphaned "
+                       "runtime dir); stop that process (`pgrep -f -- --cbm-daemon-internal`) "
+                       "and retry");
     } else if (generation_observed) {
         (void)snprintf(result_out->message, sizeof(result_out->message),
                        "CBM daemon is active or starting but could not accept this client "

@@ -3231,6 +3231,23 @@ static void ipc_test_log_capture_sink(const char *line) {
     ipc_test_log_capture[ipc_test_log_capture_used] = '\0';
 }
 
+static bool ipc_test_path_has_inode(const char *path, const struct stat *expected) {
+    struct stat status;
+    return lstat(path, &status) == 0 && status.st_dev == expected->st_dev &&
+           status.st_ino == expected->st_ino;
+}
+
+static size_t ipc_test_log_capture_count(const char *needle) {
+    size_t count = 0;
+    size_t length = strlen(needle);
+    const char *at = strstr(ipc_test_log_capture, needle);
+    while (length > 0 && at) {
+        count++;
+        at = strstr(at + length, needle);
+    }
+    return count;
+}
+
 #ifndef _WIN32
 static bool ipc_test_record_temp_path(char out[TEST_PATH_CAP], const char *runtime_dir,
                                       const char *record_path) {
@@ -4513,10 +4530,17 @@ TEST(daemon_ipc_posix_active_listener_is_never_cleaned_under_queue_pressure) {
  * unlinked `.sock`, `.anc` and `.sock.identity` while the daemon was still
  * listening. Every later client then waited out its 30 s startup budget for an
  * endpoint that no longer existed. The lifetime lock can be fooled this way; a
- * listener answering on the generation's own socket cannot. */
+ * listener answering on the generation's own socket cannot.
+ *
+ * Preserving the names still left that CLI failing while the daemon was on its
+ * way out. The bounded seal wait retries only that refusal: against a listener
+ * that keeps answering it still fails closed at the bound, names the reason
+ * and logs the preservation once; when the daemon exits half a second in, it
+ * seals. */
 TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_replaced) {
     static const char key[] = "c7d8e9f0a1b2c3d4";
     static const char preserved_line[] = "level=warn msg=daemon.ipc.stale_cleanup_preserved";
+    enum { SEAL_WAIT_MS = 2000, DAEMON_EXIT_AFTER_MS = 500, CLOCK_SLACK_MS = 100 };
     char parent[TEST_PATH_CAP] = {0};
     char runtime_dir[TEST_PATH_CAP] = {0};
     char socket_path[TEST_PATH_CAP] = {0};
@@ -4548,6 +4572,18 @@ TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_
     bool artifacts_unchanged = false;
     bool client_connected = false;
     bool preservation_logged = false;
+    int held_transition_result = -1;
+    int held_wait_result = -1;
+    uint64_t held_wait_ms = 0;
+    bool held_wait_preserved = false;
+    size_t held_wait_logged = 0;
+    bool held_artifacts_unchanged = false;
+    int released_transition_result = -1;
+    bool release_requested = false;
+    int released_wait_result = -1;
+    uint64_t released_wait_ms = 0;
+    bool released_wait_preserved = true;
+    bool released_names_removed = false;
     CBMLogLevel saved_level = cbm_log_get_level();
     CBMLogFormat saved_format = cbm_log_get_format();
 
@@ -4569,7 +4605,9 @@ TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_
         /* The permanent daemon, in its own process so its record lock and the
          * in-process lock registry stay out of the cleaner's way: publish the
          * endpoint, hold the lifetime reservation, never accept, and keep
-         * listening until the parent says stop (or goes away). */
+         * listening until the parent says stop (or goes away). 'D' is the
+         * daemon noticing its replaced lock: it closes a little later, while
+         * the parent is already retrying. */
         (void)close(ready_pipe[0]);
         (void)close(stop_pipe[1]);
         cbm_daemon_ipc_listener_t *listener = cbm_daemon_ipc_listen(endpoint);
@@ -4579,6 +4617,9 @@ TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_
         uint8_t stop = 0;
         (void)ipc_test_fd_read_all(stop_pipe[0], &stop, sizeof(stop));
         (void)close(stop_pipe[0]);
+        if (stop == 'D') {
+            cbm_usleep(DAEMON_EXIT_AFTER_MS * 1000U);
+        }
         cbm_daemon_ipc_listener_close(listener);
         _exit(listener && reported ? 0 : 1);
     }
@@ -4637,6 +4678,66 @@ TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_
         client_connected = client != NULL;
         preservation_logged = strstr(ipc_test_log_capture, preserved_line) != NULL;
     }
+    if (seal_result == 0 && artifacts_unchanged) {
+        /* What the CLI and the index worker run now: the listener answers for
+         * the whole bound, so the seal keeps failing closed. */
+        ipc_test_log_capture_used = 0;
+        ipc_test_log_capture[0] = '\0';
+        cbm_log_set_level(CBM_LOG_WARN);
+        cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+        cbm_log_set_sink_ex(ipc_test_log_capture_sink, CBM_LOG_SINK_REPLACE);
+        held_transition_result = cbm_daemon_ipc_local_transition_try_acquire(endpoint, &transition);
+        uint64_t started_ms = cbm_now_ms();
+        if (held_transition_result == 1) {
+            held_wait_result =
+                cbm_daemon_ipc_local_transition_seal_legacy_wait(transition, SEAL_WAIT_MS);
+        }
+        held_wait_ms = cbm_now_ms() - started_ms;
+        held_wait_preserved =
+            cbm_daemon_ipc_local_transition_seal_preserved_live_listener(transition);
+        cbm_log_set_sink(NULL);
+        cbm_log_set_format(saved_format);
+        cbm_log_set_level(saved_level);
+        (void)cbm_daemon_ipc_local_transition_release(&transition);
+        held_wait_logged = ipc_test_log_capture_count(preserved_line);
+        held_artifacts_unchanged = ipc_test_path_has_inode(socket_path, &socket_before) &&
+                                   ipc_test_path_has_inode(anchor_path, &anchor_before) &&
+                                   ipc_test_path_has_inode(identity_path, &identity_before);
+    }
+    if (held_wait_result == 0 && held_artifacts_unchanged) {
+        /* The daemon exits half a second into the bound: the retry seals. */
+        ipc_test_log_capture_used = 0;
+        ipc_test_log_capture[0] = '\0';
+        cbm_log_set_level(CBM_LOG_WARN);
+        cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+        cbm_log_set_sink_ex(ipc_test_log_capture_sink, CBM_LOG_SINK_REPLACE);
+        released_transition_result =
+            cbm_daemon_ipc_local_transition_try_acquire(endpoint, &transition);
+        uint8_t stop = 'D';
+        if (released_transition_result == 1) {
+            release_requested = ipc_test_fd_write_all(stop_pipe[1], &stop, sizeof(stop));
+        }
+        /* The child reads one byte; never write to its pipe again. */
+        (void)close(stop_pipe[1]);
+        stop_pipe[1] = -1;
+        uint64_t started_ms = cbm_now_ms();
+        if (release_requested) {
+            released_wait_result =
+                cbm_daemon_ipc_local_transition_seal_legacy_wait(transition, SEAL_WAIT_MS);
+        }
+        released_wait_ms = cbm_now_ms() - started_ms;
+        released_wait_preserved =
+            cbm_daemon_ipc_local_transition_seal_preserved_live_listener(transition);
+        cbm_log_set_sink(NULL);
+        cbm_log_set_format(saved_format);
+        cbm_log_set_level(saved_level);
+        (void)cbm_daemon_ipc_local_transition_release(&transition);
+        struct stat gone = {0};
+        bool socket_gone = lstat(socket_path, &gone) != 0 && errno == ENOENT;
+        bool anchor_gone = lstat(anchor_path, &gone) != 0 && errno == ENOENT;
+        bool identity_gone = lstat(identity_path, &gone) != 0 && errno == ENOENT;
+        released_names_removed = socket_gone && anchor_gone && identity_gone;
+    }
 
     cbm_daemon_ipc_connection_close(client);
     (void)cbm_daemon_ipc_local_transition_release(&transition);
@@ -4670,8 +4771,113 @@ TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_
     ASSERT_TRUE(artifacts_unchanged);
     ASSERT_TRUE(client_connected);
     ASSERT_TRUE(preservation_logged);
+    ASSERT_EQ(held_transition_result, 1);
+    ASSERT_EQ(held_wait_result, 0);
+    ASSERT_GTE(held_wait_ms, SEAL_WAIT_MS - CLOCK_SLACK_MS);
+    ASSERT_LT(held_wait_ms, 2 * SEAL_WAIT_MS);
+    ASSERT_TRUE(held_wait_preserved);
+    ASSERT_EQ(held_wait_logged, 1);
+    ASSERT_TRUE(held_artifacts_unchanged);
+    ASSERT_EQ(released_transition_result, 1);
+    ASSERT_TRUE(release_requested);
+    ASSERT_EQ(released_wait_result, 1);
+    ASSERT_GTE(released_wait_ms, DAEMON_EXIT_AFTER_MS - CLOCK_SLACK_MS);
+    ASSERT_LT(released_wait_ms, SEAL_WAIT_MS);
+    ASSERT_FALSE(released_wait_preserved);
+    ASSERT_TRUE(released_names_removed);
     ASSERT_TRUE(WIFEXITED(child_status));
     ASSERT_EQ(WEXITSTATUS(child_status), 0);
+    PASS();
+}
+
+/* The client's timeout diagnostic needs to tell "the generation's socket name
+ * is gone" (an external cleaner took it) from every other failed connect, so
+ * the connect reports a still-absent stable name, and only that: a socket that
+ * is there but refuses (its daemon died) or one that connects is not absent. */
+TEST(daemon_ipc_posix_connect_reports_absent_socket_name_only) {
+    static const char key[] = "d4c3b2a1f0e9d8c7";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_listener_t *listener = NULL;
+    cbm_daemon_ipc_connection_t *client = NULL;
+    int ready_pipe[2] = {-1, -1};
+    pid_t child = -1;
+    int child_status = -1;
+    uint8_t ready = 0;
+    bool endpoint_ready = false;
+    bool absent_connected = true;
+    bool absent_reported = false;
+    bool live_connected = false;
+    bool live_reported = true;
+    bool dead_published = false;
+    bool dead_connected = true;
+    bool dead_reported = true;
+
+    if (ipc_test_parent_new(parent, "connect-absent")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        endpoint_ready = true;
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        client = cbm_daemon_ipc_connect_ex(endpoint, 30, &absent_reported);
+        absent_connected = client != NULL;
+        cbm_daemon_ipc_connection_close(client);
+        client = NULL;
+        listener = cbm_daemon_ipc_listen(endpoint);
+    }
+    if (listener) {
+        client = cbm_daemon_ipc_connect_ex(endpoint, 200, &live_reported);
+        live_connected = client != NULL;
+        cbm_daemon_ipc_connection_close(client);
+        client = NULL;
+        cbm_daemon_ipc_listener_close(listener);
+        listener = NULL;
+        if (pipe(ready_pipe) == 0) {
+            child = fork();
+        }
+    }
+    if (child == 0) {
+        /* A daemon killed while listening: its names stay, nobody listens. */
+        (void)close(ready_pipe[0]);
+        cbm_daemon_ipc_listener_t *doomed = cbm_daemon_ipc_listen(endpoint);
+        uint8_t result = doomed ? 'R' : 'E';
+        (void)ipc_test_fd_write_all(ready_pipe[1], &result, sizeof(result));
+        _exit(doomed ? 0 : 1);
+    }
+    if (child > 0) {
+        (void)close(ready_pipe[1]);
+        ready_pipe[1] = -1;
+        dead_published = ipc_test_fd_read_all(ready_pipe[0], &ready, sizeof(ready)) && ready == 'R';
+        while (waitpid(child, &child_status, 0) < 0 && errno == EINTR) {}
+    }
+    if (dead_published) {
+        client = cbm_daemon_ipc_connect_ex(endpoint, 30, &dead_reported);
+        dead_connected = client != NULL;
+        cbm_daemon_ipc_connection_close(client);
+        client = NULL;
+    }
+
+    for (size_t index = 0; index < 2; index++) {
+        if (ready_pipe[index] >= 0) {
+            (void)close(ready_pipe[index]);
+        }
+    }
+    cbm_daemon_ipc_listener_close(listener);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    ASSERT_TRUE(endpoint_ready);
+    ASSERT_FALSE(absent_connected);
+    ASSERT_TRUE(absent_reported);
+    ASSERT_TRUE(live_connected);
+    ASSERT_FALSE(live_reported);
+    ASSERT_GT(child, 0);
+    ASSERT_TRUE(dead_published);
+    ASSERT_TRUE(WIFEXITED(child_status));
+    ASSERT_EQ(WEXITSTATUS(child_status), 0);
+    ASSERT_FALSE(dead_connected);
+    ASSERT_FALSE(dead_reported);
     PASS();
 }
 
@@ -5800,6 +6006,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_markerless_mismatched_socket_and_anchor_are_preserved);
     RUN_TEST(daemon_ipc_posix_active_listener_is_never_cleaned_under_queue_pressure);
     RUN_TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_replaced);
+    RUN_TEST(daemon_ipc_posix_connect_reports_absent_socket_name_only);
     RUN_TEST(daemon_ipc_posix_partial_frame_timeout_poisons_connection);
 #ifdef __APPLE__
     RUN_TEST(daemon_ipc_macos_clears_inherited_deny_acl_from_new_runtime);
