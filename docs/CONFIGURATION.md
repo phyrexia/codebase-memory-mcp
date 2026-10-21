@@ -644,28 +644,58 @@ process that should share one daemon must see the same value — set it in the
 environment of your MCP client and your shell alike, or a CLI invocation without
 it will coordinate through the default location instead.
 
-**Keep temporary-file cleaners out of the rendezvous directory.** It holds the
-running daemon's socket names (`cbm-<key>.sock`, `.anc`, `.sock.identity`) and
-its lock files, and on a daemon that has been up for days they look old. If a
-cleaner unlinks and recreates `cbm-<key>.lifetime.lock`, the daemon keeps its
-lock on the deleted file, so other CBM processes can no longer see that it is
-alive. A CLI command or index worker that then finds the lock free still asks
-the daemon's socket before it removes anything: when a listener answers, every
-name stays in place and the process logs
-`daemon.ipc.stale_cleanup_preserved socket=anchor listener=answered lifetime_lock=unheld`
-once. It asks again every 100 ms for up to 2 s, so a daemon that is already
-exiting does not fail the command; if the listener still answers after that, the
-command refuses to start with *"a live CBM daemon lost its lifetime lock (an
-external cleaner replaced it); it is restarting — retry in a few seconds"*. If
-that persists, restart the daemon to give it a fresh lock (close its sessions,
-run `codebase-memory-mcp daemon stop`, and let the next session start it). If
-instead the socket names are gone while the daemon still holds its
-cohort marker, `daemon stop` cannot reach it: a session waits out its startup
-budget and then reports *"CBM daemon holds the cohort marker but publishes no
-endpoint (orphaned runtime dir)"* — stop that process
-(`pgrep -f -- --cbm-daemon-internal` lists it) and retry. Either way, exclude
-the directory from the cleaner — on systemd hosts, an `x /tmp/cbm-daemon-*`
-line in `/etc/tmpfiles.d/`.
+**Temporary-file cleaners and the rendezvous directory.** It holds the running
+daemon's socket names (`cbm-<key>.sock`, `.anc`, `.sock.identity`) and its lock
+files. Age-based cleaners do not see the daemon's locks — macOS `tmp_cleaner`
+honours none, and `systemd-tmpfiles` ignores the `fcntl` record lock on
+`cbm-<key>.lifetime.lock` — so a running daemon refreshes the timestamps of
+every file it holds once an hour, by wall-clock time (the first check after a
+long sleep refreshes at once). It never touches the socket names: their change
+time is part of the identity `.sock.identity` vouches for, and both cleaners
+leave live sockets alone. A refresh that fails is logged once as
+`daemon.runtime_dir.keepalive_failed name=<file> errno=<code>`, and the daemon
+keeps serving.
+
+If a name is removed or replaced anyway — a cleaner pass the refresh lost to,
+or a manual `rm` — the daemon notices within a second: it compares every file
+it holds with what the name resolves to now. It logs
+`daemon.runtime_dir.orphaned detail=<what>` (`lifetime_replaced`,
+`socket_missing`, `identity_missing`, `participant_lock_replaced`,
+`cohort_marker_replaced`, `cohort_record_replaced`, or `io` when two checks in
+a row could not inspect the directory), stops admitting sessions, cancels the
+requests in flight, removes only the names that are still its own and exits
+with status 75 (`EX_TEMPFAIL`), so a fresh generation takes over: the next
+session or command starts one, or the supervisor restarts it. Until then, a
+`cbm-<key>.lifetime.lock` that was unlinked and recreated leaves the daemon
+holding its lock on the deleted file, so other CBM processes can no longer see
+that it is alive. A CLI command or index worker that then finds the lock free
+still asks the daemon's socket before it removes anything: when a listener
+answers, every name stays in place, the process logs
+`daemon.ipc.stale_cleanup_preserved socket=anchor listener=answered lifetime_lock=unheld`,
+and it asks again every 100 ms for up to 2 s, so a daemon that is already
+exiting does not fail the command; if the listener still answers after that,
+the command refuses to start with *"a live CBM daemon lost its lifetime lock
+(an external cleaner replaced it); it is restarting — retry in a few
+seconds"*. If instead the socket names are gone while an older daemon still
+holds its cohort marker, a session waits out its startup budget and then
+reports *"CBM daemon holds the cohort marker but publishes no endpoint
+(orphaned runtime dir)"* — stop that process (`pgrep -f --
+--cbm-daemon-internal` lists it) and retry. Excluding the directory
+from the cleaner remains the first line of defence and also protects older
+binaries — on systemd hosts, an `x /tmp/cbm-daemon-*` line in
+`/etc/tmpfiles.d/`, placed before any rule that ages `/tmp`.
+
+A daemon started directly in its permanent role
+(`codebase-memory-mcp --cbm-daemon-internal --cbm-daemon-permanent`, the way a
+supervisor such as a systemd user unit runs it) that finds another generation
+already serving the account — one a session launched, for instance — leaves
+that one alone: it logs
+`daemon.start_skipped reason=generation_already_served pid=<pid> serving_permanent=<0|1>`
+(both fields describe the generation that serves)
+and exits at once with status 73 (`EX_CANTCREAT`), where it used to wait out a
+12-second handoff window and fail. A supervisor should treat 73 as success and
+not restart on it (`SuccessExitStatus=73`, `RestartPreventExitStatus=73`), and
+restart on failure, which includes 75.
 
 Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
 

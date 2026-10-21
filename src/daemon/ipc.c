@@ -145,6 +145,28 @@ bool cbm_daemon_ipc_listen_failure_detail(cbm_daemon_ipc_listen_failure_t *out) 
     return ipc_listen_failure.stage[0] != '\0';
 }
 
+const char *cbm_daemon_ipc_names_state_name(cbm_daemon_ipc_names_state_t state) {
+    switch (state) {
+    case CBM_DAEMON_IPC_NAMES_INTACT:
+        return "intact";
+    case CBM_DAEMON_IPC_NAMES_LIFETIME_REPLACED:
+        return "lifetime_replaced";
+    case CBM_DAEMON_IPC_NAMES_SOCKET_MISSING:
+        return "socket_missing";
+    case CBM_DAEMON_IPC_NAMES_IDENTITY_MISSING:
+        return "identity_missing";
+    case CBM_DAEMON_IPC_NAMES_PARTICIPANT_REPLACED:
+        return "participant_lock_replaced";
+    case CBM_DAEMON_IPC_NAMES_COHORT_MARKER_REPLACED:
+        return "cohort_marker_replaced";
+    case CBM_DAEMON_IPC_NAMES_COHORT_RECORD_REPLACED:
+        return "cohort_record_replaced";
+    case CBM_DAEMON_IPC_NAMES_IO:
+    default:
+        return "io";
+    }
+}
+
 static bool instance_key_valid(const char *key) {
     if (!key) {
         return false;
@@ -3874,6 +3896,243 @@ bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t
     return true;
 }
 
+/* ── Runtime-directory upkeep (see ipc.h) ── */
+
+static void posix_keepalive_failure_note(cbm_daemon_ipc_keepalive_failure_t *failure_out,
+                                         const char *name, int errno_value) {
+    if (failure_out) {
+        (void)snprintf(failure_out->name, sizeof(failure_out->name), "%s", name ? name : "");
+        failure_out->errno_value = errno_value;
+    }
+}
+
+/* futimens(NULL) sets atime and mtime to now, and the kernel moves ctime with
+ * them: all three marks an age-based cleaner reads are fresh afterwards. */
+static bool posix_held_fd_touch(int fd, int *errno_out) {
+    int result;
+    do {
+        result = futimens(fd, NULL);
+    } while (result != 0 && errno == EINTR);
+    *errno_out = result == 0 ? 0 : errno;
+    return result == 0;
+}
+
+/* The identity record is the one held name without a retained descriptor.
+ * Open it without following links and refresh it only while it is still the
+ * inode this listener published. Absent or replaced is no refresh failure:
+ * the names check reports it, and refreshing a name that is no longer ours
+ * would keep somebody else's file alive. */
+static bool posix_identity_record_touch(const cbm_daemon_ipc_listener_t *listener,
+                                        int *errno_out) {
+    *errno_out = 0;
+    int fd;
+    do {
+        fd = openat(listener->dir_fd, listener->socket_identity_name,
+                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) {
+        /* ELOOP: a symlink now stands at the name, which is not ours either. */
+        *errno_out = errno == ENOENT || errno == ELOOP ? 0 : errno;
+        return *errno_out == 0;
+    }
+    struct stat status;
+    bool refreshed = true;
+    if (fstat(fd, &status) != 0) {
+        *errno_out = errno;
+        refreshed = false;
+    } else if (S_ISREG(status.st_mode) && status.st_dev == listener->identity_device &&
+               status.st_ino == listener->identity_inode) {
+        refreshed = posix_held_fd_touch(fd, errno_out);
+    }
+    (void)close(fd);
+    return refreshed;
+}
+
+bool cbm_daemon_ipc_participant_guard_keepalive(const cbm_daemon_ipc_participant_guard_t *guard,
+                                                cbm_daemon_ipc_keepalive_failure_t *failure_out) {
+    if (failure_out) {
+        memset(failure_out, 0, sizeof(*failure_out));
+    }
+    int error = EBADF;
+    bool valid = guard && guard->legacy_fd >= 0 && guard->legacy_process_entry &&
+                 guard->owner_pid == getpid();
+    if (valid && posix_held_fd_touch(guard->legacy_fd, &error)) {
+        return true;
+    }
+    const char *name = valid ? guard->legacy_process_entry->lock_name : "participant_guard";
+    posix_keepalive_failure_note(failure_out, name, error);
+    return false;
+}
+
+bool cbm_daemon_ipc_listener_keepalive(const cbm_daemon_ipc_listener_t *listener,
+                                       cbm_daemon_ipc_keepalive_failure_t *failure_out) {
+    if (failure_out) {
+        memset(failure_out, 0, sizeof(*failure_out));
+    }
+    const cbm_daemon_ipc_lifetime_reservation_t *reservation =
+        listener ? listener->lifetime_reservation : NULL;
+    if (!listener || listener->owner_pid != getpid() || listener->dir_fd < 0 ||
+        !listener->socket_identity_name || !reservation || reservation->fd < 0 ||
+        !reservation->process_entry) {
+        posix_keepalive_failure_note(failure_out, "listener", EBADF);
+        return false;
+    }
+    bool refreshed = true;
+    int error = 0;
+    if (!posix_held_fd_touch(reservation->fd, &error)) {
+        posix_keepalive_failure_note(failure_out, reservation->process_entry->lock_name, error);
+        refreshed = false;
+    }
+    if (!posix_identity_record_touch(listener, &error)) {
+        if (refreshed) {
+            posix_keepalive_failure_note(failure_out, listener->socket_identity_name, error);
+        }
+        refreshed = false;
+    }
+    cbm_daemon_ipc_keepalive_failure_t guard_failure;
+    if (listener->participant_guard &&
+        !cbm_daemon_ipc_participant_guard_keepalive(listener->participant_guard, &guard_failure)) {
+        if (refreshed && failure_out) {
+            *failure_out = guard_failure;
+        }
+        refreshed = false;
+    }
+    return refreshed;
+}
+
+static int posix_fstatat_no_eintr(int dir_fd, const char *name, struct stat *status) {
+    int result;
+    do {
+        result = fstatat(dir_fd, name, status, AT_SYMLINK_NOFOLLOW);
+    } while (result != 0 && errno == EINTR);
+    return result;
+}
+
+/* Whether `name` still resolves to the file behind the held descriptor, as
+ * `replaced` or IO when it does not or cannot be told. */
+static cbm_daemon_ipc_names_state_t posix_held_name_state(int dir_fd, const char *name, int fd,
+                                                          cbm_daemon_ipc_names_state_t replaced) {
+    if (dir_fd < 0 || !name || fd < 0) {
+        return CBM_DAEMON_IPC_NAMES_IO;
+    }
+    struct stat held;
+    struct stat named;
+    int result;
+    do {
+        result = fstat(fd, &held);
+    } while (result != 0 && errno == EINTR);
+    if (result != 0) {
+        return CBM_DAEMON_IPC_NAMES_IO;
+    }
+    if (posix_fstatat_no_eintr(dir_fd, name, &named) != 0) {
+        return errno == ENOENT ? replaced : CBM_DAEMON_IPC_NAMES_IO;
+    }
+    bool same_file = named.st_dev == held.st_dev && named.st_ino == held.st_ino;
+    return same_file ? CBM_DAEMON_IPC_NAMES_INTACT : replaced;
+}
+
+static cbm_daemon_ipc_names_state_t posix_participant_guard_name_state(
+    const cbm_daemon_ipc_participant_guard_t *guard, int dir_fd) {
+    if (!guard || guard->legacy_fd < 0 || !guard->legacy_process_entry ||
+        guard->owner_pid != getpid()) {
+        return CBM_DAEMON_IPC_NAMES_IO;
+    }
+    return posix_held_name_state(dir_fd, guard->legacy_process_entry->lock_name, guard->legacy_fd,
+                                 CBM_DAEMON_IPC_NAMES_PARTICIPANT_REPLACED);
+}
+
+/* `.sock` or `.anc`: still the socket inode this listener bound. */
+static cbm_daemon_ipc_names_state_t posix_listener_socket_name_state(
+    const cbm_daemon_ipc_listener_t *listener, const char *name) {
+    struct stat status;
+    if (posix_fstatat_no_eintr(listener->dir_fd, name, &status) != 0) {
+        return errno == ENOENT ? CBM_DAEMON_IPC_NAMES_SOCKET_MISSING : CBM_DAEMON_IPC_NAMES_IO;
+    }
+    bool bound = S_ISSOCK(status.st_mode) && status.st_dev == listener->socket_identity.device &&
+                 status.st_ino == listener->socket_identity.inode;
+    return bound ? CBM_DAEMON_IPC_NAMES_INTACT : CBM_DAEMON_IPC_NAMES_SOCKET_MISSING;
+}
+
+/* The identity record: still the inode this listener published, and still
+ * encoding this listener's socket identity with its ctime, so the check
+ * exercises the identity verification instead of stepping around it. */
+static cbm_daemon_ipc_names_state_t posix_listener_identity_state(
+    const cbm_daemon_ipc_listener_t *listener, const cbm_daemon_ipc_endpoint_t *view) {
+    struct stat status;
+    if (posix_fstatat_no_eintr(listener->dir_fd, listener->socket_identity_name, &status) != 0) {
+        return errno == ENOENT ? CBM_DAEMON_IPC_NAMES_IDENTITY_MISSING : CBM_DAEMON_IPC_NAMES_IO;
+    }
+    if (!S_ISREG(status.st_mode) || status.st_dev != listener->identity_device ||
+        status.st_ino != listener->identity_inode) {
+        return CBM_DAEMON_IPC_NAMES_IDENTITY_MISSING;
+    }
+    posix_socket_record_t marker = {0};
+    struct stat marker_status = {0};
+    posix_record_state_t state = posix_socket_record_read(
+        view, listener->socket_identity_name, POSIX_SOCKET_MARKER_MAGIC, &marker, &marker_status);
+    if (state == POSIX_RECORD_UNSAFE) {
+        return CBM_DAEMON_IPC_NAMES_IO;
+    }
+    bool ours = state == POSIX_RECORD_VALID && marker_status.st_dev == listener->identity_device &&
+                marker_status.st_ino == listener->identity_inode &&
+                posix_socket_identity_equal(&marker.identity, &listener->socket_identity);
+    return ours ? CBM_DAEMON_IPC_NAMES_INTACT : CBM_DAEMON_IPC_NAMES_IDENTITY_MISSING;
+}
+
+cbm_daemon_ipc_names_state_t cbm_daemon_ipc_listener_names_intact(
+    const cbm_daemon_ipc_listener_t *listener) {
+    const cbm_daemon_ipc_lifetime_reservation_t *reservation =
+        listener ? listener->lifetime_reservation : NULL;
+    if (!listener || listener->owner_pid != getpid() || listener->dir_fd < 0 ||
+        !listener->runtime_dir || !listener->socket_name || !listener->socket_anchor_name ||
+        !listener->socket_identity_name || !reservation || !reservation->process_entry) {
+        return CBM_DAEMON_IPC_NAMES_IO;
+    }
+    cbm_daemon_ipc_endpoint_t view = {
+        .runtime_dir = listener->runtime_dir,
+        .dir_device = listener->dir_device,
+        .dir_inode = listener->dir_inode,
+        .socket_name = listener->socket_name,
+        .socket_anchor_name = listener->socket_anchor_name,
+        .socket_identity_name = listener->socket_identity_name,
+        .socket_pending_name = listener->socket_pending_name,
+        .dir_fd = listener->dir_fd,
+    };
+    /* A removed, moved or re-permissioned runtime directory: the descriptor
+     * may still resolve every name while clients, who come by path, find
+     * none of them. */
+    if (!endpoint_runtime_still_valid(&view)) {
+        return CBM_DAEMON_IPC_NAMES_IO;
+    }
+    const char *lifetime_name = reservation->process_entry->lock_name;
+    cbm_daemon_ipc_names_state_t state = posix_held_name_state(
+        listener->dir_fd, lifetime_name, reservation->fd, CBM_DAEMON_IPC_NAMES_LIFETIME_REPLACED);
+    if (state == CBM_DAEMON_IPC_NAMES_INTACT) {
+        state = posix_listener_socket_name_state(listener, listener->socket_name);
+    }
+    if (state == CBM_DAEMON_IPC_NAMES_INTACT) {
+        state = posix_listener_socket_name_state(listener, listener->socket_anchor_name);
+    }
+    if (state == CBM_DAEMON_IPC_NAMES_INTACT) {
+        state = posix_listener_identity_state(listener, &view);
+    }
+    if (state == CBM_DAEMON_IPC_NAMES_INTACT && listener->participant_guard) {
+        state = posix_participant_guard_name_state(listener->participant_guard, listener->dir_fd);
+    }
+    return state;
+}
+
+cbm_daemon_ipc_names_state_t cbm_daemon_ipc_participant_guard_names_intact(
+    const cbm_daemon_ipc_participant_guard_t *guard, const cbm_daemon_ipc_endpoint_t *endpoint) {
+    const process_lock_entry_t *entry = guard ? guard->legacy_process_entry : NULL;
+    if (!entry || !endpoint_runtime_still_valid(endpoint) ||
+        entry->directory_device != endpoint->dir_device ||
+        entry->directory_inode != endpoint->dir_inode) {
+        return CBM_DAEMON_IPC_NAMES_IO;
+    }
+    return posix_participant_guard_name_state(guard, endpoint->dir_fd);
+}
+
 int cbm_daemon_ipc_local_transition_try_acquire(
     const cbm_daemon_ipc_endpoint_t *endpoint, cbm_daemon_ipc_local_transition_t **transition_out) {
     if (transition_out) {
@@ -7158,6 +7417,35 @@ bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t
     free(guard);
     *guard_io = NULL;
     return true;
+}
+
+/* Runtime-directory upkeep (see ipc.h). A named pipe has no file name to age
+ * out, and every Windows lock file is held without FILE_SHARE_DELETE, so no
+ * cleaner can remove a name under a live generation. */
+bool cbm_daemon_ipc_listener_keepalive(const cbm_daemon_ipc_listener_t *listener,
+                                       cbm_daemon_ipc_keepalive_failure_t *failure_out) {
+    if (failure_out) {
+        memset(failure_out, 0, sizeof(*failure_out));
+    }
+    return listener != NULL;
+}
+
+bool cbm_daemon_ipc_participant_guard_keepalive(const cbm_daemon_ipc_participant_guard_t *guard,
+                                                cbm_daemon_ipc_keepalive_failure_t *failure_out) {
+    if (failure_out) {
+        memset(failure_out, 0, sizeof(*failure_out));
+    }
+    return guard != NULL;
+}
+
+cbm_daemon_ipc_names_state_t cbm_daemon_ipc_listener_names_intact(
+    const cbm_daemon_ipc_listener_t *listener) {
+    return listener ? CBM_DAEMON_IPC_NAMES_INTACT : CBM_DAEMON_IPC_NAMES_IO;
+}
+
+cbm_daemon_ipc_names_state_t cbm_daemon_ipc_participant_guard_names_intact(
+    const cbm_daemon_ipc_participant_guard_t *guard, const cbm_daemon_ipc_endpoint_t *endpoint) {
+    return guard && endpoint ? CBM_DAEMON_IPC_NAMES_INTACT : CBM_DAEMON_IPC_NAMES_IO;
 }
 
 int cbm_daemon_ipc_local_transition_try_acquire(

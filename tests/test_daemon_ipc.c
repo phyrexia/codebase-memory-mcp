@@ -49,6 +49,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #ifdef __linux__
 #include <sched.h> /* #1830 userns real smoke: unshare(CLONE_NEWUSER). */
@@ -4881,6 +4882,340 @@ TEST(daemon_ipc_posix_connect_reports_absent_socket_name_only) {
     PASS();
 }
 
+/* ── D1: runtime-directory upkeep for long-lived generations ──
+ *
+ * systemd-tmpfiles (3 days on qf-infra) and macOS tmp_cleaner (more than 3
+ * days) delete runtime files by age. Neither honours the lifetime lock's
+ * fcntl record lock, and tmp_cleaner honours no lock at all, so a daemon that
+ * runs for days loses the names its locks hang on while it keeps serving. */
+
+enum {
+    IPC_TEST_AGED_SECONDS = 10 * 24 * 3600,
+    IPC_TEST_FRESH_SECONDS = 2,
+};
+
+static bool ipc_test_runtime_name_path(char out[TEST_PATH_CAP], const char *runtime_dir,
+                                       const char *key, const char *suffix) {
+    int written = runtime_dir && key && suffix
+                      ? snprintf(out, TEST_PATH_CAP, "%s/cbm-%s%s", runtime_dir, key, suffix)
+                      : -1;
+    return written > 0 && written < TEST_PATH_CAP;
+}
+
+/* Put atime and mtime ten days back. ctime cannot be set from user space (this
+ * very call moves it to now), which is why the assertions read mtime. */
+static bool ipc_test_age_name(const char *path) {
+    struct timespec aged[2];
+    aged[0].tv_sec = time(NULL) - IPC_TEST_AGED_SECONDS;
+    aged[0].tv_nsec = 0;
+    aged[1] = aged[0];
+    return path && utimensat(AT_FDCWD, path, aged, AT_SYMLINK_NOFOLLOW) == 0;
+}
+
+static bool ipc_test_recently_modified(const struct stat *status) {
+    return status && status->st_mtime >= time(NULL) - IPC_TEST_FRESH_SECONDS;
+}
+
+static bool ipc_test_ctime_equal(const struct stat *left, const struct stat *right) {
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    return left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+#else
+    return left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+#endif
+}
+
+/* What a cleaner leaves behind: the name unlinked and, for a lock, usually a
+ * fresh empty file under it, created by the next process that wanted it. */
+static bool ipc_test_replace_name(const char *path) {
+    if (!path || unlink(path) != 0) {
+        return false;
+    }
+    int replacement = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    bool replaced = replacement >= 0 && fchmod(replacement, 0600) == 0;
+    if (replacement >= 0) {
+        (void)close(replacement);
+    }
+    return replaced;
+}
+
+/* D1 §A: the listener refreshes the names it holds, and only those. A file it
+ * does not own keeps its age, and `.sock`/`.anc` keep their ctime: the socket
+ * identity the record vouches for includes it, so touching a socket would
+ * break the very verification the record exists for. */
+TEST(daemon_ipc_posix_listener_keepalive_refreshes_owned_names_only) {
+    static const char key[] = "d1a0000000000001";
+    enum { OWNED_NAMES = 3 };
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char socket_path[TEST_PATH_CAP] = {0};
+    char anchor_path[TEST_PATH_CAP] = {0};
+    char foreign_path[TEST_PATH_CAP] = {0};
+    char owned_paths[OWNED_NAMES][TEST_PATH_CAP] = {{0}};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_listener_t *listener = NULL;
+    cbm_daemon_ipc_keepalive_failure_t failure;
+    struct stat owned_before[OWNED_NAMES];
+    struct stat owned_after[OWNED_NAMES];
+    struct stat foreign_before = {0};
+    struct stat foreign_after = {0};
+    struct stat socket_before = {0};
+    struct stat socket_after = {0};
+    struct stat anchor_before = {0};
+    struct stat anchor_after = {0};
+    bool parent_ok = ipc_test_parent_new(parent, "keepalive");
+    bool paths_ok = false;
+    bool listening = false;
+    bool aged = false;
+    bool refreshed = false;
+    bool owned_fresh = false;
+    bool foreign_kept = false;
+    bool sockets_untouched = false;
+    int probe_after = -1;
+    int names_after = -1;
+    memset(&failure, 0, sizeof(failure));
+    memset(owned_before, 0, sizeof(owned_before));
+    memset(owned_after, 0, sizeof(owned_after));
+
+    if (parent_ok) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        ipc_test_copy_path(socket_path, cbm_daemon_ipc_endpoint_address(endpoint));
+        int foreign_written =
+            snprintf(foreign_path, sizeof(foreign_path), "%s/cbm-foreign.rw", runtime_dir);
+        paths_ok = ipc_test_lifetime_lock_path(owned_paths[0], runtime_dir, key) &&
+                   ipc_test_runtime_name_path(owned_paths[1], runtime_dir, key, ".lock") &&
+                   ipc_test_socket_identity_path(owned_paths[2], socket_path) &&
+                   ipc_test_socket_anchor_path(anchor_path, runtime_dir, key) &&
+                   foreign_written > 0 && foreign_written < (int)sizeof(foreign_path);
+    }
+    if (paths_ok) {
+        /* listen() keeps its own participant guard, so `.lock` is the
+         * listener's here. In the daemon role the host holds it instead (see
+         * the participant-guard test below). */
+        listener = cbm_daemon_ipc_listen(endpoint);
+        listening = listener != NULL;
+    }
+    if (listening) {
+        int foreign = open(foreign_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        aged = foreign >= 0 && close(foreign) == 0 && ipc_test_age_name(foreign_path) &&
+               lstat(foreign_path, &foreign_before) == 0 &&
+               lstat(socket_path, &socket_before) == 0 && lstat(anchor_path, &anchor_before) == 0;
+        for (size_t index = 0; aged && index < OWNED_NAMES; index++) {
+            aged = ipc_test_age_name(owned_paths[index]) &&
+                   lstat(owned_paths[index], &owned_before[index]) == 0 &&
+                   !ipc_test_recently_modified(&owned_before[index]);
+        }
+    }
+    if (aged) {
+        refreshed = cbm_daemon_ipc_listener_keepalive(listener, &failure);
+        owned_fresh = true;
+        for (size_t index = 0; index < OWNED_NAMES; index++) {
+            owned_fresh = owned_fresh && lstat(owned_paths[index], &owned_after[index]) == 0 &&
+                          ipc_test_recently_modified(&owned_after[index]) &&
+                          owned_after[index].st_dev == owned_before[index].st_dev &&
+                          owned_after[index].st_ino == owned_before[index].st_ino;
+        }
+        foreign_kept = lstat(foreign_path, &foreign_after) == 0 &&
+                       foreign_after.st_mtime == foreign_before.st_mtime;
+        sockets_untouched = lstat(socket_path, &socket_after) == 0 &&
+                            lstat(anchor_path, &anchor_after) == 0 &&
+                            socket_after.st_ino == socket_before.st_ino &&
+                            ipc_test_ctime_equal(&socket_before, &socket_after) &&
+                            ipc_test_ctime_equal(&anchor_before, &anchor_after);
+        probe_after = cbm_daemon_ipc_endpoint_probe(endpoint, 1);
+        names_after = (int)cbm_daemon_ipc_listener_names_intact(listener);
+    }
+
+    cbm_daemon_ipc_listener_close(listener);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    th_cleanup(parent_ok ? parent : NULL);
+
+    ASSERT_TRUE(parent_ok);
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(listening);
+    ASSERT_TRUE(aged);
+    ASSERT_TRUE(refreshed);
+    ASSERT_EQ(failure.errno_value, 0);
+    ASSERT_TRUE(owned_fresh);
+    ASSERT_TRUE(foreign_kept);
+    ASSERT_TRUE(sockets_untouched);
+    ASSERT_EQ(probe_after, 1);
+    ASSERT_EQ(names_after, CBM_DAEMON_IPC_NAMES_INTACT);
+    PASS();
+}
+
+typedef enum {
+    IPC_TEST_NAME_KEEP,
+    IPC_TEST_NAME_UNLINK,
+    IPC_TEST_NAME_REPLACE,
+} ipc_test_name_mutation_t;
+
+/* Publish one live listener for `key`, let an "external cleaner" act on the
+ * single runtime name ending in `suffix`, and return what the listener's own
+ * check reports (-1 when the fixture could not be built). */
+static int ipc_test_names_after_cleaner(const char *parent, const char *key, const char *suffix,
+                                        ipc_test_name_mutation_t mutation) {
+    cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    cbm_daemon_ipc_listener_t *listener = endpoint ? cbm_daemon_ipc_listen(endpoint) : NULL;
+    char path[TEST_PATH_CAP] = {0};
+    bool acted = listener && ipc_test_runtime_name_path(
+                                 path, cbm_daemon_ipc_endpoint_runtime_dir(endpoint), key, suffix);
+    if (acted && mutation == IPC_TEST_NAME_UNLINK) {
+        acted = unlink(path) == 0;
+    } else if (acted && mutation == IPC_TEST_NAME_REPLACE) {
+        acted = ipc_test_replace_name(path);
+    }
+    int state = acted ? (int)cbm_daemon_ipc_listener_names_intact(listener) : -1;
+    cbm_daemon_ipc_listener_close(listener);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    return state;
+}
+
+/* D1 §B: the daemon checks every second that each runtime name still resolves
+ * to what it holds. A cleaner that replaced the lifetime lock (the qf-infra
+ * incident of 2026-10-15), unlinked the anchor, unlinked the identity record
+ * or replaced the participant lock leaves a generation that other processes
+ * can no longer prove alive. Each case is reported by name; an untouched
+ * directory is intact. */
+TEST(daemon_ipc_posix_listener_names_intact_reports_replaced_and_missing_names) {
+    char parent[TEST_PATH_CAP] = {0};
+    bool parent_ok = ipc_test_parent_new(parent, "names-intact");
+    int untouched = -1;
+    int lifetime = -1;
+    int anchor = -1;
+    int identity = -1;
+    int participant = -1;
+    if (parent_ok) {
+        untouched =
+            ipc_test_names_after_cleaner(parent, "d1b0000000000001", "", IPC_TEST_NAME_KEEP);
+        lifetime = ipc_test_names_after_cleaner(parent, "d1b0000000000002", ".lifetime.lock",
+                                                IPC_TEST_NAME_REPLACE);
+        anchor = ipc_test_names_after_cleaner(parent, "d1b0000000000003", ".anc",
+                                              IPC_TEST_NAME_UNLINK);
+        identity = ipc_test_names_after_cleaner(parent, "d1b0000000000004", ".sock.identity",
+                                                IPC_TEST_NAME_UNLINK);
+        participant = ipc_test_names_after_cleaner(parent, "d1b0000000000005", ".lock",
+                                                   IPC_TEST_NAME_REPLACE);
+    }
+    th_cleanup(parent_ok ? parent : NULL);
+
+    ASSERT_TRUE(parent_ok);
+    ASSERT_EQ(untouched, CBM_DAEMON_IPC_NAMES_INTACT);
+    ASSERT_EQ(lifetime, CBM_DAEMON_IPC_NAMES_LIFETIME_REPLACED);
+    ASSERT_EQ(anchor, CBM_DAEMON_IPC_NAMES_SOCKET_MISSING);
+    ASSERT_EQ(identity, CBM_DAEMON_IPC_NAMES_IDENTITY_MISSING);
+    ASSERT_EQ(participant, CBM_DAEMON_IPC_NAMES_PARTICIPANT_REPLACED);
+    PASS();
+}
+
+/* D1 §A/§B: in the daemon role the host joins the participant group itself
+ * (only listen() hands its guard to the listener), so `.lock` is refreshed
+ * and checked through the guard, against the endpoint's directory. */
+TEST(daemon_ipc_posix_participant_guard_keepalive_and_names_follow_the_held_lock) {
+    static const char key[] = "d1c0000000000001";
+    char parent[TEST_PATH_CAP] = {0};
+    char lock_path[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_participant_guard_t *guard = NULL;
+    cbm_daemon_ipc_keepalive_failure_t failure;
+    struct stat before = {0};
+    struct stat after = {0};
+    bool parent_ok = ipc_test_parent_new(parent, "guard-keepalive");
+    int joined = -1;
+    bool aged = false;
+    bool refreshed = false;
+    bool fresh_same_inode = false;
+    int names_held = -1;
+    int names_replaced = -1;
+    memset(&failure, 0, sizeof(failure));
+
+    if (parent_ok) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint && ipc_test_runtime_name_path(
+                        lock_path, cbm_daemon_ipc_endpoint_runtime_dir(endpoint), key, ".lock")) {
+        joined = cbm_daemon_ipc_participant_guard_try_join(endpoint, &guard);
+    }
+    if (joined == 1) {
+        aged = ipc_test_age_name(lock_path) && lstat(lock_path, &before) == 0 &&
+               !ipc_test_recently_modified(&before);
+    }
+    if (aged) {
+        refreshed = cbm_daemon_ipc_participant_guard_keepalive(guard, &failure);
+        fresh_same_inode = lstat(lock_path, &after) == 0 && ipc_test_recently_modified(&after) &&
+                           after.st_dev == before.st_dev && after.st_ino == before.st_ino;
+        names_held = (int)cbm_daemon_ipc_participant_guard_names_intact(guard, endpoint);
+        names_replaced = ipc_test_replace_name(lock_path)
+                             ? (int)cbm_daemon_ipc_participant_guard_names_intact(guard, endpoint)
+                             : -1;
+    }
+
+    (void)cbm_daemon_ipc_participant_guard_release(&guard);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    th_cleanup(parent_ok ? parent : NULL);
+
+    ASSERT_TRUE(parent_ok);
+    ASSERT_EQ(joined, 1);
+    ASSERT_TRUE(aged);
+    ASSERT_TRUE(refreshed);
+    ASSERT_EQ(failure.errno_value, 0);
+    ASSERT_TRUE(fresh_same_inode);
+    ASSERT_EQ(names_held, CBM_DAEMON_IPC_NAMES_INTACT);
+    ASSERT_EQ(names_replaced, CBM_DAEMON_IPC_NAMES_PARTICIPANT_REPLACED);
+    PASS();
+}
+
+/* D1 §B: a check that cannot inspect its own runtime directory reports IO,
+ * distinct from a replaced name. The host tolerates one IO observation and
+ * ends the generation only when the next check fails too (exercised end to
+ * end by the daemon smoke). Revoking the directory's mode is that failure on
+ * every account, root included, because the private-runtime validation
+ * compares the mode itself; with the mode back the next check is intact. */
+TEST(daemon_ipc_posix_listener_names_intact_reports_io_while_runtime_dir_is_unreadable) {
+    static const char key[] = "d1d0000000000001";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_listener_t *listener = NULL;
+    bool parent_ok = ipc_test_parent_new(parent, "names-io");
+    bool listening = false;
+    bool revoked = false;
+    bool restored = false;
+    int names_revoked = -1;
+    int names_restored = -1;
+
+    if (parent_ok) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        listener = cbm_daemon_ipc_listen(endpoint);
+        listening = listener != NULL;
+    }
+    if (listening) {
+        revoked = chmod(runtime_dir, 0) == 0;
+        names_revoked = revoked ? (int)cbm_daemon_ipc_listener_names_intact(listener) : -1;
+        restored = chmod(runtime_dir, 0700) == 0;
+        names_restored = restored ? (int)cbm_daemon_ipc_listener_names_intact(listener) : -1;
+    }
+
+    cbm_daemon_ipc_listener_close(listener);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    th_cleanup(parent_ok ? parent : NULL);
+
+    ASSERT_TRUE(parent_ok);
+    ASSERT_TRUE(listening);
+    ASSERT_TRUE(revoked);
+    ASSERT_EQ(names_revoked, CBM_DAEMON_IPC_NAMES_IO);
+    ASSERT_TRUE(restored);
+    ASSERT_EQ(names_restored, CBM_DAEMON_IPC_NAMES_INTACT);
+    PASS();
+}
+
 TEST(daemon_ipc_posix_partial_frame_timeout_poisons_connection) {
     static const char key[] = "777788889999aaaa";
     static const uint8_t payload[] = {'n', 'e', 'w'};
@@ -6006,6 +6341,10 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_markerless_mismatched_socket_and_anchor_are_preserved);
     RUN_TEST(daemon_ipc_posix_active_listener_is_never_cleaned_under_queue_pressure);
     RUN_TEST(daemon_ipc_posix_stale_cleanup_preserves_live_listener_after_lifetime_lock_replaced);
+    RUN_TEST(daemon_ipc_posix_listener_keepalive_refreshes_owned_names_only);
+    RUN_TEST(daemon_ipc_posix_listener_names_intact_reports_replaced_and_missing_names);
+    RUN_TEST(daemon_ipc_posix_participant_guard_keepalive_and_names_follow_the_held_lock);
+    RUN_TEST(daemon_ipc_posix_listener_names_intact_reports_io_while_runtime_dir_is_unreadable);
     RUN_TEST(daemon_ipc_posix_connect_reports_absent_socket_name_only);
     RUN_TEST(daemon_ipc_posix_partial_frame_timeout_poisons_connection);
 #ifdef __APPLE__

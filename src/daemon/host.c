@@ -28,12 +28,14 @@
 #include "ui/http_server.h"
 #include "watcher/watcher.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum {
     /* Descriptor budget for the configured connection cap. Measured on a live
@@ -58,12 +60,28 @@ enum {
      * rather than failing startup on a transient BUSY. Bounded well under the
      * client's 30 s daemon-start budget. */
     HOST_DAEMON_CLAIM_TIMEOUT_MS = 12000,
+    /* While the claim is BUSY, how long to wait for the generation that holds
+     * it to answer a status probe. The budget the client bootstrap gives a
+     * HELLO: a serving daemon answers well inside it, and a stopping one never
+     * answers at all, so a longer wait would only delay the handoff. */
+    HOST_SERVED_PROBE_TIMEOUT_MS = 1000,
     HOST_WAIT_TICK_MS = 100,
     HOST_HTTP_CONFIG_POLL_MS = 1000,
     HOST_METRICS_FLUSH_MS = 60000,
     HOST_HTTP_RETRY_INITIAL_MS = 1000,
     HOST_HTTP_RETRY_MAX_MS = 30000,
     HOST_WATCH_INTERVAL_MS = 5000,
+    /* Age-based cleaners reap runtime files after about 3 days (a common
+     * systemd-tmpfiles /tmp policy; macOS tmp_cleaner's daily sweep). An
+     * hourly refresh keeps every held name far inside either threshold. */
+    HOST_KEEPALIVE_INTERVAL_S = 3600,
+    /* How often the daemon checks that its runtime names still resolve to
+     * what it holds, and how many IO observations in a row end the
+     * generation: one transient failure must not, two on its own directory
+     * do, because a generation it cannot verify must not keep serving. */
+    HOST_NAMES_CHECK_MS = 1000,
+    HOST_NAMES_IO_STREAK_LIMIT = 2,
+    HOST_NAMES_CHECK_SEAM_CEILING_MS = 60000,
     HOST_CONFLICT_LOG_CAP = 1024 * 1024,
     HOST_OPERATION_LOG_CAP = 5 * 1024 * 1024,
     HOST_PATH_CAP = 4096,
@@ -1088,22 +1106,204 @@ static bool host_background_start(host_state_t *host) {
     return true;
 }
 
-static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
-                                   atomic_int *stop_requested, host_state_t *host, bool permanent) {
+/* ── Runtime-directory upkeep ──
+ *
+ * The names this generation holds in the runtime directory, each kept by its
+ * owner: the listener (inside the runtime service) holds the lifetime
+ * reservation and the identity record; the host itself holds the participant
+ * guard, the cohort lease and the daemon claim. See ipc.h for why age-based
+ * cleaners would otherwise reap them under a daemon that runs for days. */
+typedef struct {
+    const cbm_daemon_ipc_endpoint_t *endpoint;
+    const cbm_daemon_ipc_participant_guard_t *participant_guard;
+    const cbm_version_cohort_daemon_claim_t *daemon_claim;
+    const cbm_version_cohort_lease_t *cohort_lease;
+    uint64_t keepalive_interval_ms;
+    uint64_t keepalive_last_wall_ms;
+    bool keepalive_done;
+    bool keepalive_failure_logged;
+    uint64_t names_check_ms;
+    uint64_t names_next_check_ms;
+    unsigned names_io_streak;
+} host_runtime_dir_t;
+
+/* Wall-clock milliseconds since the epoch, 0 if unavailable. The keepalive is
+ * paced by the wall clock rather than cbm_now_ms(): cleaners age files by wall
+ * time, and the monotonic clock stops while the machine sleeps, so the first
+ * tick after a long suspend has to see the whole gap. */
+static uint64_t host_wall_clock_ms(void) {
+#ifdef _WIN32
+    time_t now = time(NULL);
+    return now > 0 ? (uint64_t)now * CBM_MSEC_PER_SEC : 0;
+#else
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec < 0) {
+        return 0;
+    }
+    return (uint64_t)now.tv_sec * CBM_MSEC_PER_SEC + (uint64_t)now.tv_nsec / CBM_NSEC_PER_MSEC;
+#endif
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Test builds may shorten a host cadence. Only a whole number of milliseconds
+ * in [HOST_WAIT_TICK_MS, ceiling_ms] is honoured; anything else keeps the
+ * production value. */
+static uint64_t host_cadence_seam_ms(const char *name, uint64_t production_ms,
+                                     uint64_t ceiling_ms) {
+    char text[32];
+    const char *configured = cbm_safe_getenv(name, text, sizeof(text), NULL);
+    if (configured) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(configured, &end, 10);
+        if (errno == 0 && end && end != configured && *end == '\0' &&
+            parsed >= HOST_WAIT_TICK_MS && parsed <= ceiling_ms) {
+            return (uint64_t)parsed;
+        }
+    }
+    return production_ms;
+}
+#endif
+
+static uint64_t host_keepalive_interval_ms(void) {
+    uint64_t interval = (uint64_t)HOST_KEEPALIVE_INTERVAL_S * CBM_MSEC_PER_SEC;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    interval = host_cadence_seam_ms("CBM_TEST_KEEPALIVE_MS", interval, interval);
+#endif
+    return interval;
+}
+
+/* Evaluated every tick: refresh on the first one, once the interval has passed
+ * on the wall clock, and whenever that clock went backwards. A failure is
+ * logged once and never stops the daemon; the next complete refresh re-arms
+ * the log, so a new episode shows up without a persistent one repeating
+ * hourly. */
+static void host_runtime_dir_keepalive_at(host_runtime_dir_t *dir,
+                                          cbm_daemon_runtime_service_t *service,
+                                          uint64_t now_wall_ms) {
+    bool due = !dir->keepalive_done || now_wall_ms < dir->keepalive_last_wall_ms ||
+               now_wall_ms - dir->keepalive_last_wall_ms >= dir->keepalive_interval_ms;
+    if (!due) {
+        return;
+    }
+    dir->keepalive_done = true;
+    dir->keepalive_last_wall_ms = now_wall_ms;
+
+    cbm_daemon_ipc_keepalive_failure_t first;
+    cbm_daemon_ipc_keepalive_failure_t failure;
+    bool refreshed =
+        cbm_daemon_ipc_listener_keepalive(cbm_daemon_runtime_service_listener(service), &first);
+    if (!cbm_daemon_ipc_participant_guard_keepalive(dir->participant_guard, &failure)) {
+        if (refreshed) {
+            first = failure;
+        }
+        refreshed = false;
+    }
+    if (!cbm_version_cohort_daemon_keepalive(dir->daemon_claim, dir->cohort_lease, &failure)) {
+        if (refreshed) {
+            first = failure;
+        }
+        refreshed = false;
+    }
+    if (refreshed) {
+        dir->keepalive_failure_logged = false;
+        return;
+    }
+    if (dir->keepalive_failure_logged) {
+        return;
+    }
+    dir->keepalive_failure_logged = true;
+    const char *errno_name = first.errno_value != 0 ? cbm_errno_name(first.errno_value) : NULL;
+    cbm_log_warn("daemon.runtime_dir.keepalive_failed", "name", first.name, "errno",
+                 errno_name ? errno_name : "none");
+}
+
+static uint64_t host_names_check_ms(void) {
+    uint64_t period = HOST_NAMES_CHECK_MS;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    period = host_cadence_seam_ms("CBM_TEST_NAMES_INTACT_MS", period,
+                                  HOST_NAMES_CHECK_SEAM_CEILING_MS);
+#endif
+    return period;
+}
+
+/* One observation over every owner. A replaced or missing name outranks IO
+ * from another owner: it is terminal, and IO only counts when it repeats. */
+static cbm_daemon_ipc_names_state_t host_runtime_dir_names_state(
+    const host_runtime_dir_t *dir, cbm_daemon_runtime_service_t *service) {
+    cbm_daemon_ipc_names_state_t observed[] = {
+        cbm_daemon_ipc_listener_names_intact(cbm_daemon_runtime_service_listener(service)),
+        cbm_daemon_ipc_participant_guard_names_intact(dir->participant_guard, dir->endpoint),
+        cbm_version_cohort_daemon_names_intact(dir->daemon_claim, dir->cohort_lease),
+    };
+    cbm_daemon_ipc_names_state_t combined = CBM_DAEMON_IPC_NAMES_INTACT;
+    for (size_t index = 0; index < sizeof(observed) / sizeof(observed[0]); index++) {
+        if (observed[index] == CBM_DAEMON_IPC_NAMES_IO) {
+            combined = CBM_DAEMON_IPC_NAMES_IO;
+        } else if (observed[index] != CBM_DAEMON_IPC_NAMES_INTACT) {
+            return observed[index];
+        }
+    }
+    return combined;
+}
+
+/* Whether this generation must stop serving. Checked once per period, only
+ * while the runtime is RUNNING: every name was created by this process before
+ * the loop began, so any discrepancy is external, and a new generation can
+ * only publish under absent names, so none can be racing this one yet. A
+ * replaced or missing name acts on its first observation; IO only after
+ * HOST_NAMES_IO_STREAK_LIMIT in a row. Leaving, never relocking or
+ * republishing in place, is the one move that cannot race a legitimate
+ * starter: if one exists it wins, if not the next client launches one. */
+static bool host_runtime_dir_orphaned_at(host_runtime_dir_t *dir,
+                                         cbm_daemon_runtime_service_t *service, uint64_t now_ms) {
+    if (now_ms < dir->names_next_check_ms) {
+        return false;
+    }
+    dir->names_next_check_ms = host_deadline_from(now_ms, (uint32_t)dir->names_check_ms);
+    cbm_daemon_ipc_names_state_t state = host_runtime_dir_names_state(dir, service);
+    if (state == CBM_DAEMON_IPC_NAMES_INTACT) {
+        dir->names_io_streak = 0;
+        return false;
+    }
+    if (state == CBM_DAEMON_IPC_NAMES_IO && ++dir->names_io_streak < HOST_NAMES_IO_STREAK_LIMIT) {
+        return false;
+    }
+    cbm_log_warn("daemon.runtime_dir.orphaned", "detail", cbm_daemon_ipc_names_state_name(state));
+    return true;
+}
+
+/* How a generation's lifetime ended; the first four are the `reason`s of
+ * daemon.lifetime_end. */
+typedef enum {
+    HOST_END_RUNTIME_EXITED,
+    HOST_END_STOP_REQUESTED,
+    HOST_END_INITIAL_WINDOW,
+    HOST_END_ORPHANED,
+    HOST_END_SHUTDOWN_TIMEOUT,
+} host_lifetime_end_t;
+
+static host_lifetime_end_t host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
+                                                  atomic_int *stop_requested, host_state_t *host,
+                                                  bool permanent, host_runtime_dir_t *runtime_dir) {
     uint64_t initial_deadline = cbm_now_ms() + HOST_INITIAL_CLIENT_TIMEOUT_MS;
     uint64_t stopping_deadline = 0;
+    bool orphaned = false;
     for (;;) {
         cbm_daemon_runtime_service_state_t state = cbm_daemon_runtime_service_state(service);
         if (state == CBM_DAEMON_RUNTIME_SERVICE_EXITED) {
-            cbm_log_info("daemon.lifetime_end", "reason", "runtime_exited");
-            return true;
+            /* An orphaned generation ends through the ordinary stop below;
+             * the reason is the host's, recorded when it decided to leave. */
+            cbm_log_info("daemon.lifetime_end", "reason",
+                         orphaned ? "runtime_dir_orphaned" : "runtime_exited");
+            return orphaned ? HOST_END_ORPHANED : HOST_END_RUNTIME_EXITED;
         }
         if (state == CBM_DAEMON_RUNTIME_SERVICE_STOPPING) {
             if (stopping_deadline == 0) {
                 stopping_deadline = cbm_now_ms() + HOST_RUNTIME_SHUTDOWN_MS;
             }
             if (cbm_now_ms() >= stopping_deadline) {
-                return false;
+                return HOST_END_SHUTDOWN_TIMEOUT;
             }
             (void)cbm_daemon_runtime_service_wait_exited(service, HOST_WAIT_TICK_MS);
             continue;
@@ -1121,7 +1321,20 @@ static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
         if (stop || (!permanent && !admitted && cbm_now_ms() >= initial_deadline)) {
             cbm_log_info("daemon.lifetime_end", "reason",
                          stop ? "stop_requested" : "initial_window_expired");
-            return cbm_daemon_runtime_service_stop(service, HOST_RUNTIME_SHUTDOWN_MS);
+            if (!cbm_daemon_runtime_service_stop(service, HOST_RUNTIME_SHUTDOWN_MS)) {
+                return HOST_END_SHUTDOWN_TIMEOUT;
+            }
+            return stop ? HOST_END_STOP_REQUESTED : HOST_END_INITIAL_WINDOW;
+        }
+        host_runtime_dir_keepalive_at(runtime_dir, service, host_wall_clock_ms());
+        if (host_runtime_dir_orphaned_at(runtime_dir, service, cbm_now_ms())) {
+            /* Not an emergency stop: admission ends, sessions are cancelled
+             * and given the usual bound to unwind, and the listener removes
+             * only the names that are still its own. */
+            orphaned = true;
+            cbm_daemon_runtime_service_begin_stop(service, HOST_RUNTIME_SHUTDOWN_MS,
+                                                  "runtime_dir_orphaned");
+            continue;
         }
         host_http_reconcile_at(host, cbm_now_ms(), false);
         host_metrics_flush_at(host, cbm_now_ms());
@@ -1249,6 +1462,32 @@ static void host_prepare_descriptor_limit(uint32_t max_clients) {
                  effective_text);
 }
 
+/* With the daemon claim BUSY, whether a generation is already serving the
+ * endpoint, asked the way `daemon status` asks. Only a present socket is
+ * probed: between generations the name is absent and a status request would
+ * spend its whole timeout retrying the connect. A RUNNING generation answers
+ * at once; a stopping one no longer accepts, never answers, and reads as not
+ * served, so the existing handoff wait continues. The first generation to
+ * claim the marker serves; this one then leaves without noise. */
+static bool host_generation_already_served(const cbm_daemon_host_config_t *config) {
+    if (cbm_daemon_ipc_endpoint_probe(config->endpoint, 0) != 1) {
+        return false;
+    }
+    cbm_daemon_runtime_status_t status;
+    if (!cbm_daemon_runtime_request_status(config->endpoint, &config->identity,
+                                           HOST_SERVED_PROBE_TIMEOUT_MS, &status) ||
+        status.stopping) {
+        return false;
+    }
+    /* pid and serving_permanent describe the generation that serves, not
+     * this one, which leaves. */
+    char pid_text[32];
+    (void)snprintf(pid_text, sizeof(pid_text), "%lu", (unsigned long)status.daemon_pid);
+    cbm_log_info("daemon.start_skipped", "reason", "generation_already_served", "pid", pid_text,
+                 "serving_permanent", status.permanent ? "1" : "0");
+    return true;
+}
+
 int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     if (!config || !config->endpoint || !config->executable_path ||
         !config->identity.semantic_version || !config->identity.build_fingerprint) {
@@ -1299,19 +1538,29 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     uint64_t claim_deadline = host_deadline_after(HOST_DAEMON_CLAIM_TIMEOUT_MS);
     cbm_version_cohort_status_t claim_status =
         cbm_version_cohort_daemon_claim_acquire(cohort_manager, &daemon_claim);
+    bool already_served = false;
     while (claim_status == CBM_VERSION_COHORT_BUSY && cbm_now_ms() < claim_deadline) {
-        /* The previous generation is releasing; retry until the claim is free
+        /* A generation that answers already serves: leave it alone. Otherwise
+         * the previous generation is releasing; retry until the claim is free
          * or the handoff window elapses (a persistent BUSY = a real conflict). */
+        already_served = host_generation_already_served(config);
+        if (already_served) {
+            break;
+        }
         cbm_usleep(HOST_WAIT_TICK_MS * 1000);
         claim_status = cbm_version_cohort_daemon_claim_acquire(cohort_manager, &daemon_claim);
     }
     if (claim_status != CBM_VERSION_COHORT_OK) {
-        cbm_log_error("daemon.start_failed", "component", "claim");
+        /* Nothing is published yet (no lifetime reservation, service or
+         * application exists), so the same cleanup serves both exits. */
+        if (!already_served) {
+            cbm_log_error("daemon.start_failed", "component", "claim");
+        }
         host_participant_guard_close(&participant_guard);
         host_daemon_claim_close(&daemon_claim);
         host_cohort_close(&cohort_lease, &cohort_manager);
         host_log_close();
-        return -1;
+        return already_served ? CBM_DAEMON_HOST_EXIT_ALREADY_SERVED : -1;
     }
     cbm_daemon_ipc_lifetime_reservation_t *lifetime_reservation = NULL;
     if (host_lifetime_reservation_acquire(config->endpoint, &lifetime_reservation) != 1) {
@@ -1443,7 +1692,17 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
                   * it — the same values `daemon status` reports. */
                  "max_clients", max_clients_text, "max_clients_source",
                  cbm_daemon_max_clients_source_name(knobs.max_clients_source));
-    if (!host_wait_for_lifetime(service, config->stop_requested, &host, config->permanent)) {
+    host_runtime_dir_t runtime_dir = {
+        .endpoint = config->endpoint,
+        .participant_guard = participant_guard,
+        .daemon_claim = daemon_claim,
+        .cohort_lease = cohort_lease,
+        .keepalive_interval_ms = host_keepalive_interval_ms(),
+        .names_check_ms = host_names_check_ms(),
+    };
+    host_lifetime_end_t lifetime_end = host_wait_for_lifetime(
+        service, config->stop_requested, &host, config->permanent, &runtime_dir);
+    if (lifetime_end == HOST_END_SHUTDOWN_TIMEOUT) {
         host_force_terminate("runtime");
     }
 
@@ -1471,5 +1730,5 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     host_participant_guard_close(&participant_guard);
     host_daemon_claim_close(&daemon_claim);
     host_cohort_close(&cohort_lease, &cohort_manager);
-    return 0;
+    return lifetime_end == HOST_END_ORPHANED ? CBM_DAEMON_HOST_EXIT_RUNTIME_DIR_ORPHANED : 0;
 }

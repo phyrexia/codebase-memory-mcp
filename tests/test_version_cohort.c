@@ -22,7 +22,10 @@
 #endif
 #include <windows.h>
 #else
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -1022,6 +1025,191 @@ TEST(version_cohort_crash_releases_process_lifetime_lease) {
 #endif
 }
 
+#ifndef _WIN32
+/* ── D1: runtime-directory upkeep of the daemon's cohort names ──
+ *
+ * macOS tmp_cleaner honours no lock at all, so the generation marker and the
+ * cohort lifetime record a daemon holds for days age out like any other file.
+ * (Windows holds its lock files without FILE_SHARE_DELETE; nothing can unlink
+ * them under a live holder, so these checks are POSIX-only.) */
+
+static const char VERSION_COHORT_TEST_MARKER_FILE[] = "cbm-version-cohort-daemon-v1.lock";
+static const char VERSION_COHORT_TEST_RECORD_FILE[] = "cbm-version-cohort-lifetime-v1.lock";
+
+enum {
+    VERSION_COHORT_TEST_AGED_SECONDS = 10 * 24 * 3600,
+    VERSION_COHORT_TEST_FRESH_SECONDS = 2,
+    VERSION_COHORT_TEST_RECORD_CAP = 4096,
+};
+
+static bool version_cohort_test_runtime_path(char out[VERSION_COHORT_TEST_PATH_CAP],
+                                             const version_cohort_fixture_t *fixture,
+                                             const char *name) {
+    const char *runtime_dir = cbm_daemon_ipc_endpoint_runtime_dir(fixture->endpoint);
+    int written = runtime_dir
+                      ? snprintf(out, VERSION_COHORT_TEST_PATH_CAP, "%s/%s", runtime_dir, name)
+                      : -1;
+    return written > 0 && written < VERSION_COHORT_TEST_PATH_CAP;
+}
+
+static bool version_cohort_test_age(const char *path) {
+    struct timespec aged[2];
+    aged[0].tv_sec = time(NULL) - VERSION_COHORT_TEST_AGED_SECONDS;
+    aged[0].tv_nsec = 0;
+    aged[1] = aged[0];
+    return utimensat(AT_FDCWD, path, aged, AT_SYMLINK_NOFOLLOW) == 0;
+}
+
+static bool version_cohort_test_recently_modified(const struct stat *status) {
+    return status->st_mtime >= time(NULL) - VERSION_COHORT_TEST_FRESH_SECONDS;
+}
+
+static bool version_cohort_test_read(const char *path, unsigned char *buffer, size_t capacity,
+                                     size_t *length_out) {
+    *length_out = 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        return false;
+    }
+    ssize_t count = read(fd, buffer, capacity);
+    bool closed = close(fd) == 0;
+    if (count > 0) {
+        *length_out = (size_t)count;
+    }
+    return count > 0 && closed;
+}
+
+static bool version_cohort_test_replace(const char *path) {
+    if (unlink(path) != 0) {
+        return false;
+    }
+    int replacement = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    bool replaced = replacement >= 0 && fchmod(replacement, 0600) == 0;
+    if (replacement >= 0) {
+        (void)close(replacement);
+    }
+    return replaced;
+}
+
+/* What a daemon holds for its whole lifetime: one exact-build lease (the
+ * lifetime record, SH) plus the generation marker (EX). */
+typedef struct {
+    version_cohort_fixture_t fixture;
+    cbm_version_cohort_manager_t *manager;
+    cbm_version_cohort_lease_t *lease;
+    cbm_version_cohort_daemon_claim_t *claim;
+} version_cohort_daemon_hold_t;
+
+static bool version_cohort_test_daemon_hold(version_cohort_daemon_hold_t *hold, const char *tag) {
+    memset(hold, 0, sizeof(*hold));
+    cbm_daemon_build_identity_t identity = version_cohort_identity("2.4.0", VERSION_COHORT_BUILD_A);
+    cbm_daemon_conflict_t conflict;
+    if (!version_cohort_fixture_start(&hold->fixture, tag)) {
+        return false;
+    }
+    hold->manager = cbm_version_cohort_manager_new(hold->fixture.endpoint);
+    return hold->manager &&
+           cbm_version_cohort_acquire(hold->manager, &identity, UINT64_MAX, &hold->lease,
+                                      &conflict) == CBM_VERSION_COHORT_OK &&
+           cbm_version_cohort_daemon_claim_acquire(hold->manager, &hold->claim) ==
+               CBM_VERSION_COHORT_OK;
+}
+
+static void version_cohort_test_daemon_release(version_cohort_daemon_hold_t *hold) {
+    while (hold->claim &&
+           cbm_version_cohort_daemon_claim_release(&hold->claim) != CBM_PRIVATE_FILE_LOCK_OK) {
+        cbm_usleep(1000);
+    }
+    version_cohort_release(&hold->lease);
+    version_cohort_manager_close(&hold->manager);
+    version_cohort_fixture_finish(&hold->fixture);
+}
+
+/* D1 §A: the refresh goes through the held descriptors, so the inodes stay the
+ * same and the lifetime record's payload is untouched. */
+TEST(version_cohort_daemon_keepalive_refreshes_marker_and_record_without_reopening) {
+    version_cohort_daemon_hold_t hold;
+    cbm_daemon_ipc_keepalive_failure_t failure;
+    char marker_path[VERSION_COHORT_TEST_PATH_CAP] = {0};
+    char record_path[VERSION_COHORT_TEST_PATH_CAP] = {0};
+    unsigned char record_before[VERSION_COHORT_TEST_RECORD_CAP];
+    unsigned char record_after[VERSION_COHORT_TEST_RECORD_CAP];
+    size_t record_before_length = 0;
+    size_t record_after_length = 0;
+    struct stat marker_before = {0};
+    struct stat marker_after = {0};
+    struct stat record_status_before = {0};
+    struct stat record_status_after = {0};
+    memset(&failure, 0, sizeof(failure));
+
+    bool held = version_cohort_test_daemon_hold(&hold, "keepalive");
+    bool aged =
+        held &&
+        version_cohort_test_runtime_path(marker_path, &hold.fixture,
+                                         VERSION_COHORT_TEST_MARKER_FILE) &&
+        version_cohort_test_runtime_path(record_path, &hold.fixture,
+                                         VERSION_COHORT_TEST_RECORD_FILE) &&
+        version_cohort_test_read(record_path, record_before, sizeof(record_before),
+                                 &record_before_length) &&
+        version_cohort_test_age(marker_path) && version_cohort_test_age(record_path) &&
+        lstat(marker_path, &marker_before) == 0 && lstat(record_path, &record_status_before) == 0 &&
+        !version_cohort_test_recently_modified(&marker_before) &&
+        !version_cohort_test_recently_modified(&record_status_before);
+    bool refreshed = aged && cbm_version_cohort_daemon_keepalive(hold.claim, hold.lease, &failure);
+    bool fresh_same_inodes =
+        refreshed && lstat(marker_path, &marker_after) == 0 &&
+        lstat(record_path, &record_status_after) == 0 &&
+        version_cohort_test_recently_modified(&marker_after) &&
+        version_cohort_test_recently_modified(&record_status_after) &&
+        marker_after.st_ino == marker_before.st_ino &&
+        record_status_after.st_ino == record_status_before.st_ino;
+    bool payload_kept = fresh_same_inodes &&
+                        version_cohort_test_read(record_path, record_after, sizeof(record_after),
+                                                 &record_after_length) &&
+                        record_after_length == record_before_length &&
+                        memcmp(record_after, record_before, record_before_length) == 0;
+    int names = fresh_same_inodes
+                    ? (int)cbm_version_cohort_daemon_names_intact(hold.claim, hold.lease)
+                    : -1;
+    version_cohort_test_daemon_release(&hold);
+
+    ASSERT_TRUE(held);
+    ASSERT_TRUE(aged);
+    ASSERT_TRUE(refreshed);
+    ASSERT_EQ(failure.errno_value, 0);
+    ASSERT_TRUE(fresh_same_inodes);
+    ASSERT_TRUE(payload_kept);
+    ASSERT_EQ(names, CBM_DAEMON_IPC_NAMES_INTACT);
+    PASS();
+}
+
+static int version_cohort_test_names_after_replacing(const char *tag, const char *name) {
+    version_cohort_daemon_hold_t hold;
+    char path[VERSION_COHORT_TEST_PATH_CAP] = {0};
+    bool replaced = version_cohort_test_daemon_hold(&hold, tag) &&
+                    version_cohort_test_runtime_path(path, &hold.fixture, name) &&
+                    version_cohort_test_replace(path);
+    int state = replaced ? (int)cbm_version_cohort_daemon_names_intact(hold.claim, hold.lease) : -1;
+    version_cohort_test_daemon_release(&hold);
+    return state;
+}
+
+/* D1 §B: a cleaner that unlinks the marker lets the next client read
+ * DAEMON_ABSENT and launch a second daemon that can never publish (the macOS
+ * orphan of 2026-10-14); one that unlinks the lifetime record lets a
+ * different build claim a fresh cohort beside the running one. The generation
+ * still holding the old inodes reads each as replaced. */
+TEST(version_cohort_daemon_names_intact_reports_replaced_marker_and_record) {
+    int marker = version_cohort_test_names_after_replacing("marker-replaced",
+                                                           VERSION_COHORT_TEST_MARKER_FILE);
+    int record = version_cohort_test_names_after_replacing("record-replaced",
+                                                           VERSION_COHORT_TEST_RECORD_FILE);
+    ASSERT_EQ(marker, CBM_DAEMON_IPC_NAMES_COHORT_MARKER_REPLACED);
+    ASSERT_EQ(record, CBM_DAEMON_IPC_NAMES_COHORT_RECORD_REPLACED);
+    PASS();
+}
+#endif /* !_WIN32 */
+
 SUITE(version_cohort) {
     RUN_TEST(version_cohort_shares_exact_build_rejects_conflict_and_turns_over);
     RUN_TEST(version_cohort_rejects_same_hash_with_different_abi);
@@ -1039,4 +1227,8 @@ SUITE(version_cohort) {
     RUN_TEST(version_cohort_transition_shutdown_order_has_no_false_conflict);
     RUN_TEST(version_cohort_presence_recovers_current_posix_listener_crash);
     RUN_TEST(version_cohort_crash_releases_process_lifetime_lease);
+#ifndef _WIN32
+    RUN_TEST(version_cohort_daemon_keepalive_refreshes_marker_and_record_without_reopening);
+    RUN_TEST(version_cohort_daemon_names_intact_reports_replaced_marker_and_record);
+#endif
 }

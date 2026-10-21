@@ -128,6 +128,23 @@ cbm_version_cohort_status_t cbm_version_cohort_daemon_claim_acquire(
 cbm_private_file_lock_status_t cbm_version_cohort_daemon_claim_release(
     cbm_version_cohort_daemon_claim_t **claim_io);
 
+/* Runtime-directory upkeep for the daemon generation that holds `claim` and
+ * `lease` (see the contract in ipc.h): refresh the generation marker and the
+ * cohort lifetime record through the held handles. The inodes and the
+ * record's payload stay as they are. */
+bool cbm_version_cohort_daemon_keepalive(const cbm_version_cohort_daemon_claim_t *claim,
+                                         const cbm_version_cohort_lease_t *lease,
+                                         cbm_daemon_ipc_keepalive_failure_t *failure_out);
+
+/* Whether the marker and the cohort lifetime record names still resolve to
+ * the files `claim` and `lease` hold (COHORT_MARKER_REPLACED /
+ * COHORT_RECORD_REPLACED otherwise, IO when that cannot be told). A removed
+ * marker lets the next client read DAEMON_ABSENT and launch a second daemon
+ * that can never publish; a removed record lets a different build claim a
+ * fresh cohort beside this one. */
+cbm_daemon_ipc_names_state_t cbm_version_cohort_daemon_names_intact(
+    const cbm_version_cohort_daemon_claim_t *claim, const cbm_version_cohort_lease_t *lease);
+
 /* Non-owning marker observation for startup turnover. COORDINATED means a
  * current daemon still holds its generation claim, including the cleanup
  * interval after its listener/lifetime reservation has closed. ABSENT means

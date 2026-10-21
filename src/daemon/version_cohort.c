@@ -857,6 +857,55 @@ cbm_private_file_lock_status_t cbm_version_cohort_daemon_claim_release(
     return result;
 }
 
+bool cbm_version_cohort_daemon_keepalive(const cbm_version_cohort_daemon_claim_t *claim,
+                                         const cbm_version_cohort_lease_t *lease,
+                                         cbm_daemon_ipc_keepalive_failure_t *failure_out) {
+    if (failure_out) {
+        memset(failure_out, 0, sizeof(*failure_out));
+    }
+    const cbm_private_file_lock_t *held[] = {claim ? claim->marker : NULL,
+                                             lease ? lease->lifetime : NULL};
+    const char *names[] = {VERSION_COHORT_DAEMON_FILE, VERSION_COHORT_LIFETIME_FILE};
+    bool refreshed = true;
+    for (size_t index = 0; index < sizeof(held) / sizeof(held[0]); index++) {
+        int error = 0;
+        if (cbm_private_file_lock_touch(held[index], &error)) {
+            continue;
+        }
+        if (refreshed && failure_out) {
+            (void)snprintf(failure_out->name, sizeof(failure_out->name), "%s", names[index]);
+            failure_out->errno_value = error;
+        }
+        refreshed = false;
+    }
+    return refreshed;
+}
+
+static cbm_daemon_ipc_names_state_t version_cohort_names_state(
+    cbm_private_file_lock_name_state_t state, cbm_daemon_ipc_names_state_t replaced) {
+    if (state == CBM_PRIVATE_FILE_LOCK_NAME_HELD) {
+        return CBM_DAEMON_IPC_NAMES_INTACT;
+    }
+    return state == CBM_PRIVATE_FILE_LOCK_NAME_REPLACED ? replaced : CBM_DAEMON_IPC_NAMES_IO;
+}
+
+cbm_daemon_ipc_names_state_t cbm_version_cohort_daemon_names_intact(
+    const cbm_version_cohort_daemon_claim_t *claim, const cbm_version_cohort_lease_t *lease) {
+    if (!claim || !claim->manager || !lease || lease->manager != claim->manager) {
+        return CBM_DAEMON_IPC_NAMES_IO;
+    }
+    const cbm_private_lock_directory_t *directory = claim->manager->directory;
+    cbm_daemon_ipc_names_state_t marker = version_cohort_names_state(
+        cbm_private_file_lock_name_state(claim->marker, directory, VERSION_COHORT_DAEMON_FILE),
+        CBM_DAEMON_IPC_NAMES_COHORT_MARKER_REPLACED);
+    if (marker != CBM_DAEMON_IPC_NAMES_INTACT) {
+        return marker;
+    }
+    return version_cohort_names_state(
+        cbm_private_file_lock_name_state(lease->lifetime, directory, VERSION_COHORT_LIFETIME_FILE),
+        CBM_DAEMON_IPC_NAMES_COHORT_RECORD_REPLACED);
+}
+
 cbm_version_cohort_daemon_presence_t cbm_version_cohort_daemon_claim_presence(
     cbm_version_cohort_manager_t *manager) {
     if (!manager || !version_cohort_manager_register(manager)) {

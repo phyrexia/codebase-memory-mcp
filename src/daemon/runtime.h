@@ -414,6 +414,14 @@ size_t cbm_daemon_runtime_service_active_connections(cbm_daemon_runtime_service_
  * no-op unless a last-committed-client linger is armed. */
 void cbm_daemon_runtime_service_reconcile_lifetime(cbm_daemon_runtime_service_t *service);
 
+/* The service's listener, lent to its host for runtime-directory upkeep (the
+ * cbm_daemon_ipc_listener_* upkeep calls, read-only towards the listener). It
+ * is set before start returns, never replaced, and closed only by
+ * cbm_daemon_runtime_service_free, so the host that will free the service may
+ * use it until then. NULL for a NULL service. */
+const cbm_daemon_ipc_listener_t *cbm_daemon_runtime_service_listener(
+    const cbm_daemon_runtime_service_t *service);
+
 /* ── Connection-admission telemetry ──────────────────────────────
  *
  * Together these answer the one question the live count cannot: is the
@@ -453,6 +461,16 @@ bool cbm_daemon_runtime_service_job_reaped(cbm_daemon_runtime_service_t *service
  * final disconnect makes STOPPING terminal, drains/reaps within the configured
  * bound, and exits automatically. stop is itself bounded by timeout_ms. */
 bool cbm_daemon_runtime_service_stop(cbm_daemon_runtime_service_t *service, uint32_t timeout_ms);
+/* Begin the ordinary, non-emergency stop `daemon stop` uses, on the host's own
+ * initiative, and name why in daemon.runtime_stopping. Admission ends at
+ * once; every live connection is interrupted, so an in-flight application
+ * request is cancelled (cooperatively, through its session) rather than
+ * answered; workers and cancelled jobs then get up to timeout_ms to unwind,
+ * and resource emptiness completes the stop for a permanent generation too.
+ * Returns immediately; observe the end with state or wait_exited. A service
+ * that is already stopping keeps its earlier deadline. */
+void cbm_daemon_runtime_service_begin_stop(cbm_daemon_runtime_service_t *service,
+                                           uint32_t timeout_ms, const char *reason);
 /* Before wait_exited or a successful stop this returns false without teardown.
  * Otherwise it returns true only after every thread is joined, the owned
  * participant guard is released, and the service allocation is destroyed. A
