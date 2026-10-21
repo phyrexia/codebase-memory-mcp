@@ -53,7 +53,9 @@ typedef enum {
 
 /* Fill `out` with the identity of `db_path`, reading the file only when it
  * changed since the cached entry. `out` is zeroed first and owns its strings;
- * release them with cbm_project_identity_clear(). */
+ * release them with cbm_project_identity_clear(). They come from the memory
+ * core, class store: a caller that takes one over releases it with
+ * cbm_free(CBM_MEM_CLASS_STORE, ...). */
 cbm_project_registry_status_t cbm_project_registry_lookup(const char *db_path,
                                                           cbm_project_identity_t *out);
 

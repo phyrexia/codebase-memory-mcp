@@ -6,6 +6,7 @@
 #include "daemon/application.h"
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "foundation/subprocess.h"
 #include "mcp/mcp.h"
@@ -212,7 +213,7 @@ static cbm_daemon_maintenance_monitor_t *frontend_maintenance_monitor_start(
     if (!manager || exit_code < 0 || !participant || !participant[0]) {
         return NULL;
     }
-    cbm_daemon_maintenance_monitor_t *monitor = calloc(1, sizeof(*monitor));
+    cbm_daemon_maintenance_monitor_t *monitor = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*monitor));
     if (!monitor) {
         return NULL;
     }
@@ -225,7 +226,7 @@ static cbm_daemon_maintenance_monitor_t *frontend_maintenance_monitor_start(
     cbm_mutex_init(&monitor->wait_mutex);
     if (!cbm_condition_init(&monitor->wake)) {
         cbm_mutex_destroy(&monitor->wait_mutex);
-        free(monitor);
+        cbm_free(CBM_MEM_CLASS_OTHER, monitor);
         return NULL;
     }
     int written = snprintf(monitor->participant, sizeof(monitor->participant), "%s", participant);
@@ -233,7 +234,7 @@ static cbm_daemon_maintenance_monitor_t *frontend_maintenance_monitor_start(
         cbm_thread_create(&monitor->thread, 0, frontend_maintenance_monitor_worker, monitor) != 0) {
         cbm_condition_destroy(&monitor->wake);
         cbm_mutex_destroy(&monitor->wait_mutex);
-        free(monitor);
+        cbm_free(CBM_MEM_CLASS_OTHER, monitor);
         return NULL;
     }
     return monitor;
@@ -262,7 +263,7 @@ bool cbm_daemon_maintenance_monitor_stop(cbm_daemon_maintenance_monitor_t **moni
     }
     cbm_condition_destroy(&monitor->wake);
     cbm_mutex_destroy(&monitor->wait_mutex);
-    free(monitor);
+    cbm_free(CBM_MEM_CLASS_OTHER, monitor);
     *monitor_io = NULL;
     return true;
 }

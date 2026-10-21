@@ -19,6 +19,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "store/store.h"
 
@@ -45,25 +46,19 @@ static void registry_disk_read_tick(void) {
 static void registry_disk_read_tick(void) {}
 #endif
 
+/* Every string this registry owns or hands out -- identity fields and cached
+ * entry paths -- comes from the memory core, class store. */
 static char *identity_strdup(const char *s) {
-    if (!s) {
-        return NULL;
-    }
-    size_t len = strlen(s) + 1;
-    char *d = malloc(len);
-    if (d) {
-        memcpy(d, s, len);
-    }
-    return d;
+    return cbm_mem_strdup(CBM_MEM_CLASS_STORE, s);
 }
 
 void cbm_project_identity_clear(cbm_project_identity_t *identity) {
     if (!identity) {
         return;
     }
-    free(identity->name);
-    free(identity->root_path);
-    free(identity->indexed_at);
+    cbm_free(CBM_MEM_CLASS_STORE, identity->name);
+    cbm_free(CBM_MEM_CLASS_STORE, identity->root_path);
+    cbm_free(CBM_MEM_CLASS_STORE, identity->indexed_at);
     memset(identity, 0, sizeof(*identity));
 }
 
@@ -107,12 +102,13 @@ static cbm_project_registry_status_t project_identity_read(const char *db_path, 
             cbm_project_stats_t stats = {0};
             if (cbm_store_get_project_stats(store, projects[primary].name, has_count_columns, &row,
                                             &stats) == CBM_STORE_OK) {
-                out->name = (char *)row.name;
-                out->root_path = (char *)row.root_path;
-                out->indexed_at = (char *)row.indexed_at;
-                row.name = NULL;
-                row.root_path = NULL;
-                row.indexed_at = NULL;
+                /* Copied, not taken over: the row's strings are the store's
+                 * raw heap copies, released below by cbm_project_free_fields(),
+                 * while an identity owns core memory. A failed copy reads as
+                 * the store's NULL did, so the checks below still apply. */
+                out->name = identity_strdup(row.name);
+                out->root_path = identity_strdup(row.root_path);
+                out->indexed_at = identity_strdup(row.indexed_at);
                 out->size_bytes = size_bytes;
                 out->mtime_ns = mtime_ns;
                 out->has_count_columns = stats.has_count_columns;
@@ -209,7 +205,7 @@ static registry_entry_t *registry_find(const char *path) {
 
 /* Unordered removal: the table is keyed by path, so row order carries nothing. */
 static void registry_drop(registry_entry_t *entry) {
-    free(entry->path);
+    cbm_free(CBM_MEM_CLASS_STORE, entry->path);
     cbm_project_identity_clear(&entry->identity);
     *entry = g_entries[g_entry_count - 1];
     g_entry_count--;
@@ -221,7 +217,7 @@ static void registry_store(const char *path, int64_t size_bytes, int64_t mtime_n
     if (!entry) {
         if (g_entry_count == g_entry_cap) {
             size_t cap = g_entry_cap ? g_entry_cap * 2 : 16;
-            void *grown = realloc(g_entries, cap * sizeof(*g_entries));
+            void *grown = cbm_realloc(CBM_MEM_CLASS_STORE, g_entries, cap * sizeof(*g_entries));
             if (!grown) {
                 return; /* cache is best-effort: the caller keeps the identity */
             }
@@ -319,10 +315,10 @@ void cbm_project_registry_invalidate(const char *db_path) {
 void cbm_project_registry_reset(void) {
     registry_lock();
     for (size_t i = 0; i < g_entry_count; i++) {
-        free(g_entries[i].path);
+        cbm_free(CBM_MEM_CLASS_STORE, g_entries[i].path);
         cbm_project_identity_clear(&g_entries[i].identity);
     }
-    free(g_entries);
+    cbm_free(CBM_MEM_CLASS_STORE, g_entries);
     g_entries = NULL;
     g_entry_count = 0;
     g_entry_cap = 0;

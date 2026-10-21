@@ -8,6 +8,7 @@
 #include "foundation/compat_fs.h" /* cbm_mkdir_p, cbm_fopen */
 #include "foundation/constants.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h" /* cbm_safe_getenv, path normalization */
 #include "foundation/profile.h"  /* cbm_profile_active (keep worker log under CBM_PROFILE) */
 #include "ui/http_server.h"      /* cbm_http_server_resolve_binary_path */
@@ -668,7 +669,7 @@ size_t cbm_index_worker_logs_rotate(const char *logs_dir, int64_t now_unix_s) {
         if (count == capacity) {
             size_t next_capacity = capacity ? capacity * 2 : 32;
             worker_log_entry_t *grown =
-                (worker_log_entry_t *)realloc(entries, next_capacity * sizeof(*entries));
+                cbm_realloc(CBM_MEM_CLASS_OTHER, entries, next_capacity * sizeof(*entries));
             if (!grown) {
                 break;
             }
@@ -676,7 +677,7 @@ size_t cbm_index_worker_logs_rotate(const char *logs_dir, int64_t now_unix_s) {
             capacity = next_capacity;
         }
         size_t name_length = strlen(entry->name);
-        char *copy = (char *)malloc(name_length + 1);
+        char *copy = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, name_length + 1);
         if (!copy) {
             break;
         }
@@ -706,9 +707,9 @@ size_t cbm_index_worker_logs_rotate(const char *logs_dir, int64_t now_unix_s) {
         }
     }
     for (size_t i = 0; i < count; i++) {
-        free(entries[i].name);
+        cbm_free(CBM_MEM_CLASS_OTHER, entries[i].name);
     }
-    free(entries);
+    cbm_free(CBM_MEM_CLASS_OTHER, entries);
     return removed;
 }
 
